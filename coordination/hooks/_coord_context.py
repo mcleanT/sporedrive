@@ -21,7 +21,15 @@ def main() -> int:
     body = (ck.get("checkpoint") or {}) if isinstance(ck, dict) else {}
     pend = r.get("pending_unacked") or []
     lines = [f"Mycelium coordination: attached to task {task} as {who}."]
-    if ck:
+    execution = r.get("execution") or {}
+    stopped = bool(r.get("stop_waiting"))
+    if execution:
+        lines.append(f"Current execution: {execution.get('status')}"
+                     f" (version {execution.get('state_version')}; expired={execution.get('expired')}).")
+    if stopped:
+        lines.append("STOP: task is paused, expired, exhausted or closed. Do not resume old checkpoint work, "
+                     "poll, compact or create a successor task. Only bounded reconciliation is permitted.")
+    if ck and not stopped:
         lines.append(f"Current checkpoint rev {ck.get('revision')} (auth {ck.get('authorization_ref')}).")
         nxt = body.get("next_action") or body.get("next")
         if nxt:
@@ -31,21 +39,18 @@ def main() -> int:
             lines.append("Knowledge refs: " + ", ".join(str(x) for x in refs[:8]))
         # a bounded view of remaining checkpoint keys so a compacted session sees substance, not just
         # a revision number; the full record is resolvable via the read instruction below.
-        shown = {"next_action", "next", "knowledge_refs", "knowledge"}
-        extra = {k: v for k, v in body.items() if k not in shown}
-        if extra:
-            blob = json.dumps(extra, default=str)
-            lines.append("Checkpoint (bounded): " + (blob if len(blob) <= 600 else blob[:600] + " …"))
+        # Keep the header and next action; details are fetched only when they answer a live question.
         lines.append(f"Read full checkpoint: mycelium-coord checkpoint-read {task} --revision {ck.get('revision')}")
     lines.append(f"Pending unacknowledged messages: {r.get('pending_count', len(pend))}.")
-    for m in pend[:10]:
-        body = m.get("text") or m.get("artifact_ref") or ""
+    for m in pend[:5]:
+        body = m.get("preview") or m.get("text") or m.get("artifact_ref") or ""
         lines.append(
             f"  - {m.get('message_id')} [{m.get('kind')}] from {m.get('sender')} "
             f"rev {m.get('task_revision')}: {str(body)[:120]}"
         )
     lines.append(
-        "Read/ack via the mycelium-coord CLI or the coord_* MCP tools. This is coordination "
+        f"Fetch a selected full brief: mycelium-coord read-message {task} {who} MESSAGE_ID. "
+        "Summaries are incomplete; content_hash identifies the envelope, not a file. This is coordination "
         "state only; it does not change repository ownership or run analysis hooks."
     )
     print(json.dumps({"hookSpecificOutput": {

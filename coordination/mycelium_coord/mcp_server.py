@@ -205,27 +205,40 @@ async def coord_inbox(
     task_id: str,
     participant_id: str,
     after_seq: int = 0,
-    limit: int = 100,
+    limit: int = 10,
     kinds: list | None = None,
+    compact: bool = True,
 ) -> dict:
     """Bounded read of messages addressed to this participant with seq > after_seq. Does NOT consume
-    and does NOT move the stored cursor. Returns messages + next_after_seq.
+    and does NOT move the stored cursor. Compact summaries are the default. Use coord_read_message
+    for a selected full body before acting; summaries are not complete briefs or acceptance evidence.
 
     Args:
         task_id: Task id.
         participant_id: The reading participant.
         after_seq: Return messages with seq greater than this.
-        limit: Max messages (default 100).
+        limit: Max messages (default 10; compact cap 20).
         kinds: Optional kind filter.
+        compact: False explicitly returns full message bodies (cap 200).
     """
     return await asyncio.to_thread(
         lambda: _wrap(
             "coord_inbox",
             lambda: _co().inbox(
-                task_id, participant_id, after_seq=after_seq, limit=limit, kinds=kinds
+                task_id, participant_id, after_seq=after_seq, limit=limit, kinds=kinds,
+                compact=compact,
             ),
         )
     )
+
+
+@mcp.tool(title="Coord Read Message", annotations=_READ)
+async def coord_read_message(task_id: str, participant_id: str, message_id: str) -> dict:
+    """Read ONE complete addressed message selected from a compact inbox/resume. No acknowledgment.
+    content_hash hashes the message envelope, not a referenced file. Verify file hashes separately.
+    """
+    return await asyncio.to_thread(lambda: _wrap(
+        "coord_read_message", lambda: _co().read_message(task_id, participant_id, message_id)))
 
 
 @mcp.tool(title="Coord Wait", annotations=_READ)
@@ -235,9 +248,14 @@ async def coord_wait(
     after_seq: int = 0,
     timeout_s: float = 30.0,
     kinds: list | None = None,
+    limit: int = 10,
+    compact: bool = True,
 ) -> dict:
     """Bounded wait for new addressed messages after a cursor. Truthful: a finite-timeout poll, NOT a
-    host wake-up. Returns as soon as any qualifying message exists or timed_out=True at the deadline.
+    host wake-up. The wait runs locally without model polling inside it. Returns for a message,
+    pause/closure/expiry/exhaustion, or timeout. Stop reissuing when stop_waiting=True. An unchanged
+    timeout is not progress and does not require a new status read or narrated model turn. Choose one
+    finite wait within the host's call limit and the task deadline; do not add clock/sleep loops.
 
     Args:
         task_id: Task id.
@@ -245,6 +263,8 @@ async def coord_wait(
         after_seq: Wait for messages with seq greater than this.
         timeout_s: Finite timeout seconds (max 600).
         kinds: Optional kind filter.
+        limit: Max messages returned (default 10).
+        compact: Summaries by default; fetch one full message with coord_read_message.
     """
     return await asyncio.to_thread(
         lambda: _wrap(
@@ -255,6 +275,8 @@ async def coord_wait(
                 after_seq=after_seq,
                 timeout_s=timeout_s,
                 kinds=kinds,
+                limit=limit,
+                compact=compact,
             ),
         )
     )
@@ -370,18 +392,24 @@ async def coord_checkpoint_read(
 
 
 @mcp.tool(title="Coord Resume", annotations=_READ)
-async def coord_resume(task_id: str, participant_id: str, limit: int = 50) -> dict:
-    """Reattach after compaction/restart: current checkpoint + bounded UNACKNOWLEDGED messages +
-    revision/authorization. Does not re-inject transcripts.
+async def coord_resume(task_id: str, participant_id: str, limit: int = 10,
+                       compact: bool = True, after_checkpoint_revision: int | None = None) -> dict:
+    """ONE batched state read: execution/stop status, checkpoint identity, participant and pending
+    message summaries. Prefer this to separate status/checkpoint/inbox reads. Compact by default;
+    use coord_read_message or coord_checkpoint_read for selected full evidence. Current execution
+    state overrides stale checkpoint instructions. Never resume work from a summary alone.
 
     Args:
         task_id: Task id.
         participant_id: Resuming participant.
         limit: Max pending messages returned.
+        compact: False opts into full checkpoint and message bodies.
+        after_checkpoint_revision: Previously seen revision; omit unchanged checkpoint content.
     """
     return await asyncio.to_thread(
         lambda: _wrap(
-            "coord_resume", lambda: _co().resume(task_id, participant_id, limit=limit)
+            "coord_resume", lambda: _co().resume(task_id, participant_id, limit=limit,
+                compact=compact, after_checkpoint_revision=after_checkpoint_revision)
         )
     )
 

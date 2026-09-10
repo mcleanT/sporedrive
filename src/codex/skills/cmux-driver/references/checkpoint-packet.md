@@ -4,7 +4,7 @@
 
 ```text
 Task: [observable desired outcome]
-Context: [only facts needed for this work; exact input/spec/revision references]
+Context: [only facts needed for this work; exact input/spec/revision references; paths instead of full history]
 Constraints: [hard boundaries and applicable authorization; preserve unrelated work]
 Done when: [behavior plus the exact test/build/check, or ask Claude to identify the
            repository's canonical check if it is not yet known]

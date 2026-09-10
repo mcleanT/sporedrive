@@ -1,6 +1,7 @@
 ---
 name: codex-review
-description: Use when the user wants an adversarial external review from OpenAI Codex — spec reviews, design critiques, plan audits, PR reviews, "get a second opinion from codex", "have codex look at this", "adversarial review". Also use for a different-model sanity check before a significant refactor or a substantive merge. Dispatches through the context-injecting `codex_ask` wrapper (read-only sandbox, prompt via stdin, output direct to file), then disposes of the findings on evidence in the executor: one scoped review, grouped by failure mechanism, a further specialist only for an unresolved consequential question.
+description: >-
+  Use when the user wants an adversarial external review from OpenAI Codex — spec reviews, design critiques, plan audits, PR reviews, "get a second opinion from codex", "have codex look at this", "adversarial review". Also use for a different-model sanity check before a significant refactor or a substantive merge. Dispatches through the context-injecting `codex_ask` wrapper (read-only sandbox, prompt via stdin, output direct to file), then disposes of the findings on evidence in the executor: one scoped review, grouped by failure mechanism, a further specialist only for an unresolved consequential question.
 ---
 
 # Codex Review
@@ -60,11 +61,13 @@ codex_ask -o /tmp/codex_review_<slug>.txt \
 | `-e EFFORT` | Default `medium`; `xhigh` for deep reviews. Accepted: `low|medium|high|xhigh|ultra|max`. |
 | `-n` | Dry run: print the assembled prompt, do not call codex. |
 
-**Auto-injected `## Session context`:** repo name + branch, `git log -5`, the tail of `.living/last-session.md` if present (capped), and the `-f` path list. Codex also auto-loads `~/.codex/AGENTS.md` and the repo-root `AGENTS.md`. You do not need to package git state or architecture overviews by hand.
+**Context is small by default:** repo/branch, the last3 commit subjects, and the selected `-f` paths. File contents are read only when needed. Historical `.living/last-session.md` narrative is not automatically injected; `CODEX_ASK_INCLUDE_LASTSESSION=1` explicitly restores its bounded tail. Supply the relevant current scope/evidence, not an entire discussion transcript. Read a decisive range and batch independent reads with one aggregate output budget.
 
-**Backgrounding:** the wrapper is synchronous. Launch it via the Bash tool with `run_in_background: true` (timeout 600000) and wait for the completion notification; the wrapper prints the output path on its last line.
+**Backgrounding:** use the host's completion notification for the owned bounded review. Do not wrap it in clock/sleep/status loops or repeatedly read an unchanged output file. Respect the host's call limit and the review deadline.
 
-**Receipt:** the wrapper writes one merged text file and exits with codex's status. There is no separate machine-readable receipt yet. Before trusting a review, check: exit status 0; no `ERROR:` / `not supported` / `not logged in` lines; the requested section headers are present. A rejected model, an expired login, or an empty prompt still exits and writes a file.
+**Receipt:** `${OUTFILE}.receipt.json` records completion/exit, wall-clock duration, requested/resolved model and retained raw-result identity. Read the compact receipt and the final review first; inspect raw output only for an unresolved failure. Missing/unknown/error output is not a successful review. Managed launches reserve/claim an allowance and use the existing owned-process deadline. Ordinary inline desktop review remains time-advisory, not a hard reasoning cap.
+
+One question, one scoped review and one verification of repairs. An existing brief needs no second planning phase. Group findings by mechanism; no extra verifier per finding or mandatory praise section. Once checks answer the question, return the result and stop.
 
 ## Prompt Template
 
@@ -86,7 +89,6 @@ B. <dimension 2>
 Format:
 ## Summary verdict [one paragraph: proceed / revise-and-proceed / replace]
 ## Specific issues (ordered by severity) [numbered; each with section or file:line reference, the failure mechanism, the evidence you relied on, and a suggested fix]
-## Things the doc does well [brief]
 ## Recommended revisions before <committing|merging|running>
 
 Under <word limit — typically 1500>. Be direct; the author explicitly asked for challenge, not validation.

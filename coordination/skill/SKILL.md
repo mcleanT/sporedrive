@@ -16,7 +16,7 @@ One shared, provider-neutral protocol lets a Codex **supervisor** and a Claude *
 optional **observers**) talk over an authorized task. The same operations are available two ways:
 
 - **MCP tools** (server `mycelium-coord`): `coord_create_task`, `coord_attach`, `coord_send`,
-  `coord_inbox`, `coord_wait`, `coord_ack`, `coord_message_state`, `coord_set_cursor`,
+  `coord_inbox`, `coord_read_message`, `coord_wait`, `coord_ack`, `coord_message_state`, `coord_set_cursor`,
   `coord_checkpoint_publish`, `coord_checkpoint_read`, `coord_resume`, `coord_participants`,
   `coord_detach`, `coord_notify_via_bridge`, and the bounded discovery reads `coord_list_tasks`,
   `coord_find_recipients`, `coord_list_sessions`.
@@ -51,11 +51,27 @@ The CLI takes **positional** task/participant ids — not `--task`/`--participan
 compaction or restart, ONE bounded call restores you:
 
 ```
-mycelium-coord resume TASK PARTICIPANT            # checkpoint + bounded unacked inbox + authorization
+mycelium-coord resume TASK PARTICIPANT            # one compact execution/checkpoint/inbox read
+mycelium-coord read-message TASK PARTICIPANT ID   # selected complete brief, no acknowledgment
 ```
 
 Prefer that over re-reading pieces separately. The other common ops (positional ids, flags only for
 options):
+
+Resume/inbox/wait return summaries by default (10 messages, compact cap20). A summary is explicitly
+incomplete: fetch a selected body with `read-message` / `coord_read_message` before acting. Use
+`checkpoint-read` only for a relevant checkpoint; pass `--after-checkpoint REV` to resume to omit
+unchanged checkpoint content. `--full` (MCP `compact=false`) is the explicit full-record escape hatch.
+Retrieval does not acknowledge or advance a cursor. Save the returned cursor only for the page
+actually exposed; pending messages remain reachable. `content_hash` hashes the coordination envelope,
+not a referenced file's bytes; artifact verification uses its own hash.
+
+Current execution state is included in resume/wait and outranks old checkpoint next actions.
+`stop_waiting=true` means paused, draining, exhausted, closed, completed or expired: stop the wait loop.
+Timeout with `unchanged=true` is not progress. Choose a finite wait within the host/task deadline and
+let the tool do the waiting. Do not add clock calls, repeated screen/transcript reads or model-driven
+heartbeat commentary; no recurring monitor is enabled by this protocol. A stored message still does
+not wake an idle host. Exact delivery, authorization and completion rules below remain unchanged.
 
 ```
 mycelium-coord inbox   TASK PARTICIPANT [--after SEQ] [--limit N] [--kind KIND]

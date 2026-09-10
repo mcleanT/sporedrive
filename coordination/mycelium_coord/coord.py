@@ -718,6 +718,16 @@ class Coordinator:
         found = self._find_message_record(task_id, message_id)
         return found[0] if found else None
 
+    def read_message(self, task_id: str, participant_id: str, message_id: str) -> dict:
+        """Fetch one complete addressed message after inspecting a compact view; never acknowledge."""
+        p = self._participant(task_id, participant_id)
+        require_id(message_id, "message_id")
+        message = self.get_message(task_id, message_id)
+        if not message or not self._addressed_to(message, p):
+            raise ProtocolError("message_not_addressed", message_id,
+                                "no message addressed to this participant")
+        return message
+
     def _max_seq(self, task_id: str) -> int:
         """Highest DURABLE message seq (derived from atomic body filenames). This is the seq
         authority: a seq is "taken" only once its body is durably renamed into place."""
@@ -762,6 +772,7 @@ class Coordinator:
         after_seq: int = 0,
         limit: int = 100,
         kinds: list[str] | None = None,
+        compact: bool = False,
     ) -> dict:
         """Bounded read of messages addressed to this participant with seq > after_seq. Does NOT
         consume and does NOT move the stored cursor (reading is side-effect free). Returns messages
@@ -775,9 +786,14 @@ class Coordinator:
         if kinds:
             kset = set(kinds)
             msgs = [m for m in msgs if m.get("kind") in kset]
+        limit = min(max(0, int(limit)), 20 if compact else 200)
         truncated = len(msgs) > limit
         page = msgs[: max(0, int(limit))]
         next_after = page[-1]["seq"] if page else int(after_seq)
+        if compact:
+            from .views import message_view
+
+            page = [message_view(m) for m in page]
         return {
             "messages": page,
             "next_after_seq": next_after,
@@ -1086,17 +1102,34 @@ class Coordinator:
         timeout_s: float = 30.0,
         kinds: list[str] | None = None,
         poll_s: float = 0.5,
+        limit: int = 10,
+        compact: bool = False,
     ) -> dict:
         """Bounded wait for NEW addressed messages after a cursor. Truthful: a filesystem poll with a
         finite timeout, NOT a host wake-up. Returns as soon as any qualifying message exists or the
         timeout elapses (timed_out True, empty list). Never blocks unbounded."""
+        from .execution import ExecutionManager
+        from .views import execution_view, stops_wait
+
+        # A bad participant must not turn into a successful terminal-state observation.
+        self._participant(task_id, participant_id)
+        manager = ExecutionManager(self.store)
         timeout_s = max(0.0, min(float(timeout_s), 600.0))
         poll_s = max(0.05, min(float(poll_s), 5.0))
         deadline = time.monotonic() + timeout_s
         while True:
-            res = self.inbox(task_id, participant_id, after_seq=after_seq, kinds=kinds)
+            status = execution_view(manager.status(task_id))
+            if stops_wait(status):
+                return {"messages": [], "next_after_seq": int(after_seq), "returned": 0,
+                        "truncated": False, "timed_out": False, "stop_waiting": True,
+                        "reason": "task_expired" if status.get("expired") else "task_" + status["status"],
+                        "execution": status}
+            res = self.inbox(task_id, participant_id, after_seq=after_seq, kinds=kinds,
+                             limit=limit, compact=compact)
             if res["messages"]:
                 res["timed_out"] = False
+                res["execution"] = status
+                res["stop_waiting"] = False
                 return res
             if time.monotonic() >= deadline:
                 return {
@@ -1105,27 +1138,48 @@ class Coordinator:
                     "truncated": False,
                     "returned": 0,
                     "timed_out": True,
+                    "unchanged": True,
+                    "stop_waiting": False,
+                    "execution": status,
                 }
             time.sleep(min(poll_s, max(0.0, deadline - time.monotonic())))
 
     # ------------------------------------------------------------------ resume after compaction
-    def resume(self, task_id: str, participant_id: str, *, limit: int = 50) -> dict:
+    def resume(self, task_id: str, participant_id: str, *, limit: int = 50,
+               compact: bool = False, after_checkpoint_revision: int | None = None) -> dict:
         """Reattach context after compaction/restart: current checkpoint + bounded UNACKNOWLEDGED
         messages addressed to this participant + the current revision/authorization. Large transcripts
         are NOT re-injected — only pending items and the checkpoint."""
         task = self._require_task(task_id)
         p = self._participant(task_id, participant_id)
+        from .execution import ExecutionManager
+        from .views import checkpoint_view, execution_view, message_view, stops_wait
+
+        status = execution_view(ExecutionManager(self.store).status(task_id))
+        limit = min(max(0, int(limit)), 20 if compact else 200)
         pending = [
             m
             for m in self._all_messages(task_id)
             if self._addressed_to(m, p)
             and not self.is_acked(task_id, participant_id, m["message_id"])
-        ][: max(0, int(limit))]
+        ]
+        count = len(pending)
+        pending = pending[:limit]
+        checkpoint = self.read_checkpoint(task_id)
+        if compact:
+            pending = [message_view(m) for m in pending]
+            checkpoint = checkpoint_view(checkpoint, after_revision=after_checkpoint_revision,
+                                         stopped=stops_wait(status))
+            task = {k: task.get(k) for k in ("task_id", "revision", "authorization_ref")}
+            p = {k: p.get(k) for k in ("participant_id", "role", "host", "state")}
         return {
             "task": task,
             "participant": p,
-            "checkpoint": self.read_checkpoint(task_id),
+            "checkpoint": checkpoint,
             "pending_unacked": pending,
-            "pending_count": len(pending),
+            "pending_count": count,
+            "pending_truncated": count > len(pending),
             "cursor_after_seq": self.get_cursor(task_id, participant_id),
+            "execution": status,
+            "stop_waiting": stops_wait(status),
         }

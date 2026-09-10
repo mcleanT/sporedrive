@@ -68,6 +68,32 @@ supervise another with real, auditable limits** rather than two chat windows and
   `coordination/` and `bridge/` into one owned, self-verifying native Mycelium plugin candidate. Both
   are covered in detail under [Native install & setup](#native-install--setup-portable).
 
+## Efficient supervision
+
+The default is fewer model requests and less carried context: wait for meaningful events, restore
+one small working-state packet, fetch only decisive evidence, stop at the required outcome, and use
+low reasoning effort for routine operations where the host supports it. Detailed procedures are
+loaded on demand. Existing reviews and scientific checks retain their explicit quality requirements.
+
+The Mycelium CLI/MCP now defaults to compact `resume`, `inbox` and `wait` views. `resume` combines
+current execution/stop state, checkpoint identity, participant and pending message summaries; it
+replaces separate status/checkpoint/inbox reads. Fetch a selected full brief with
+`mycelium-coord read-message TASK PARTICIPANT MESSAGE_ID` or `coord_read_message`. Use `--full`
+(`compact=false` in MCP) when complete records are required. These views do not acknowledge messages,
+change message hashes, advance cursors or prove delivery. Existing Python callers retain full views
+unless they opt into `compact=True`.
+
+Waits return immediately on pause, draining, exhaustion, closure, completion or expiry with
+`stop_waiting=true`. An ordinary timeout is marked `unchanged=true`; it is not a reason for repeated
+model-driven status narration. Startup context gives current execution state precedence over stale
+checkpoint work. Waiting inside a tool is still a finite local poll, not a native wake-up or a hard
+limit on desktop reasoning. Respect the host's timeout limits; no new background scheduler is added.
+
+`codex_ask` keeps only three commit subjects in its automatic context and omits historical session
+narrative unless `CODEX_ASK_INCLUDE_LASTSESSION=1` is explicitly set. Full logs remain on disk. These
+changes reduce supplied context and unnecessary reads; they do not automatically shrink an already
+running conversation, change its model effort, or establish a measured percentage saving.
+
 ## Bounded execution
 
 A supervised workflow is only meaningful if "supervised" is something the code enforces. A managed

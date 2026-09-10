@@ -94,6 +94,11 @@ TARGETS = [
     ),
     ("file", "src/codex/AGENTS.md", ".codex/AGENTS.md"),
     ("dir", "src/codex/skills/cmux-driver", ".codex/skills/cmux-driver"),
+    (
+        "file",
+        "src/claude/skills/codex-review/references/global-conventions.md",
+        ".claude/skills/codex-review/references/global-conventions.md",
+    ),
 ]
 # Fields merged into ~/.claude/settings.json. Its leaves are the owned settings leaves.
 SETTINGS_FIELDS_SRC = "src/claude/settings.fields.json"
@@ -862,6 +867,8 @@ def stage_all(steps: list[dict]) -> tuple[dict, bool]:
     parent_created = False
     for st in steps:
         staging = Path(st["staging"])
+        # Newly installed reference files may introduce a destination directory.
+        staging.parent.mkdir(parents=True, exist_ok=True)
         if staging.exists():
             cleanup_staging([staging])
         if st["kind"] == "dir":

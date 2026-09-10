@@ -148,7 +148,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("task_id")
     p.add_argument("participant_id")
     p.add_argument("--after", type=int, default=0)
-    p.add_argument("--limit", type=int, default=100)
+    p.add_argument("--limit", type=int, default=10)
+    p.add_argument("--full", action="store_true", help="include full message bodies")
     p.add_argument("--kind", action="append", default=None, dest="kinds")
 
     p = sub.add_parser("wait")
@@ -157,6 +158,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--after", type=int, default=0)
     p.add_argument("--timeout", type=float, default=30.0)
     p.add_argument("--kind", action="append", default=None, dest="kinds")
+    p.add_argument("--limit", type=int, default=10)
+    p.add_argument("--full", action="store_true", help="include full message bodies")
+
+    p = sub.add_parser("read-message", help="read one full addressed message, without acknowledging")
+    p.add_argument("task_id")
+    p.add_argument("participant_id")
+    p.add_argument("message_id")
 
     p = sub.add_parser("ack")
     p.add_argument("task_id")
@@ -188,7 +196,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("resume")
     p.add_argument("task_id")
     p.add_argument("participant_id")
-    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--limit", type=int, default=10)
+    p.add_argument("--full", action="store_true", help="include full checkpoint and message bodies")
+    p.add_argument("--after-checkpoint", type=int, default=None)
 
     p = sub.add_parser("select-session")
     p.add_argument("task_id")
@@ -524,6 +534,7 @@ def run(argv: list[str] | None = None) -> int:
                     after_seq=args.after,
                     limit=args.limit,
                     kinds=args.kinds,
+                    compact=not args.full,
                 )
             )
         elif op == "wait":
@@ -534,8 +545,12 @@ def run(argv: list[str] | None = None) -> int:
                     after_seq=args.after,
                     timeout_s=args.timeout,
                     kinds=args.kinds,
+                    limit=args.limit,
+                    compact=not args.full,
                 )
             )
+        elif op == "read-message":
+            _emit(co.read_message(args.task_id, args.participant_id, args.message_id))
         elif op == "ack":
             _emit(
                 co.ack(
@@ -565,7 +580,8 @@ def run(argv: list[str] | None = None) -> int:
         elif op == "checkpoint-read":
             _emit(co.read_checkpoint(args.task_id, revision=args.revision))
         elif op == "resume":
-            _emit(co.resume(args.task_id, args.participant_id, limit=args.limit))
+            _emit(co.resume(args.task_id, args.participant_id, limit=args.limit,
+                            compact=not args.full, after_checkpoint_revision=args.after_checkpoint))
         elif op == "select-session":
             _emit(
                 co.select_session(
