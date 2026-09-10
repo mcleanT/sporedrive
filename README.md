@@ -84,8 +84,8 @@ from the maintained defaults in `coordination/mycelium_coord/execution_policy.js
   verification) and two reviewer launches; each owned read-only reviewer process carries a hard 900 s
   wall-clock limit. A brief may only **lower** a limit -- raising one, extending it, or unpausing
   requires a user-authorization-linked change path, never something a supervisor composes for itself.
-- **Acceptance closure, evidenced repairs, and a backlog.** When work is accepted the task moves to
-  *closure*; after closure only an **evidenced repair** -- a reservation linked to a still-open,
+- **Acceptance closure, evidenced repairs, and a backlog.** When the required criteria have accepted
+  evidence the task moves to *closure* automatically (no separate owner-approval step); after closure only an **evidenced repair** -- a reservation linked to a still-open,
   evidence-backed acceptance blocker -- may dispatch, and optional non-blocking improvements go to a
   backlog rather than reopening the task.
 - **Pause and expiry gates.** A task can be paused (it enters a *draining* state) or given an expiry;
@@ -106,13 +106,17 @@ and opens its execution record, then **sends** the brief as an addressed, action
 Claude executor over Mycelium. The executor **acks**, does the work as the sole writer, runs tests,
 and **publishes a checkpoint** plus progress messages the supervisor reads back. If a review is
 warranted the supervisor spends a **review launch** on a scoped, read-only `codex_ask` review (bounded
-by the 900 s reviewer deadline); the executor repairs against the named findings. When the owner
-authorizes acceptance, the task moves to **closure**, and the executor sends a **completion_receipt**
-carrying artifact evidence (a file path plus sha256) that Mycelium verifies before the task is marked
-completed. Throughout, the supervisor reaches the executor's exact live session through the cmux
-bridge, and every dispatch is drawn from -- and checked against -- the task's persisted allowance. The
-runnable, command-by-command version of this exchange is in
-[Minimal cross-session exchange example](#4-minimal-cross-session-exchange-example) below.
+by the 900 s reviewer deadline); the executor repairs against the named findings. Once the task's
+already-frozen required criteria have accepted evidence, it moves to **closure** automatically -- there
+is no separate owner-approval gate -- and the executor sends a **completion_receipt** carrying artifact
+evidence (a file path plus sha256) that Mycelium verifies. Completion *is* that verified receipt, not a
+new human sign-off. Throughout, the supervisor reaches the executor's exact live session through the
+cmux bridge, and every dispatch is drawn from -- and checked against -- the task's persisted allowance.
+A runnable, command-by-command example of the underlying **unmanaged** message exchange (attach / send /
+ack / checkpoint) is in
+[Minimal cross-session exchange example](#4-minimal-cross-session-exchange-example) below -- that
+example shows plain coordination only; a *managed* task additionally opens an execution record
+(`exec-open`) and reserves/claims each actionable dispatch, which the example does not.
 
 ## What SporeDrive does and does not do
 
@@ -220,8 +224,9 @@ not reinstall or re-export an existing candidate solely because this bundle's do
 non-runtime files changed -- a release can instead be rebuilt from its own final bundled inputs and
 record its own manifest identity (`EXPORT_MANIFEST.json` / the `+<build-id>` suffix in `plugin.json`),
 distinct from both of the above. The concrete commit, manifest, and cache identities for the current
-accepted release are recorded in `PROVENANCE.md` and the accepted release receipt
-`checks/RELEASE-RECEIPT-20260910.json`.
+accepted release are recorded in `PROVENANCE.md` (committed) and, for the local validation run, in the
+accepted release receipt `checks/RELEASE-RECEIPT-20260910.json` -- a local artifact from the `664de18`
+release run, not committed to the repository and absent from a GitHub clone.
 
 ## Native install & setup (portable)
 
@@ -466,7 +471,11 @@ back both the bundled CLI (`coordination/bin/mycelium-coord`, confirmed subcomma
 `attach`, `send`, `inbox`, `ack`, `checkpoint-publish`, `checkpoint-read`, ...) and, once the plugin
 is loaded, the `coord_*` MCP tools (Claude server `plugin:mycelium:mycelium-coord`, Codex server
 `mycelium-coord`) -- `coord_attach`, `coord_send`, `coord_inbox`, `coord_ack`,
-`coord_checkpoint_publish`, `coord_checkpoint_read` map one-to-one onto the CLI ops below. Smallest
+`coord_checkpoint_publish`, `coord_checkpoint_read` map one-to-one onto the CLI ops below. This is an
+**unmanaged messaging example**: it creates a task, attaches, and sends/acks plain coordination messages
+and a checkpoint; it does **not** `exec-open` an execution record or reserve/claim dispatches, so it is
+not the bounded/managed form of the workflow. A *managed* task additionally opens an execution record and
+reserves then claims each actionable dispatch (see [Bounded execution](#bounded-execution)). Smallest
 concrete round trip between two sessions attached to the same task:
 
 ```bash
@@ -553,9 +562,11 @@ and accepted. The maintained runtime source is the bounded-execution build at co
 branch `sporedrive-bounded-execution` (bridge `cmux_bridge/core.py` sha256 `54cac34e...`, 18 pre-enter
 gate sites); the bundled Mycelium lifecycle source is pinned at `f2b0083` (see `PROVENANCE.md`). The
 concrete commit, cache, and manifest identities are recorded in the accepted release receipt
-`checks/RELEASE-RECEIPT-20260910.json`.
+`checks/RELEASE-RECEIPT-20260910.json`. That receipt and the `checks/live-*` run directories cited below
+are **local validation artifacts from the tested `664de18` release run -- they are not committed to the
+repository and are absent from a GitHub clone**; the results they attest are dated to that release.
 
-**Validation (current):**
+**Validation (tested `664de18` release):**
 
 - **346 offline tests pass** -- coordination 87 (including 5 repair-verification tests), package tests
   45, bridge 214 -- plus `py_compile` and a clean-clone-shaped `tests/test_wfctl.py` (no `snapshots/`,
