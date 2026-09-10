@@ -76,6 +76,12 @@ TARGETS = [
         ".claude/skills/codex-review/SKILL.md",
     ),
     ("file", "src/claude/tools/codex_ask.sh", ".claude/tools/codex_ask.sh"),
+    ("file", "src/claude/tools/codex_launch.py", ".claude/tools/codex_launch.py"),
+    (
+        "file",
+        "src/claude/tools/sporedrive_review_guard.py",
+        ".claude/tools/sporedrive_review_guard.py",
+    ),
     (
         "dir",
         "src/claude/skills/prompt-optimizer",

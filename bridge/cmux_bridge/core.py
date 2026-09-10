@@ -1381,6 +1381,7 @@ class Bridge:
         expected_revision: int,
         kind: str = "task",
         accept_timeout_s: float = 12.0,
+        pre_enter_gate=None,
     ) -> dict:
         """Stage a payload, press Enter at most once on a *verified* staging, then correlate.
 
@@ -1390,6 +1391,14 @@ class Bridge:
         per-binding lock): a concurrent call observes the in-flight operation instead of delivering
         a second time. A duplicate call after completion replays the persisted receipt. Nothing is
         resent after an ambiguous outcome; only a simulated pre-send fault is a resend basis.
+
+        ``pre_enter_gate`` (optional): a caller callback invoked with no args immediately BEFORE the
+        real Enter keystroke — i.e. AFTER all staging/waits — at every Enter site (fresh delivery and
+        reconcile resend). Raising from it withholds the Enter and nothing is sent (the staged text is
+        left for inspection/reconcile, exactly like the writer-lease pre-Enter re-check). SporeDrive's
+        managed transport passes a gate that re-checks the bound execution here, so a pause/expiry that
+        lands DURING this submit's staging still prevents the actual cmux mutation (review R1). Default
+        None preserves the legacy raw behaviour exactly.
         """
         if kind not in SUBMIT_KINDS:
             raise BridgeError(
@@ -1415,6 +1424,7 @@ class Bridge:
                     rel,
                     accept_timeout_s,
                     deadline,
+                    pre_enter_gate,
                 )
         except StateError as e:
             if getattr(e, "code", "") != "lock_timeout":
@@ -1445,6 +1455,7 @@ class Bridge:
         rel,
         accept_timeout_s,
         deadline,
+        pre_enter_gate=None,
     ) -> dict:
         h = sha256_text(text)
         with self.store.lock():
@@ -1458,7 +1469,9 @@ class Bridge:
                 )
             if rec["status"] in TERMINAL_STATUSES:
                 return self._receipt(b, rec, duplicate=True)
-            return self._reconcile(b, rec, rel, accept_timeout_s, deadline)
+            return self._reconcile(
+                b, rec, rel, accept_timeout_s, deadline, pre_enter_gate=pre_enter_gate
+            )
         # a NEW mutation: a stale revision blocks it up front (the reservation re-checks atomically)
         self._check_text(text, kind)
         if int(expected_revision) != int(b["revision"]):
@@ -1525,8 +1538,12 @@ class Bridge:
         if kind_r == "existing":
             if obj["status"] in TERMINAL_STATUSES:
                 return self._receipt(b, obj, duplicate=True)
-            return self._reconcile(b, obj, rel, accept_timeout_s, deadline)
-        return self._deliver_and_confirm(b, obj, rel, accept_timeout_s, deadline)
+            return self._reconcile(
+                b, obj, rel, accept_timeout_s, deadline, pre_enter_gate=pre_enter_gate
+            )
+        return self._deliver_and_confirm(
+            b, obj, rel, accept_timeout_s, deadline, pre_enter_gate=pre_enter_gate
+        )
 
     def _prepare_delivery(
         self, b: dict, request_id: str, text: str
@@ -1614,6 +1631,33 @@ class Bridge:
                     detail=e.to_dict(),
                 ) from e
 
+    def _run_pre_enter_gate(self, pre_enter_gate, rec: dict, rel: str) -> None:
+        """Invoke the optional caller gate immediately before an Enter press (review R1). The gate
+        signals a refusal by RAISING; the staged text is then left in the editor unsubmitted (nothing
+        is cleared or resent), exactly like the writer-lease pre-Enter re-check. A BridgeError
+        propagates as-is; any other exception is wrapped so nothing is pressed."""
+        if pre_enter_gate is None:
+            return
+        try:
+            pre_enter_gate()
+        except BridgeError as e:
+            self._mark(rec, rel, "uncertain", pre_enter_gate=e.to_dict())
+            raise
+        except (
+            Exception
+        ) as e:  # pragma: no cover - defensive: an unexpected gate error never sends
+            self._mark(
+                rec,
+                rel,
+                "uncertain",
+                pre_enter_gate={"error": f"{type(e).__name__}: {e}"},
+            )
+            raise BridgeError(
+                "pre_enter_gate_error",
+                "the pre-Enter gate raised; the Enter was NOT pressed",
+                detail=f"{type(e).__name__}: {e}",
+            ) from e
+
     def _deliver_and_confirm(
         self,
         b: dict,
@@ -1622,6 +1666,7 @@ class Bridge:
         accept_timeout_s: float,
         deadline: float,
         resend_basis: str | None = None,
+        pre_enter_gate=None,
     ) -> dict:
         text = rec["delivered_text"]
         if resend_basis:
@@ -1700,6 +1745,9 @@ class Bridge:
         # release or a rebind that lands after staging must still block it, not just the earlier
         # reservation-time preflight.
         self._assert_writer_before_enter(b, rec, rel)
+        # review R1: a caller gate re-checked AFTER staging, immediately before the real Enter — a
+        # pause/expiry that landed during this submit's own staging/waits withholds the keystroke.
+        self._run_pre_enter_gate(pre_enter_gate, rec, rel)
         self._mark(
             rec,
             rel,
@@ -1888,6 +1936,7 @@ class Bridge:
         rel: str,
         accept_timeout_s: float,
         deadline: float,
+        pre_enter_gate=None,
     ) -> dict:
         """Non-terminal record. Correlate first; re-deliver ONLY on a simulated pre-send fault (the
         one proven zero-bytes-sent case). A non-zero CLI exit is never a resend basis (item 3), and
@@ -1939,7 +1988,13 @@ class Bridge:
         basis = "simulated_pre_send_fault" if sr == "not_attempted_simulated" else None
         if basis and screen["state"] == "prompt_idle":
             return self._deliver_and_confirm(
-                b, rec, rel, accept_timeout_s, deadline, resend_basis=basis
+                b,
+                rec,
+                rel,
+                accept_timeout_s,
+                deadline,
+                resend_basis=basis,
+                pre_enter_gate=pre_enter_gate,
             )
         if screen["state"] == "staged":
             ok, why = staged_is_ours(text, screen)
@@ -1948,6 +2003,8 @@ class Bridge:
                 # release/rebind landing during this later window must block it too, not only the
                 # already-covered initial Enter and reservation-time preflight.
                 self._assert_writer_before_enter(b, rec, rel)
+                # review R1: the same post-staging execution gate covers the reconcile Enter too.
+                self._run_pre_enter_gate(pre_enter_gate, rec, rel)
                 self._mark(
                     rec,
                     rel,

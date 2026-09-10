@@ -127,6 +127,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reply-to", default=None)
     p.add_argument("--correlation-id", default=None)
     p.add_argument("--host", action="append", default=[])
+    p.add_argument(
+        "--execution-action",
+        default=None,
+        dest="execution_action_id",
+        help="reservation funding this work request on a managed task (review R1)",
+    )
+    p.add_argument(
+        "--actionable",
+        default=None,
+        action=argparse.BooleanOptionalAction,
+        help="explicit managed disposition (review R1): --actionable marks this message as a work "
+        "dispatch and REQUIRES a compatible reservation (--execution-action); --no-actionable marks "
+        "a non-actionable status/notice that never wakes a completed/closed executor. Default: "
+        "derived from --kind (task-like kinds are actionable). A trusted-agent disposition, never a "
+        "free-text parse.",
+    )
 
     p = sub.add_parser("inbox")
     p.add_argument("task_id")
@@ -207,10 +223,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--scope", required=True, dest="scope_ref")
     p.add_argument("--authorization", required=True, dest="authorization_ref")
     p.add_argument("--manifest", default=None, help="JSON {cid:{...}} or - for stdin")
-    p.add_argument("--limits", default=None, help="JSON limits overrides or - for stdin")
+    p.add_argument(
+        "--limits", default=None, help="JSON limits overrides or - for stdin"
+    )
     p.add_argument("--expires-at", default=None, dest="expires_at")
     p.add_argument("--phase", default="implementation")
     p.add_argument("--prev", default=None, dest="previous_execution_id")
+    p.add_argument(
+        "--unattended",
+        action="store_true",
+        help="unattended/automation-driven: requires a finite --expires-at and --automation-ref (R5)",
+    )
+    p.add_argument(
+        "--automation-ref",
+        default=None,
+        dest="automation_ref",
+        help="automation to pause on shutdown for an unattended execution (R5)",
+    )
 
     p = sub.add_parser("exec-read")
     p.add_argument("task_id")
@@ -220,11 +249,21 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("exec-reserve")
     p.add_argument("task_id")
     p.add_argument("--action-id", required=True, dest="action_id")
-    p.add_argument("--kind", required=True, choices=["work_dispatch", "review_launch", "repair"])
+    p.add_argument(
+        "--kind", required=True, choices=["work_dispatch", "review_launch", "repair"]
+    )
     p.add_argument("--purpose", default=None)
     p.add_argument("--criterion", default=None, dest="criterion_ref")
     p.add_argument("--repair-blocker", default=None, dest="repair_blocker_id")
-    p.add_argument("--expected-version", type=int, default=None, dest="expected_state_version")
+    p.add_argument(
+        "--dispatch-binding",
+        default=None,
+        dest="dispatch_binding",
+        help="pre-bind this reservation to one concrete dispatch identity (review R1)",
+    )
+    p.add_argument(
+        "--expected-version", type=int, default=None, dest="expected_state_version"
+    )
 
     p = sub.add_parser("exec-settle")
     p.add_argument("task_id")
@@ -232,7 +271,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--outcome", required=True)
     p.add_argument("--evidence", default=None, dest="evidence_ref")
     p.add_argument("--criterion", default=None, dest="criterion_ref")
-    p.add_argument("--expected-version", type=int, default=None, dest="expected_state_version")
+    p.add_argument(
+        "--expected-version", type=int, default=None, dest="expected_state_version"
+    )
 
     p = sub.add_parser("exec-record-evidence")
     p.add_argument("task_id")
@@ -241,7 +282,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--attestation", default=None)
     p.add_argument("--sha256", default=None, dest="evidence_sha256")
     p.add_argument("--by", default=None, dest="accepted_by")
-    p.add_argument("--expected-version", type=int, default=None, dest="expected_state_version")
+    p.add_argument(
+        "--expected-version", type=int, default=None, dest="expected_state_version"
+    )
 
     p = sub.add_parser("exec-open-blocker")
     p.add_argument("task_id")
@@ -249,19 +292,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--criterion", required=True, dest="criterion_id")
     p.add_argument("--evidence", required=True, dest="evidence_ref")
     p.add_argument("--description", default=None)
-    p.add_argument("--expected-version", type=int, default=None, dest="expected_state_version")
+    p.add_argument(
+        "--expected-version", type=int, default=None, dest="expected_state_version"
+    )
 
     p = sub.add_parser("exec-resolve-blocker")
     p.add_argument("task_id")
     p.add_argument("--blocker-id", required=True, dest="blocker_id")
     p.add_argument("--resolution", default=None, dest="resolution_ref")
-    p.add_argument("--expected-version", type=int, default=None, dest="expected_state_version")
+    p.add_argument(
+        "--expected-version", type=int, default=None, dest="expected_state_version"
+    )
 
     p = sub.add_parser("exec-backlog")
     p.add_argument("task_id")
     p.add_argument("--item", required=True)
     p.add_argument("--source", default=None)
-    p.add_argument("--expected-version", type=int, default=None, dest="expected_state_version")
+    p.add_argument(
+        "--expected-version", type=int, default=None, dest="expected_state_version"
+    )
 
     p = sub.add_parser("exec-reserve-call")
     p.add_argument("task_id")
@@ -269,7 +318,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--phase", required=True, choices=["technical_debug", "acceptance"])
     p.add_argument("--freeze-identity", required=True, dest="freeze_identity")
     p.add_argument("--purpose", default=None)
-    p.add_argument("--expected-version", type=int, default=None, dest="expected_state_version")
+    p.add_argument(
+        "--expected-version", type=int, default=None, dest="expected_state_version"
+    )
 
     p = sub.add_parser("exec-settle-call")
     p.add_argument("task_id")
@@ -277,30 +328,113 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--freeze-identity", required=True, dest="freeze_identity")
     p.add_argument("--outcome", required=True)
     p.add_argument("--response", default=None, dest="response_ref")
-    p.add_argument("--expected-version", type=int, default=None, dest="expected_state_version")
+    p.add_argument(
+        "--expected-version", type=int, default=None, dest="expected_state_version"
+    )
 
     p = sub.add_parser("exec-pause")
     p.add_argument("task_id")
     p.add_argument("--authorization", required=True, dest="authorization_ref")
     p.add_argument("--reason", default=None)
-    p.add_argument("--expected-version", type=int, default=None, dest="expected_state_version")
+    p.add_argument(
+        "--expected-version", type=int, default=None, dest="expected_state_version"
+    )
 
     p = sub.add_parser("exec-unpause")
     p.add_argument("task_id")
     p.add_argument("--authorization", required=True, dest="authorization_ref")
-    p.add_argument("--expected-version", type=int, default=None, dest="expected_state_version")
+    p.add_argument(
+        "--expected-version", type=int, default=None, dest="expected_state_version"
+    )
 
     p = sub.add_parser("exec-change-limits")
     p.add_argument("task_id")
     p.add_argument("--authorization", required=True, dest="authorization_ref")
-    p.add_argument("--changes", required=True, help="JSON object of limit changes or - for stdin")
-    p.add_argument("--expected-version", type=int, default=None, dest="expected_state_version")
+    p.add_argument(
+        "--changes", required=True, help="JSON object of limit changes or - for stdin"
+    )
+    p.add_argument(
+        "--expected-version", type=int, default=None, dest="expected_state_version"
+    )
 
     p = sub.add_parser("exec-set-phase")
     p.add_argument("task_id")
-    p.add_argument("--phase", required=True,
-                   choices=["implementation", "technical_debug", "acceptance", "execution", "closure"])
-    p.add_argument("--expected-version", type=int, default=None, dest="expected_state_version")
+    p.add_argument(
+        "--phase",
+        required=True,
+        choices=[
+            "implementation",
+            "technical_debug",
+            "acceptance",
+            "execution",
+            "closure",
+        ],
+    )
+    p.add_argument(
+        "--expected-version", type=int, default=None, dest="expected_state_version"
+    )
+
+    # --- review R1/R3/R4/R5 managed-launch and lifecycle surfaces ---
+    p = sub.add_parser("exec-claim-dispatch")
+    p.add_argument("task_id")
+    p.add_argument("--action-id", required=True, dest="action_id")
+    p.add_argument("--dispatch-identity", required=True, dest="dispatch_identity")
+    p.add_argument(
+        "--expected-version", type=int, default=None, dest="expected_state_version"
+    )
+
+    p = sub.add_parser("exec-claim-review")
+    p.add_argument("task_id")
+    p.add_argument("--execution-id", required=True, dest="execution_id")
+    p.add_argument("--action-id", required=True, dest="action_id")
+    p.add_argument("--launch-identity", required=True, dest="launch_identity")
+    p.add_argument(
+        "--deadline",
+        type=float,
+        default=None,
+        dest="caller_deadline_seconds",
+        help="caller deadline in seconds; may only SHORTEN the policy deadline",
+    )
+    p.add_argument(
+        "--expected-version", type=int, default=None, dest="expected_state_version"
+    )
+
+    p = sub.add_parser("exec-settle-review")
+    p.add_argument("task_id")
+    p.add_argument("--action-id", required=True, dest="action_id")
+    p.add_argument("--outcome", required=True)
+    p.add_argument("--launch-identity", default=None, dest="launch_identity")
+    p.add_argument("--response", default=None, dest="response_ref")
+    p.add_argument(
+        "--expected-version", type=int, default=None, dest="expected_state_version"
+    )
+
+    p = sub.add_parser("exec-record-completion")
+    p.add_argument("task_id")
+    p.add_argument("--completion-ref", required=True, dest="completion_ref")
+    p.add_argument("--by", required=True, dest="accepted_by")
+    p.add_argument("--attestation", default=None)
+    p.add_argument(
+        "--expected-version", type=int, default=None, dest="expected_state_version"
+    )
+
+    p = sub.add_parser("exec-request-shutdown")
+    p.add_argument("task_id")
+    p.add_argument("--reason", default="expiry")
+    p.add_argument(
+        "--expected-version", type=int, default=None, dest="expected_state_version"
+    )
+
+    p = sub.add_parser("exec-note-expiry-shutdown")
+    p.add_argument("task_id")
+
+    p = sub.add_parser("exec-reconcile-shutdown")
+    p.add_argument("task_id")
+    p.add_argument("--outcome", default="paused")
+    p.add_argument("--detail", default=None)
+    p.add_argument(
+        "--expected-version", type=int, default=None, dest="expected_state_version"
+    )
 
     return ap
 
@@ -378,6 +512,8 @@ def run(argv: list[str] | None = None) -> int:
                     reply_to=args.reply_to,
                     correlation_id=args.correlation_id,
                     host=_kv(args.host),
+                    execution_action_id=args.execution_action_id,
+                    actionable=args.actionable,
                 )
             )
         elif op == "inbox":
@@ -470,64 +606,206 @@ def run(argv: list[str] | None = None) -> int:
                 )
             )
         elif op == "exec-open":
-            _emit(em.open_execution(
-                args.task_id, execution_id=args.execution_id, scope_ref=args.scope_ref,
-                authorization_ref=args.authorization_ref,
-                acceptance_manifest=_load_json_arg(args.manifest),
-                limits_overrides=_load_json_arg(args.limits), expires_at=args.expires_at,
-                phase=args.phase, previous_execution_id=args.previous_execution_id))
+            _emit(
+                em.open_execution(
+                    args.task_id,
+                    execution_id=args.execution_id,
+                    scope_ref=args.scope_ref,
+                    authorization_ref=args.authorization_ref,
+                    acceptance_manifest=_load_json_arg(args.manifest),
+                    limits_overrides=_load_json_arg(args.limits),
+                    expires_at=args.expires_at,
+                    phase=args.phase,
+                    previous_execution_id=args.previous_execution_id,
+                    attended=not args.unattended,
+                    automation_ref=args.automation_ref,
+                )
+            )
         elif op == "exec-read":
             _emit(em.read_execution(args.task_id))
         elif op == "exec-status":
             _emit(em.status(args.task_id))
         elif op == "exec-reserve":
-            _emit(em.reserve(args.task_id, action_id=args.action_id, kind=args.kind,
-                             purpose=args.purpose, criterion_ref=args.criterion_ref,
-                             repair_blocker_id=args.repair_blocker_id,
-                             expected_state_version=args.expected_state_version))
+            _emit(
+                em.reserve(
+                    args.task_id,
+                    action_id=args.action_id,
+                    kind=args.kind,
+                    purpose=args.purpose,
+                    criterion_ref=args.criterion_ref,
+                    repair_blocker_id=args.repair_blocker_id,
+                    dispatch_binding=args.dispatch_binding,
+                    expected_state_version=args.expected_state_version,
+                )
+            )
         elif op == "exec-settle":
-            _emit(em.settle(args.task_id, action_id=args.action_id, outcome=args.outcome,
-                            evidence_ref=args.evidence_ref, criterion_ref=args.criterion_ref,
-                            expected_state_version=args.expected_state_version))
+            _emit(
+                em.settle(
+                    args.task_id,
+                    action_id=args.action_id,
+                    outcome=args.outcome,
+                    evidence_ref=args.evidence_ref,
+                    criterion_ref=args.criterion_ref,
+                    expected_state_version=args.expected_state_version,
+                )
+            )
         elif op == "exec-record-evidence":
-            _emit(em.record_evidence(args.task_id, criterion_id=args.criterion_id,
-                                     evidence_ref=args.evidence_ref, attestation=args.attestation,
-                                     evidence_sha256=args.evidence_sha256, accepted_by=args.accepted_by,
-                                     expected_state_version=args.expected_state_version))
+            _emit(
+                em.record_evidence(
+                    args.task_id,
+                    criterion_id=args.criterion_id,
+                    evidence_ref=args.evidence_ref,
+                    attestation=args.attestation,
+                    evidence_sha256=args.evidence_sha256,
+                    accepted_by=args.accepted_by,
+                    expected_state_version=args.expected_state_version,
+                )
+            )
         elif op == "exec-open-blocker":
-            _emit(em.open_blocker(args.task_id, blocker_id=args.blocker_id,
-                                  criterion_id=args.criterion_id, evidence_ref=args.evidence_ref,
-                                  description=args.description,
-                                  expected_state_version=args.expected_state_version))
+            _emit(
+                em.open_blocker(
+                    args.task_id,
+                    blocker_id=args.blocker_id,
+                    criterion_id=args.criterion_id,
+                    evidence_ref=args.evidence_ref,
+                    description=args.description,
+                    expected_state_version=args.expected_state_version,
+                )
+            )
         elif op == "exec-resolve-blocker":
-            _emit(em.resolve_blocker(args.task_id, blocker_id=args.blocker_id,
-                                     resolution_ref=args.resolution_ref,
-                                     expected_state_version=args.expected_state_version))
+            _emit(
+                em.resolve_blocker(
+                    args.task_id,
+                    blocker_id=args.blocker_id,
+                    resolution_ref=args.resolution_ref,
+                    expected_state_version=args.expected_state_version,
+                )
+            )
         elif op == "exec-backlog":
-            _emit(em.add_backlog(args.task_id, item=args.item, source=args.source,
-                                 expected_state_version=args.expected_state_version))
+            _emit(
+                em.add_backlog(
+                    args.task_id,
+                    item=args.item,
+                    source=args.source,
+                    expected_state_version=args.expected_state_version,
+                )
+            )
         elif op == "exec-reserve-call":
-            _emit(em.reserve_call(args.task_id, action_id=args.action_id, phase=args.phase,
-                                  freeze_identity=args.freeze_identity, purpose=args.purpose,
-                                  expected_state_version=args.expected_state_version))
+            _emit(
+                em.reserve_call(
+                    args.task_id,
+                    action_id=args.action_id,
+                    phase=args.phase,
+                    freeze_identity=args.freeze_identity,
+                    purpose=args.purpose,
+                    expected_state_version=args.expected_state_version,
+                )
+            )
         elif op == "exec-settle-call":
-            _emit(em.settle_call(args.task_id, action_id=args.action_id,
-                                 freeze_identity=args.freeze_identity, outcome=args.outcome,
-                                 response_ref=args.response_ref,
-                                 expected_state_version=args.expected_state_version))
+            _emit(
+                em.settle_call(
+                    args.task_id,
+                    action_id=args.action_id,
+                    freeze_identity=args.freeze_identity,
+                    outcome=args.outcome,
+                    response_ref=args.response_ref,
+                    expected_state_version=args.expected_state_version,
+                )
+            )
         elif op == "exec-pause":
-            _emit(em.pause(args.task_id, authorization_ref=args.authorization_ref,
-                           reason=args.reason, expected_state_version=args.expected_state_version))
+            _emit(
+                em.pause(
+                    args.task_id,
+                    authorization_ref=args.authorization_ref,
+                    reason=args.reason,
+                    expected_state_version=args.expected_state_version,
+                )
+            )
         elif op == "exec-unpause":
-            _emit(em.unpause(args.task_id, authorization_ref=args.authorization_ref,
-                             expected_state_version=args.expected_state_version))
+            _emit(
+                em.unpause(
+                    args.task_id,
+                    authorization_ref=args.authorization_ref,
+                    expected_state_version=args.expected_state_version,
+                )
+            )
         elif op == "exec-change-limits":
-            _emit(em.change_limits(args.task_id, authorization_ref=args.authorization_ref,
-                                   changes=_load_json_arg(args.changes),
-                                   expected_state_version=args.expected_state_version))
+            _emit(
+                em.change_limits(
+                    args.task_id,
+                    authorization_ref=args.authorization_ref,
+                    changes=_load_json_arg(args.changes),
+                    expected_state_version=args.expected_state_version,
+                )
+            )
         elif op == "exec-set-phase":
-            _emit(em.set_phase(args.task_id, phase=args.phase,
-                               expected_state_version=args.expected_state_version))
+            _emit(
+                em.set_phase(
+                    args.task_id,
+                    phase=args.phase,
+                    expected_state_version=args.expected_state_version,
+                )
+            )
+        elif op == "exec-claim-dispatch":
+            res = em.claim_dispatch(
+                args.task_id,
+                action_id=args.action_id,
+                dispatch_identity=args.dispatch_identity,
+                expected_state_version=args.expected_state_version,
+            )
+            _emit(res)
+            return 0 if res.get("ok") else 3
+        elif op == "exec-claim-review":
+            res = em.claim_review(
+                args.task_id,
+                execution_id=args.execution_id,
+                action_id=args.action_id,
+                launch_identity=args.launch_identity,
+                caller_deadline_seconds=args.caller_deadline_seconds,
+                expected_state_version=args.expected_state_version,
+            )
+            _emit(res)
+            return 0 if res.get("ok") else 3
+        elif op == "exec-settle-review":
+            _emit(
+                em.settle_review(
+                    args.task_id,
+                    action_id=args.action_id,
+                    outcome=args.outcome,
+                    launch_identity=args.launch_identity,
+                    response_ref=args.response_ref,
+                    expected_state_version=args.expected_state_version,
+                )
+            )
+        elif op == "exec-record-completion":
+            _emit(
+                em.record_completion(
+                    args.task_id,
+                    completion_ref=args.completion_ref,
+                    accepted_by=args.accepted_by,
+                    attestation=args.attestation,
+                    expected_state_version=args.expected_state_version,
+                )
+            )
+        elif op == "exec-request-shutdown":
+            _emit(
+                em.request_shutdown(
+                    args.task_id,
+                    reason=args.reason,
+                    expected_state_version=args.expected_state_version,
+                )
+            )
+        elif op == "exec-note-expiry-shutdown":
+            _emit(em.note_expiry_shutdown(args.task_id))
+        elif op == "exec-reconcile-shutdown":
+            _emit(
+                em.reconcile_shutdown(
+                    args.task_id,
+                    outcome=args.outcome,
+                    detail=args.detail,
+                    expected_state_version=args.expected_state_version,
+                )
+            )
         else:  # pragma: no cover
             _emit({"error": "unknown_op", "op": op})
             return 2

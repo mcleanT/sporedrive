@@ -34,6 +34,7 @@ from mycelium_coord.execution import (  # noqa: E402
     PHASE_ACCEPTANCE,
     PHASE_TECHNICAL_DEBUG,
     STATUS_ACTIVE,
+    STATUS_CLOSED,
     STATUS_COMPLETED,
     ExecutionManager,
 )
@@ -71,14 +72,23 @@ class EnforcingAdapter:
         return hashlib.sha256(f"build={self.provider.build}".encode()).hexdigest()[:16]
 
     def call(self, action_id: str, prompt: str, *, phase: str = PHASE_ACCEPTANCE):
-        self.em.reserve_call(self.task_id, action_id=action_id, phase=phase,
-                             freeze_identity=self._freeze())
+        self.em.reserve_call(
+            self.task_id,
+            action_id=action_id,
+            phase=phase,
+            freeze_identity=self._freeze(),
+        )
         resp = self.provider.call(prompt)
         valid = _is_valid_json_answer(resp)
         # settle binds the response to the identity that is current NOW; a mid-call build change
         # raises freeze_identity_mismatch here.
-        self.em.settle_call(self.task_id, action_id=action_id, freeze_identity=self._freeze(),
-                            outcome="ok" if valid else "invalid", response_ref=f"/resp/{action_id}")
+        self.em.settle_call(
+            self.task_id,
+            action_id=action_id,
+            freeze_identity=self._freeze(),
+            outcome="ok" if valid else "invalid",
+            response_ref=f"/resp/{action_id}",
+        )
         return resp, valid
 
 
@@ -94,58 +104,98 @@ def _is_valid_json_answer(text: str) -> bool:
 
 def _open(root, *, manifest, calls):
     em = ExecutionManager(CoordStore(root))
-    em.open_execution("t1", execution_id="e1", scope_ref=SCOPE, authorization_ref=AUTH,
-                      acceptance_manifest=manifest, limits_overrides=calls)
+    em.open_execution(
+        "t1",
+        execution_id="e1",
+        scope_ref=SCOPE,
+        authorization_ref=AUTH,
+        acceptance_manifest=manifest,
+        limits_overrides=calls,
+    )
     return em
 
 
 def test_enforcing_adapter_valid_acceptance_closes():
     with tempfile.TemporaryDirectory() as d:
-        em = _open(d, manifest={"acc": {"kind": "acceptance", "description": "fresh acceptance"}},
-                   calls={"acceptance_calls": 3})
+        em = _open(
+            d,
+            manifest={"acc": {"kind": "acceptance", "description": "fresh acceptance"}},
+            calls={"acceptance_calls": 3},
+        )
         em.set_phase("t1", phase=PHASE_ACCEPTANCE)
         adapter = EnforcingAdapter(em, "t1", FakeProvider("AAA", ['{"answer": "ok"}']))
         _resp, valid = adapter.call("c1", "check?")
         assert valid is True
-        em.record_evidence("t1", criterion_id="acc", evidence_ref="/resp/c1", accepted_by="adapter")
+        # coverage complete -> CLOSURE (not terminal completion; that needs a final receipt, R4)
+        em.record_evidence(
+            "t1",
+            criterion_id="acc",
+            evidence_ref="/resp/c1",
+            attestation="acceptance response validated by adapter",
+            accepted_by="adapter",
+        )
         s = em.status("t1")
-        assert s["status"] == STATUS_COMPLETED
+        assert s["status"] == STATUS_CLOSED
+        assert s["coverage"]["complete"] is True
         assert s["usage"]["acceptance_calls"] == 1
+        # the explicit final completion receipt is the SEPARATE transition to terminal completed
+        em.record_completion("t1", completion_ref="/receipt/final", accepted_by="user")
+        assert em.status("t1")["status"] == STATUS_COMPLETED
 
 
 def test_truncated_probe_leaves_readiness_unestablished():
     with tempfile.TemporaryDirectory() as d:
-        em = _open(d, manifest={"acc": {"kind": "acceptance", "description": "fresh acceptance"}},
-                   calls={"technical_calls": 3, "acceptance_calls": 3})
+        em = _open(
+            d,
+            manifest={"acc": {"kind": "acceptance", "description": "fresh acceptance"}},
+            calls={"technical_calls": 3, "acceptance_calls": 3},
+        )
         em.set_phase("t1", phase=PHASE_TECHNICAL_DEBUG)
         # a technical-debug probe returns a compact TRUNCATED JSON body
-        adapter = EnforcingAdapter(em, "t1", FakeProvider("AAA", ['{"answer": "ok']))  # missing }
+        adapter = EnforcingAdapter(
+            em, "t1", FakeProvider("AAA", ['{"answer": "ok'])
+        )  # missing }
         _resp, valid = adapter.call("p1", "probe?", phase=PHASE_TECHNICAL_DEBUG)
-        assert valid is False                     # truncated body is not a valid result
+        assert valid is False  # truncated body is not a valid result
         # the probe is debugging evidence, not acceptance evidence: no criterion is recorded
         s = em.status("t1")
-        assert s["coverage"]["complete"] is False   # readiness remains UNESTABLISHED
+        assert s["coverage"]["complete"] is False  # readiness remains UNESTABLISHED
         assert s["status"] == STATUS_ACTIVE
-        assert s["usage"]["technical_calls"] == 1   # the probe WAS ledgered
+        assert s["usage"]["technical_calls"] == 1  # the probe WAS ledgered
         assert s["usage"]["acceptance_calls"] == 0  # nothing counted as acceptance
 
 
 def test_build_change_within_acceptance_batch_invalidates_no_blended_cycle():
     with tempfile.TemporaryDirectory() as d:
-        em = _open(d, manifest={
-            "acc1": {"kind": "acceptance", "description": "first acceptance check"},
-            "acc2": {"kind": "acceptance", "description": "second acceptance check"},
-        }, calls={"acceptance_calls": 4})
+        em = _open(
+            d,
+            manifest={
+                "acc1": {"kind": "acceptance", "description": "first acceptance check"},
+                "acc2": {
+                    "kind": "acceptance",
+                    "description": "second acceptance check",
+                },
+            },
+            calls={"acceptance_calls": 4},
+        )
         em.set_phase("t1", phase=PHASE_ACCEPTANCE)
         provider = FakeProvider("AAA", ['{"answer": "one"}', '{"answer": "two"}'])
         adapter = EnforcingAdapter(em, "t1", provider)
         adapter.call("c1", "check1?")
-        em.record_evidence("t1", criterion_id="acc1", evidence_ref="/resp/c1")
-        assert em.read_execution("t1")["acceptance_manifest"]["acc1"]["accepted"] is True
+        em.record_evidence(
+            "t1",
+            criterion_id="acc1",
+            evidence_ref="/resp/c1",
+            attestation="acc1 validated",
+            accepted_by="adapter",
+        )
+        assert (
+            em.read_execution("t1")["acceptance_manifest"]["acc1"]["accepted"] is True
+        )
         # someone patches the implementation mid-batch -> the provider's build changes
         provider.build = "BBB"
         with pytest.raises(ProtocolError) as ei:
-            adapter.call("c2", "check2?")           # reserve_call sees a new freeze identity
+            adapter.call("c2", "check2?")  # reserve_call sees a new freeze identity
         assert ei.value.code == "freeze_identity_mismatch"
         rec = em.read_execution("t1")
         # the criterion proven under the stale build is invalidated; no blended passing cycle
@@ -159,15 +209,20 @@ def test_observational_adapter_cannot_claim_enforcement():
     managed allowance and sets NO freeze identity — it is observational and cannot claim enforced
     phase/call limits, exactly as the plan states."""
     with tempfile.TemporaryDirectory() as d:
-        em = _open(d, manifest={"acc": {"kind": "acceptance", "description": "x"}},
-                   calls={"acceptance_calls": 3})
+        em = _open(
+            d,
+            manifest={"acc": {"kind": "acceptance", "description": "x"}},
+            calls={"acceptance_calls": 3},
+        )
         em.set_phase("t1", phase=PHASE_ACCEPTANCE)
         provider = FakeProvider("AAA", ['{"answer": "ok"}', '{"answer": "ok"}'])
         # observational: no reserve_call/settle_call at all
         provider.call("a?")
         provider.call("b?")
         s = em.status("t1")
-        assert s["usage"]["acceptance_calls"] == 0     # the core enforced nothing it never saw
+        assert (
+            s["usage"]["acceptance_calls"] == 0
+        )  # the core enforced nothing it never saw
         assert em.read_execution("t1")["acceptance_freeze"] is None
 
 

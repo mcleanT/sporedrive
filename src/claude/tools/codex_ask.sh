@@ -36,6 +36,15 @@
 #   -x  exec_ref     managed execution id/reference recorded in the receipt (ties a review launch to
 #                    an execution record). Additive; does not change output/stdout/exit contracts.
 #   -a  action_ref   reserved action id recorded in the receipt (the reservation this launch settles).
+#   -T  task_ref     managed task id (the coordination task the reservation lives under).
+#                    ANY of -x/-a/-T present makes this a MANAGED launch (review R3): all three are
+#                    then REQUIRED (a partial managed reference fails BEFORE codex starts, exit 65).
+#                    A managed launch claims its review-launch reservation via the bundled
+#                    sporedrive_review_guard.py, gets back the maintained-policy review deadline
+#                    (capping/overriding any -t), and always routes through the owned codex_launch.py
+#                    launcher below. No open, matching reservation -> codex never starts (exit 75).
+#                    On return the reservation is settled (complete/timeout/uncertain by exit code);
+#                    a settle failure is a non-fatal warning, like the receipt write.
 #   -n  dry-run      assemble and print the prompt only; do NOT call codex
 # Env: CODEX_ASK_OUTDIR overrides the temp dir for prompt/output files.
 # Output: codex's stdout AND stderr are merged into the output file (BYTE-IDENTICAL to before this
@@ -86,9 +95,10 @@ OUTDIR="${OUTDIR%/}"
 DEADLINE=""
 EXECUTION_REF=""
 ACTION_REF=""
+TASK_REF=""
 
 usage() {
-  echo 'Usage: codex_ask [-m MODEL] [-e low|medium|high|xhigh|ultra|max] [-f FILE]... [-o OUTFILE] [-t SECONDS] [-x EXEC_REF] [-a ACTION_REF] [-n] "QUESTION"' >&2
+  echo 'Usage: codex_ask [-m MODEL] [-e low|medium|high|xhigh|ultra|max] [-f FILE]... [-o OUTFILE] [-t SECONDS] [-x EXEC_REF] [-a ACTION_REF] [-T TASK_REF] [-n] "QUESTION"' >&2
   exit 64
 }
 
@@ -272,7 +282,7 @@ write_receipt() {
   } > "$receipt_file"
 }
 
-while getopts ":m:e:f:o:t:x:a:nh" opt; do
+while getopts ":m:e:f:o:t:x:a:T:nh" opt; do
   case "$opt" in
     m) MODEL="$OPTARG" ;;
     e) EFFORT="$OPTARG" ;;
@@ -281,6 +291,7 @@ while getopts ":m:e:f:o:t:x:a:nh" opt; do
     t) DEADLINE="$OPTARG" ;;
     x) EXECUTION_REF="$OPTARG" ;;
     a) ACTION_REF="$OPTARG" ;;
+    T) TASK_REF="$OPTARG" ;;
     n) DRY_RUN=1 ;;
     h) usage ;;
     \?) echo "Unknown option -$OPTARG" >&2; usage ;;
@@ -351,19 +362,66 @@ else
   OUT_FILE="$(mktemp "${OUTDIR}/codex_${SLUG:-ask}.XXXXXX.txt")"
 fi
 
+# --- Resolve this script's own directory, symlink-safe. Needed to find the adjacent
+# codex_launch.py launcher and (for a MANAGED launch) the review guard. --------------------------
+_src="${BASH_SOURCE[0]}"
+while [ -h "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)"
+  _src="$(readlink "$_src")"
+  [ "${_src#/}" = "$_src" ] && _src="$_dir/$_src"   # relative link target -> anchor to its dir
+done
+_scriptdir="$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)"
+
+# --- MANAGED launch gate (review R3) -------------------------------------------------------------
+# Any of -x/-a/-T present makes this a MANAGED launch: it must be tied to an existing, still-open
+# review-launch reservation BEFORE codex ever starts. A malformed/partial managed reference, a
+# missing guard, or a refused claim all fail HERE (codex never runs, no complete=true receipt is
+# ever written for it). A successful claim always yields a finite effective deadline, which
+# overrides/caps any -t the caller passed — so a managed launch always routes through the owned
+# codex_launch.py launcher below, exactly like an explicit -t would.
+MANAGED=0
+if [ -n "$EXECUTION_REF" ] || [ -n "$ACTION_REF" ] || [ -n "$TASK_REF" ]; then
+  MANAGED=1
+fi
+LAUNCH_ID=""
+GUARD=""
+if [ "$MANAGED" -eq 1 ]; then
+  if [ -z "$EXECUTION_REF" ] || [ -z "$ACTION_REF" ] || [ -z "$TASK_REF" ]; then
+    echo "[codex_ask] managed launch requires -x, -a, AND -T together (partial managed reference)" >&2
+    exit 65
+  fi
+  if [ -n "$DEADLINE" ]; then
+    case "$DEADLINE" in
+      ''|*[!0-9.]*) echo "[codex_ask] -t deadline must be numeric seconds" >&2; exit 64 ;;
+    esac
+  fi
+  LAUNCH_ID="launch-$$-$(date +%s)"
+  GUARD="$_scriptdir/sporedrive_review_guard.py"
+  [ -f "$GUARD" ] || { echo "[codex_ask] managed launch requested but review guard not found at $GUARD" >&2; exit 70; }
+  GUARD_ERR_FILE="$(mktemp "${OUTDIR}/codex_guard_err.XXXXXX" 2>/dev/null || mktemp)"
+  GUARD_STDOUT="$(python3 "$GUARD" claim --task "$TASK_REF" --execution "$EXECUTION_REF" \
+    --action "$ACTION_REF" --launch-identity "$LAUNCH_ID" ${DEADLINE:+--deadline "$DEADLINE"} \
+    2>"$GUARD_ERR_FILE")"
+  GUARD_RC=$?
+  if [ "$GUARD_RC" -ne 0 ]; then
+    cat "$GUARD_ERR_FILE" >&2
+    rm -f "$GUARD_ERR_FILE"
+    exit 75
+  fi
+  rm -f "$GUARD_ERR_FILE"
+  DEADLINE="${GUARD_STDOUT#EFFECTIVE_DEADLINE=}"
+  if [ -z "$DEADLINE" ] || [ "$DEADLINE" = "$GUARD_STDOUT" ]; then
+    echo "[codex_ask] managed launch: guard did not report an effective deadline" >&2
+    exit 75
+  fi
+fi
+
 # --- Resolve the owned-process launcher when a deadline is requested (symlink-safe) -------------
 LAUNCHER=""
 if [ -n "$DEADLINE" ]; then
   case "$DEADLINE" in
     ''|*[!0-9.]*) echo "[codex_ask] -t deadline must be numeric seconds" >&2; exit 64 ;;
   esac
-  _src="${BASH_SOURCE[0]}"
-  while [ -h "$_src" ]; do
-    _dir="$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)"
-    _src="$(readlink "$_src")"
-    [ "${_src#/}" = "$_src" ] && _src="$_dir/$_src"   # relative link target -> anchor to its dir
-  done
-  _scriptdir="$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)"
   LAUNCHER="$_scriptdir/codex_launch.py"
   [ -f "$LAUNCHER" ] || { echo "[codex_ask] -t requested but launcher not found at $LAUNCHER" >&2; exit 70; }
 fi
@@ -409,6 +467,18 @@ DURATION_S="$SECONDS"
 # --- Adjacent structured JSON result receipt (additive-only; see header comment) ----------------
 write_receipt "$OUT_FILE" "$RC" "$DURATION_S" "$INVOKED_AT" "$MODEL" "$EFFORT" "$PROMPT_FILE" "$LAST_MSG_FILE" "$FRESH_ARTIFACT" "$EXECUTION_REF" "$ACTION_REF" 2>/dev/null \
   || echo "[codex_ask] warning: failed to write result receipt (non-fatal, raw output at ${OUT_FILE} is unaffected)" >&2
+
+# --- Settle the managed review reservation (review R3; best-effort, never refunds/relaunches) ---
+if [ "$MANAGED" -eq 1 ]; then
+  case "$RC" in
+    0) REVIEW_OUTCOME="complete" ;;
+    124) REVIEW_OUTCOME="timeout" ;;
+    *) REVIEW_OUTCOME="uncertain" ;;
+  esac
+  python3 "$GUARD" settle --task "$TASK_REF" --action "$ACTION_REF" --outcome "$REVIEW_OUTCOME" \
+    --launch-identity "$LAUNCH_ID" --response "$OUT_FILE" \
+    || echo "[codex_ask] warning: failed to settle managed review reservation (non-fatal)" >&2
+fi
 
 echo "$OUT_FILE"
 exit "$RC"

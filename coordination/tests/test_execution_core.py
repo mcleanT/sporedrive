@@ -36,6 +36,7 @@ from mycelium_coord import ProtocolError  # noqa: E402
 from mycelium_coord.execution import (  # noqa: E402
     ExecutionManager,
     STATUS_ACTIVE,
+    STATUS_CLOSED,
     STATUS_COMPLETED,
     STATUS_DRAINING,
     STATUS_EXHAUSTED,
@@ -217,17 +218,27 @@ def test_all_criteria_accepted_auto_close_refuse_extra_complete_once():
             },
         )
         m.record_evidence(
-            "t1", criterion_id="impl", evidence_ref="/impl", accepted_by="claude"
+            "t1",
+            criterion_id="impl",
+            evidence_ref="/impl",
+            attestation="implementation delivered",
+            accepted_by="claude",
         )
         # not closed yet: the required review criterion is still open
         assert m.status("t1")["status"] == STATUS_ACTIVE
         res = m.record_evidence(
-            "t1", criterion_id="review", evidence_ref="/rev", accepted_by="codex"
+            "t1",
+            criterion_id="review",
+            evidence_ref="/rev",
+            attestation="review passed",
+            accepted_by="codex",
         )
         assert res["closed"] is True
+        # coverage complete -> CLOSURE, NOT terminal completed (review R4): a bounded repair is still
+        # possible; terminal completion needs an explicit final receipt.
         s = m.status("t1")
-        assert s["status"] == STATUS_COMPLETED and s["phase"] == PHASE_CLOSURE
-        # a late extra work request is refused
+        assert s["status"] == STATUS_CLOSED and s["phase"] == PHASE_CLOSURE
+        # a late GENERIC work request is refused in closure
         with pytest.raises(ProtocolError) as ei:
             m.reserve("t1", action_id="late", kind="work_dispatch")
         assert ei.value.code == "execution_closed"
@@ -235,10 +246,23 @@ def test_all_criteria_accepted_auto_close_refuse_extra_complete_once():
         b = m.add_backlog("t1", item="rename a heading", source="codex")
         assert b["backlog_count"] == 1
         assert m.read_execution("t1")["backlog"][0]["actionable"] is False
-        # complete once: re-recording an accepted criterion does not re-close or add scope
-        again = m.record_evidence("t1", criterion_id="impl", evidence_ref="/impl")
+        # re-recording an accepted criterion does not re-open or add scope; still closed
+        again = m.record_evidence(
+            "t1",
+            criterion_id="impl",
+            evidence_ref="/impl",
+            attestation="implementation delivered",
+            accepted_by="claude",
+        )
         assert again["closed"] is True
+        assert m.status("t1")["status"] == STATUS_CLOSED
+        # the SEPARATE final completion receipt makes it terminal completed
+        m.record_completion("t1", completion_ref="/receipt/1", accepted_by="user")
         assert m.status("t1")["status"] == STATUS_COMPLETED
+        # terminal: even a repair-shaped request cannot reactivate a completed execution
+        with pytest.raises(ProtocolError) as ei2:
+            m.reserve("t1", action_id="post", kind="work_dispatch")
+        assert ei2.value.code == "execution_completed"
 
 
 def test_empty_manifest_never_auto_closes():
@@ -295,22 +319,46 @@ def test_blocker_reopens_only_affected_criterion_after_closure():
         _open(
             m, "t1", manifest={"c1": {"description": "a"}, "c2": {"description": "b"}}
         )
-        m.record_evidence("t1", criterion_id="c1", evidence_ref="/1")
-        m.record_evidence("t1", criterion_id="c2", evidence_ref="/2")
-        assert m.status("t1")["status"] == STATUS_COMPLETED
-        # a late evidenced blocker reopens ONLY c1 for a bounded repair; usage/counters unchanged
+        m.record_evidence(
+            "t1",
+            criterion_id="c1",
+            evidence_ref="/1",
+            attestation="c1 done",
+            accepted_by="claude",
+        )
+        m.record_evidence(
+            "t1",
+            criterion_id="c2",
+            evidence_ref="/2",
+            attestation="c2 done",
+            accepted_by="claude",
+        )
+        assert m.status("t1")["status"] == STATUS_CLOSED
+        # a late evidenced blocker reopens ONLY c1 for a bounded repair; usage/counters unchanged, and
+        # the execution STAYS closed (repair-only) — it does NOT flip to a state that funds generic
+        # work (review R4 completed_reopened).
         m.open_blocker(
             "t1", blocker_id="b1", criterion_id="c1", evidence_ref="/regression"
         )
         rec = m.read_execution("t1")
-        assert rec["status"] == STATUS_ACTIVE
+        assert rec["status"] == STATUS_CLOSED
         assert rec["acceptance_manifest"]["c1"]["accepted"] is False
         assert rec["acceptance_manifest"]["c2"]["accepted"] is True
+        # GENERIC work is still refused after the blocker; only a repair linked to it is allowed
+        with pytest.raises(ProtocolError) as eg:
+            m.reserve("t1", action_id="generic", kind="work_dispatch")
+        assert eg.value.code == "execution_closed"
         # a bounded repair linked to that open blocker is now permitted
         m.reserve("t1", action_id="fix", kind="repair", repair_blocker_id="b1")
         # re-accepting c1 re-closes
-        m.record_evidence("t1", criterion_id="c1", evidence_ref="/fixed")
-        assert m.status("t1")["status"] == STATUS_COMPLETED
+        m.record_evidence(
+            "t1",
+            criterion_id="c1",
+            evidence_ref="/fixed",
+            attestation="c1 fixed",
+            accepted_by="claude",
+        )
+        assert m.status("t1")["status"] == STATUS_CLOSED
 
 
 # --------------------------------------------------------------------------- reconnect / persistence
@@ -319,12 +367,18 @@ def test_reconnect_preserves_state_and_no_duplicate_reservation():
         m1 = _mgr(d)
         _open(m1, "t1", manifest={"c1": {"description": "x"}})
         m1.reserve("t1", action_id="a1", kind="work_dispatch")
-        m1.record_evidence("t1", criterion_id="c1", evidence_ref="/e")  # closes
+        m1.record_evidence(
+            "t1",
+            criterion_id="c1",
+            evidence_ref="/e",
+            attestation="c1 done",
+            accepted_by="claude",
+        )  # -> closure
         # a fresh manager instance (compaction/reconnect) reads the same durable record
         m2 = _mgr(d)
         s = m2.status("t1")
         assert s["usage"]["work_dispatches"] == 1
-        assert s["status"] == STATUS_COMPLETED
+        assert s["status"] == STATUS_CLOSED
         # replaying the same reservation id is idempotent -> no duplicate reservation
         r = m2.reserve("t1", action_id="a1", kind="work_dispatch")
         assert r["idempotent"] is True
@@ -384,17 +438,35 @@ def test_completed_rejects_work_via_reattach_but_backlog_is_nonactionable():
     with _tmp() as d:
         m = _mgr(d)
         _open(m, "t1", manifest={"c1": {"description": "x"}})
-        m.record_evidence("t1", criterion_id="c1", evidence_ref="/e")
-        # reattach via a fresh manager; a completed task refuses new work
+        m.record_evidence(
+            "t1",
+            criterion_id="c1",
+            evidence_ref="/e",
+            attestation="c1 done",
+            accepted_by="claude",
+        )
+        # reattach via a fresh manager; a closed task refuses new work
         m2 = _mgr(d)
         with pytest.raises(ProtocolError) as ei:
             m2.reserve("t1", action_id="new", kind="work_dispatch")
         assert ei.value.code == "execution_closed"
-        # non-actionable backlog text cannot generate a work reservation
-        m2.add_backlog("t1", item="please also do X", source="supervisor")
-        assert all(e["actionable"] is False for e in m2.read_execution("t1")["backlog"])
-        # reading/recording remains safe without reopening
-        assert m2.status("t1")["status"] == STATUS_COMPLETED
+        assert m2.status("t1")["status"] == STATUS_CLOSED
+        # the explicit final receipt makes it TERMINAL completed; then work refuses as completed
+        m2.record_completion("t1", completion_ref="/receipt/2", accepted_by="user")
+        m3 = _mgr(d)
+        with pytest.raises(ProtocolError) as ei2:
+            m3.reserve("t1", action_id="new2", kind="work_dispatch")
+        assert ei2.value.code == "execution_completed"
+        # a post-completion concern cannot reopen a terminal execution
+        with pytest.raises(ProtocolError) as ei3:
+            m3.open_blocker(
+                "t1", blocker_id="late", criterion_id="c1", evidence_ref="/late"
+            )
+        assert ei3.value.code == "execution_completed"
+        # but a non-actionable backlog record is still accepted after completion (no executor wake)
+        m3.add_backlog("t1", item="please also do X", source="supervisor")
+        assert all(e["actionable"] is False for e in m3.read_execution("t1")["backlog"])
+        assert m3.status("t1")["status"] == STATUS_COMPLETED
 
 
 # --------------------------------------------------------------------------- adapter freeze identity
@@ -420,7 +492,13 @@ def test_acceptance_freeze_mismatch_blocks_and_invalidates_attempt():
             "t1", action_id="c1", phase=PHASE_ACCEPTANCE, freeze_identity="build-AAA"
         )
         m.settle_call("t1", action_id="c1", freeze_identity="build-AAA", outcome="ok")
-        m.record_evidence("t1", criterion_id="acc", evidence_ref="/acc-under-AAA")
+        m.record_evidence(
+            "t1",
+            criterion_id="acc",
+            evidence_ref="/acc-under-AAA",
+            attestation="acc under AAA",
+            accepted_by="adapter",
+        )
         assert m.read_execution("t1")["acceptance_manifest"]["acc"]["accepted"] is True
         assert (
             m.status("t1")["status"] == STATUS_ACTIVE
@@ -530,8 +608,11 @@ if __name__ == "__main__":
 def _strip_volatile(obj):
     """Drop wall-clock fields so two runs of the same sequence compare structurally."""
     if isinstance(obj, dict):
-        return {k: _strip_volatile(v) for k, v in obj.items()
-                if not (k == "at" or k.endswith("_at"))}
+        return {
+            k: _strip_volatile(v)
+            for k, v in obj.items()
+            if not (k == "at" or k.endswith("_at"))
+        }
     if isinstance(obj, list):
         return [_strip_volatile(v) for v in obj]
     return obj
@@ -546,31 +627,80 @@ def test_cli_and_mcp_make_identical_state():
     from mycelium_coord import cli
     from mycelium_coord import mcp_server as ms
 
-    manifest = {"impl": {"description": "implementation"},
-                "review": {"kind": "review", "description": "required review"}}
+    manifest = {
+        "impl": {"description": "implementation"},
+        "review": {"kind": "review", "description": "required review"},
+    }
 
     with _tmp() as dc, _tmp() as dm:
         # --- drive the sequence through the CLI ---
         def cli_run(*a):
             assert cli.run(["--root", dc, *a]) == 0
 
-        cli_run("exec-open", "t1", "--execution-id", "e1", "--scope", SCOPE,
-                "--authorization", AUTH, "--manifest", _json.dumps(manifest),
-                "--limits", _json.dumps({"work_dispatches": 3}))
+        cli_run(
+            "exec-open",
+            "t1",
+            "--execution-id",
+            "e1",
+            "--scope",
+            SCOPE,
+            "--authorization",
+            AUTH,
+            "--manifest",
+            _json.dumps(manifest),
+            "--limits",
+            _json.dumps({"work_dispatches": 3}),
+        )
         cli_run("exec-reserve", "t1", "--action-id", "a1", "--kind", "work_dispatch")
-        cli_run("exec-settle", "t1", "--action-id", "a1", "--outcome", "success", "--evidence", "/e")
-        cli_run("exec-record-evidence", "t1", "--criterion", "impl", "--evidence", "/impl")
+        cli_run(
+            "exec-settle",
+            "t1",
+            "--action-id",
+            "a1",
+            "--outcome",
+            "success",
+            "--evidence",
+            "/e",
+        )
+        cli_run(
+            "exec-record-evidence",
+            "t1",
+            "--criterion",
+            "impl",
+            "--evidence",
+            "/impl",
+            "--attestation",
+            "impl delivered",
+            "--by",
+            "claude",
+        )
         cli_run("exec-backlog", "t1", "--item", "optional polish", "--source", "codex")
 
         # --- drive the identical sequence through the MCP tools (same core) ---
         os.environ["MYCELIUM_COORD_DIR"] = dm
         ms._em.cache_clear()
         try:
-            asyncio.run(ms.execution_open("t1", "e1", SCOPE, AUTH, acceptance_manifest=manifest,
-                                          limits_overrides={"work_dispatches": 3}))
+            asyncio.run(
+                ms.execution_open(
+                    "t1",
+                    "e1",
+                    SCOPE,
+                    AUTH,
+                    acceptance_manifest=manifest,
+                    limits_overrides={"work_dispatches": 3},
+                )
+            )
             asyncio.run(ms.execution_reserve("t1", "a1", "work_dispatch"))
             asyncio.run(ms.execution_settle("t1", "a1", "success", evidence_ref="/e"))
-            asyncio.run(ms.execution_record_evidence("t1", "impl", "/impl"))
+            asyncio.run(
+                ms.execution_record_evidence(
+                    "t1",
+                    "impl",
+                    "/impl",
+                    attestation="impl delivered",
+                    accepted_by="claude",
+                )
+            )
             asyncio.run(ms.execution_backlog("t1", "optional polish", source="codex"))
         finally:
             os.environ.pop("MYCELIUM_COORD_DIR", None)

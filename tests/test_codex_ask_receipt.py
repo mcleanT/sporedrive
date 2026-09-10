@@ -20,6 +20,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 WRAPPER = REPO_ROOT / "src" / "claude" / "tools" / "codex_ask.sh"
 FAKE_CODEX_DIR = Path(__file__).resolve().parent / "fixtures" / "fake_codex"
 FAKE_CODEX_BIN = FAKE_CODEX_DIR / "codex"
+COORD_PKG = REPO_ROOT / "coordination"
+
+sys.path.insert(0, str(COORD_PKG))
+from mycelium_coord.execution import ExecutionManager  # noqa: E402
+from mycelium_coord.store import CoordStore  # noqa: E402
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -279,9 +285,13 @@ def test_stale_derived_artifact_never_trusted_when_output_dir_readonly(tmp_path)
     complete:true off a prior answer. With a UNIQUE mktemp'd artifact (created fresh in the writable
     OUTDIR fallback), the stale predictable-path file is never consulted or removed, and a
     banner-only run classifies complete:false."""
-    outdir = tmp_path / "outdir"  # writable OUTDIR: prompt file + fresh-artifact fallback live here
+    outdir = (
+        tmp_path / "outdir"
+    )  # writable OUTDIR: prompt file + fresh-artifact fallback live here
     outdir.mkdir()
-    ro = tmp_path / "readonly"  # read-only output directory (dir writes denied; existing files ok)
+    ro = (
+        tmp_path / "readonly"
+    )  # read-only output directory (dir writes denied; existing files ok)
     ro.mkdir()
     out_file = ro / "review.txt"
     out_file.write_text("prior raw log")
@@ -298,11 +308,17 @@ def test_stale_derived_artifact_never_trusted_when_output_dir_readonly(tmp_path)
     try:
         env = dict(os.environ)
         env["PATH"] = f"{FAKE_CODEX_DIR}:{env.get('PATH', '')}"
-        env["FAKE_CODEX_SCENARIO"] = "banner_only"  # rc=0, no artifact written (startup only)
+        env["FAKE_CODEX_SCENARIO"] = (
+            "banner_only"  # rc=0, no artifact written (startup only)
+        )
         env["CODEX_ASK_OUTDIR"] = str(outdir)
         proc = subprocess.run(
             ["bash", str(WRAPPER), "-o", str(out_file), "fixture only"],
-            cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=30,
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         receipt = json.loads(receipt_file.read_text())
     finally:
@@ -319,17 +335,44 @@ def test_stale_derived_artifact_never_trusted_when_output_dir_readonly(tmp_path)
 def test_deadline_times_out_via_owned_launcher(tmp_path):
     """codex_ask.sh -t routes through the owned-process launcher (codex_launch.py), which owns the
     codex process group and enforces a hard deadline. A slow run is terminated and reported
-    timed_out (rc=124, complete:false) even with partial raw output; -x/-a are recorded."""
+    timed_out (rc=124, complete:false) even with partial raw output; -x/-a are recorded.
+
+    -x and -a make this a MANAGED launch (review R3), so it must be tied to a real, open
+    review-launch reservation — set up directly against ExecutionManager here — or the guard
+    would refuse it before codex ever starts (see tests/test_codex_ask_managed_review.py for that
+    refusal path)."""
+    coord_dir = tmp_path / "coord"
+    em = ExecutionManager(CoordStore(coord_dir))
+    em.open_execution(
+        "t-xyz", execution_id="exec-XYZ", scope_ref="/s", authorization_ref="/a"
+    )
+    em.reserve("t-xyz", action_id="act-1", kind="review_launch")
+
     out_file = tmp_path / "out.txt"
     env = dict(os.environ)
     env["PATH"] = f"{FAKE_CODEX_DIR}:{env.get('PATH', '')}"
     env["FAKE_CODEX_SCENARIO"] = "slow"
     env["CODEX_ASK_OUTDIR"] = str(tmp_path)
+    env["MYCELIUM_COORD_DIR"] = str(coord_dir)
+    env["SPOREDRIVE_COORD_PKG"] = str(COORD_PKG)
     args = [
-        "bash", str(WRAPPER), "-o", str(out_file),
-        "-t", "1", "-x", "exec-XYZ", "-a", "act-1", "slow fixture question",
+        "bash",
+        str(WRAPPER),
+        "-o",
+        str(out_file),
+        "-t",
+        "1",
+        "-x",
+        "exec-XYZ",
+        "-a",
+        "act-1",
+        "-T",
+        "t-xyz",
+        "slow fixture question",
     ]
-    proc = subprocess.run(args, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=30)
+    proc = subprocess.run(
+        args, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=30
+    )
     receipt_file = out_file.with_name(out_file.name + ".receipt.json")
     receipt = json.loads(receipt_file.read_text())
     assert proc.returncode == 124
@@ -340,9 +383,9 @@ def test_deadline_times_out_via_owned_launcher(tmp_path):
     assert receipt["execution_ref"] == "exec-XYZ"
     assert receipt["action_ref"] == "act-1"
     raw = out_file.read_text()
-    assert "starting a long review" in raw          # partial raw output preserved
-    assert "deadline of" in raw                       # launcher's explicit deadline marker
-    assert proc.stdout.strip() == str(out_file)       # stdout contract: only the output path
+    assert "starting a long review" in raw  # partial raw output preserved
+    assert "deadline of" in raw  # launcher's explicit deadline marker
+    assert proc.stdout.strip() == str(out_file)  # stdout contract: only the output path
 
 
 def test_execution_and_action_refs_default_null_and_schema_bumped(tmp_path):
@@ -360,9 +403,21 @@ def test_deadline_path_success_is_still_complete(tmp_path):
     env["PATH"] = f"{FAKE_CODEX_DIR}:{env.get('PATH', '')}"
     env["FAKE_CODEX_SCENARIO"] = "success"
     env["CODEX_ASK_OUTDIR"] = str(tmp_path)
-    args = ["bash", str(WRAPPER), "-o", str(out_file), "-t", "20", "fast fixture question"]
-    proc = subprocess.run(args, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=30)
-    receipt = json.loads((out_file.with_name(out_file.name + ".receipt.json")).read_text())
+    args = [
+        "bash",
+        str(WRAPPER),
+        "-o",
+        str(out_file),
+        "-t",
+        "20",
+        "fast fixture question",
+    ]
+    proc = subprocess.run(
+        args, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=30
+    )
+    receipt = json.loads(
+        (out_file.with_name(out_file.name + ".receipt.json")).read_text()
+    )
     assert proc.returncode == 0
     assert receipt["parse_status"] == "ok"
     assert receipt["complete"] is True

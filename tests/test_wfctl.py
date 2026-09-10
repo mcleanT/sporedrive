@@ -48,6 +48,10 @@ SRC_FILES = {
     "src/claude/CLAUDE.md": "SRC: claude md v2\n",
     "src/claude/skills/codex-review/SKILL.md": "SRC: codex-review skill\n",
     "src/claude/tools/codex_ask.sh": "#!/bin/sh\necho 'SRC codex_ask'\n",
+    "src/claude/tools/codex_launch.py": "#!/usr/bin/env python3\n# SRC codex_launch stub\n",
+    "src/claude/tools/sporedrive_review_guard.py": (
+        "#!/usr/bin/env python3\n# SRC sporedrive_review_guard stub\n"
+    ),
     "src/claude/skills/prompt-optimizer/SKILL.md": "SRC: prompt-optimizer skill\n",
     "src/claude/skills/prompt-optimizer/references/scoring-design.md": (
         "SRC: prompt-optimizer scoring design\n"
@@ -106,6 +110,11 @@ FILE_TARGETS = [
     (".claude/CLAUDE.md", "src/claude/CLAUDE.md"),
     (".claude/skills/codex-review/SKILL.md", "src/claude/skills/codex-review/SKILL.md"),
     (".claude/tools/codex_ask.sh", "src/claude/tools/codex_ask.sh"),
+    (".claude/tools/codex_launch.py", "src/claude/tools/codex_launch.py"),
+    (
+        ".claude/tools/sporedrive_review_guard.py",
+        "src/claude/tools/sporedrive_review_guard.py",
+    ),
     (".codex/AGENTS.md", "src/codex/AGENTS.md"),
 ]
 DIR_TARGET = (".codex/skills/cmux-driver", "src/codex/skills/cmux-driver")
@@ -395,8 +404,8 @@ def test_t4_rollback_restores_only_owned(env: Env):
     rec = json.loads(receipts[0].read_text())
     assert rec["force"] is False
     assert (
-        len(rec["restored"]) == 7
-    )  # 5 original targets + prompt-optimizer + run-pipeline-local dirs
+        len(rec["restored"]) == 9
+    )  # 5 original targets + codex_launch.py + review guard + prompt-optimizer + run-pipeline-local dirs
     assert any("cost-tracker.sh" in p for p in rec["skipped_evidence_only"])
     assert rec["settings_leaves"][0]["action"] == "delete"
 

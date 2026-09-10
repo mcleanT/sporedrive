@@ -22,7 +22,6 @@ from .model import (
     STATE_COMPLETION_CLAIMED,
     STATE_DELIVERED,
     STATE_PERSISTED,
-    content_hash,
     utcnow,
 )
 from .store import CoordStore, StoreError, require_id, valid_id
@@ -45,7 +44,7 @@ def _same_path(a, b) -> bool:
 
 def _norm_sid(s) -> str:
     s = str(s or "").strip().lower()
-    return s[len("claude-"):] if s.startswith("claude-") else s
+    return s[len("claude-") :] if s.startswith("claude-") else s
 
 
 def _sid_match(stored, given) -> bool:
@@ -57,10 +56,17 @@ def _sid_match(stored, given) -> bool:
 
 def _session_seg(session_id: str) -> str:
     from .store import valid_id as _vi
-    return session_id if _vi(session_id) else "h." + hashlib.sha256(str(session_id).encode()).hexdigest()[:16]
+
+    return (
+        session_id
+        if _vi(session_id)
+        else "h." + hashlib.sha256(str(session_id).encode()).hexdigest()[:16]
+    )
 
 
-_MAX_PAGE = 500  # finite server-side ceiling: no single discovery call returns more than this
+_MAX_PAGE = (
+    500  # finite server-side ceiling: no single discovery call returns more than this
+)
 
 
 def _enc_cursor(prim: str, uid: str) -> str:
@@ -109,18 +115,36 @@ class Coordinator:
         return self.store.lock(require_id(task_id, "task_id"))
 
     # ------------------------------------------------------------------ native session selection
-    def _write_selection(self, host_kind: str, session_id: str, task_id: str,
-                         participant_id: str, worktree) -> dict:
+    def _write_selection(
+        self,
+        host_kind: str,
+        session_id: str,
+        task_id: str,
+        participant_id: str,
+        worktree,
+    ) -> dict:
         require_id(host_kind, "host")
         rel = f"sessions/{host_kind}/{_session_seg(session_id)}.json"
-        rec = {"host": host_kind, "session_id": session_id, "task_id": task_id,
-               "participant_id": participant_id, "worktree_realpath": worktree,
-               "selected_at": utcnow()}
+        rec = {
+            "host": host_kind,
+            "session_id": session_id,
+            "task_id": task_id,
+            "participant_id": participant_id,
+            "worktree_realpath": worktree,
+            "selected_at": utcnow(),
+        }
         self.store.write(rel, rec)
         return rec
 
-    def select_session(self, task_id: str, participant_id: str, *, host_kind: str,
-                       session_id: str, worktree: str | None = None) -> dict:
+    def select_session(
+        self,
+        task_id: str,
+        participant_id: str,
+        *,
+        host_kind: str,
+        session_id: str,
+        worktree: str | None = None,
+    ) -> dict:
         """Bind a task/participant selection to a specific NATIVE session id, in managed
         outside-repo state. Startup/compaction resolve by the same key, so two sessions in one
         worktree never resolve to each other (native-routing review 1). The participant must be
@@ -128,8 +152,11 @@ class Coordinator:
         with self._lock(task_id):
             p = self._participant(task_id, participant_id)
             if (p.get("host") or {}).get("host") != host_kind:
-                raise ProtocolError("session_host_mismatch", participant_id,
-                                    "selection host kind does not match the participant's host")
+                raise ProtocolError(
+                    "session_host_mismatch",
+                    participant_id,
+                    "selection host kind does not match the participant's host",
+                )
             # select-session may only (re)affirm the native session the participant is CURRENTLY
             # attached as. Binding a DIFFERENT session is an identity change and must go through a
             # controlled transition (attach allow_transition), never this selector — otherwise a
@@ -137,17 +164,26 @@ class Coordinator:
             # binding (no current session) is still allowed; same-session compaction is unaffected.
             cur = (p.get("host") or {}).get("session")
             if cur and not _sid_match(cur, session_id):
-                raise ProtocolError("session_identity_mismatch", participant_id,
-                                    "select-session cannot bind a native session other than the "
-                                    "participant's current attached session; use a controlled "
-                                    "transition (attach allow_transition) to rebind")
-            return self._write_selection(host_kind, session_id, task_id, participant_id,
-                                         worktree or p.get("worktree_realpath"))
+                raise ProtocolError(
+                    "session_identity_mismatch",
+                    participant_id,
+                    "select-session cannot bind a native session other than the "
+                    "participant's current attached session; use a controlled "
+                    "transition (attach allow_transition) to rebind",
+                )
+            return self._write_selection(
+                host_kind,
+                session_id,
+                task_id,
+                participant_id,
+                worktree or p.get("worktree_realpath"),
+            )
 
     def resolve_session(self, host_kind: str, session_id: str) -> dict | None:
         """Resolve a native (host, session_id) to its selected {task, participant}, or None.
         Silent (None) if the participant is detached or its host kind no longer matches."""
         from .store import valid_id as _vi
+
         if not _vi(host_kind) or not session_id:
             return None
         rec = self.store.read(f"sessions/{host_kind}/{_session_seg(session_id)}.json")
@@ -159,7 +195,9 @@ class Coordinator:
                     break
         if not rec:
             return None
-        p = self.store.read(f"{_task_root(rec['task_id'])}/participants/{rec['participant_id']}.json")
+        p = self.store.read(
+            f"{_task_root(rec['task_id'])}/participants/{rec['participant_id']}.json"
+        )
         if not p or p.get("detached") or (p.get("host") or {}).get("host") != host_kind:
             return None
         # Valid only while the participant is STILL on this native session. A controlled rebind
@@ -168,11 +206,17 @@ class Coordinator:
         # participant's CURRENT host.session is the authority.
         if not _sid_match((p.get("host") or {}).get("session"), rec.get("session_id")):
             return None
-        return {"task": rec["task_id"], "participant": rec["participant_id"], "host": host_kind,
-                "session_id": rec.get("session_id"), "worktree_realpath": rec.get("worktree_realpath")}
+        return {
+            "task": rec["task_id"],
+            "participant": rec["participant_id"],
+            "host": host_kind,
+            "session_id": rec.get("session_id"),
+            "worktree_realpath": rec.get("worktree_realpath"),
+        }
 
-    def verify_participant_session(self, task_id: str, participant_id: str,
-                                   host_kind: str, session_id: str) -> bool:
+    def verify_participant_session(
+        self, task_id: str, participant_id: str, host_kind: str, session_id: str
+    ) -> bool:
         """True iff the participant is attached, not detached, and its recorded native identity
         (host kind + session) EXACTLY matches this input. The SessionStart hook's env fallback uses
         this so an unrelated or inherited-env session cannot silently impersonate a participant
@@ -189,8 +233,14 @@ class Coordinator:
 
     # ------------------------------------------------------------------ tasks
     def create_task(
-        self, task_id: str, *, project: str, worktree_realpath: str,
-        authorization_ref=None, revision: int = 0, title: str = "",
+        self,
+        task_id: str,
+        *,
+        project: str,
+        worktree_realpath: str,
+        authorization_ref=None,
+        revision: int = 0,
+        title: str = "",
     ) -> dict:
         """Create-or-return a task. Idempotent: a second call returns the existing task unchanged
         (it never resets revision or authorization). authorization_ref is recorded, never a grant."""
@@ -211,16 +261,21 @@ class Coordinator:
                 "created_at": utcnow(),
             }
             self.store.write(rel, task)
-            self.store.append_receipt(f"{_task_root(task_id)}/audit.jsonl", "task_created",
-                                      {"task_id": task_id}, lock_name=task_id)
+            self.store.append_receipt(
+                f"{_task_root(task_id)}/audit.jsonl",
+                "task_created",
+                {"task_id": task_id},
+                lock_name=task_id,
+            )
             return task
 
     def get_task(self, task_id: str) -> dict | None:
         return self.store.read(f"{_task_root(task_id)}/task.json")
 
     # ------------------------------------------------------------------ discovery (bounded)
-    def list_tasks(self, project: str | None = None, *, limit: int = 200,
-                   cursor: str | None = None) -> dict:
+    def list_tasks(
+        self, project: str | None = None, *, limit: int = 200, cursor: str | None = None
+    ) -> dict:
         """Bounded task DISCOVERY: enumerate known tasks, optionally scoped to one project, as
         lightweight summaries (never message/participant bodies). This is the only way to find a
         task you do not already hold the id for; it never joins, never notifies, and never crosses
@@ -234,19 +289,41 @@ class Coordinator:
                 continue
             if project is not None and rec.get("project") != project:
                 continue
-            out.append({"task_id": rec.get("task_id"), "project": rec.get("project"),
-                        "title": rec.get("title", ""), "revision": rec.get("revision"),
-                        "worktree_realpath": rec.get("worktree_realpath"),
-                        "created_at": rec.get("created_at")})
-        page, nxt, more = _page(out, lambda r: (r.get("created_at") or "", r.get("task_id") or ""),
-                                cursor, limit)
-        return {"tasks": page, "returned": len(page), "truncated": more,
-                "next_cursor": nxt, "project": project}
+            out.append(
+                {
+                    "task_id": rec.get("task_id"),
+                    "project": rec.get("project"),
+                    "title": rec.get("title", ""),
+                    "revision": rec.get("revision"),
+                    "worktree_realpath": rec.get("worktree_realpath"),
+                    "created_at": rec.get("created_at"),
+                }
+            )
+        page, nxt, more = _page(
+            out,
+            lambda r: (r.get("created_at") or "", r.get("task_id") or ""),
+            cursor,
+            limit,
+        )
+        return {
+            "tasks": page,
+            "returned": len(page),
+            "truncated": more,
+            "next_cursor": nxt,
+            "project": project,
+        }
 
-    def find_recipients(self, task_id: str, *, role: str | None = None,
-                        host_kind: str | None = None, exclude: str | None = None,
-                        attached_only: bool = True, limit: int = 200,
-                        cursor: str | None = None) -> dict:
+    def find_recipients(
+        self,
+        task_id: str,
+        *,
+        role: str | None = None,
+        host_kind: str | None = None,
+        exclude: str | None = None,
+        attached_only: bool = True,
+        limit: int = 200,
+        cursor: str | None = None,
+    ) -> dict:
         """Bounded RECIPIENT scoping within a KNOWN task: the addressable participants a sender may
         target, filtered by role / host kind, excluding one id (typically self), attached-only by
         default. It does NOT broadcast — it only reports who exists so a caller can address a
@@ -259,21 +336,45 @@ class Coordinator:
                 continue
             if role is not None and rec.get("role") != role:
                 continue
-            if host_kind is not None and (rec.get("host") or {}).get("host") != host_kind:
+            if (
+                host_kind is not None
+                and (rec.get("host") or {}).get("host") != host_kind
+            ):
                 continue
             if exclude is not None and rec.get("participant_id") == exclude:
                 continue
-            recips.append({"participant_id": rec.get("participant_id"), "role": rec.get("role"),
-                           "host": rec.get("host") or {}, "detached": bool(rec.get("detached")),
-                           "worktree_realpath": rec.get("worktree_realpath"),
-                           "attached_at": rec.get("attached_at")})
-        page, nxt, more = _page(recips, lambda r: (r.get("attached_at") or "",
-                                                   r.get("participant_id") or ""), cursor, limit)
-        return {"task": task_id, "recipients": page, "returned": len(page),
-                "truncated": more, "next_cursor": nxt}
+            recips.append(
+                {
+                    "participant_id": rec.get("participant_id"),
+                    "role": rec.get("role"),
+                    "host": rec.get("host") or {},
+                    "detached": bool(rec.get("detached")),
+                    "worktree_realpath": rec.get("worktree_realpath"),
+                    "attached_at": rec.get("attached_at"),
+                }
+            )
+        page, nxt, more = _page(
+            recips,
+            lambda r: (r.get("attached_at") or "", r.get("participant_id") or ""),
+            cursor,
+            limit,
+        )
+        return {
+            "task": task_id,
+            "recipients": page,
+            "returned": len(page),
+            "truncated": more,
+            "next_cursor": nxt,
+        }
 
-    def list_sessions(self, host_kind: str, *, live_only: bool = False, limit: int = 200,
-                      cursor: str | None = None) -> dict:
+    def list_sessions(
+        self,
+        host_kind: str,
+        *,
+        live_only: bool = False,
+        limit: int = 200,
+        cursor: str | None = None,
+    ) -> dict:
         """Bounded SESSION discovery for one host kind: the native-session selection records under
         this host and the task/participant each is bound to. Each entry carries `live` — TRUE only
         while the bound participant is still attached on exactly that native session (the same
@@ -281,8 +382,13 @@ class Coordinator:
         under live_only. Ordered by selected_at (session_id tiebreak); page with `cursor`/`limit`
         (`next_cursor` continues) so every session stays reachable within a finite per-call budget."""
         if not valid_id(host_kind):
-            return {"host": host_kind, "sessions": [], "returned": 0, "truncated": False,
-                    "next_cursor": None}
+            return {
+                "host": host_kind,
+                "sessions": [],
+                "returned": 0,
+                "truncated": False,
+                "next_cursor": None,
+            }
         out = []
         for pth in self.store.listdir(f"sessions/{host_kind}"):
             rec = self.store.read(f"sessions/{host_kind}/{pth.name}")
@@ -291,25 +397,51 @@ class Coordinator:
             live = self.resolve_session(host_kind, rec.get("session_id")) is not None
             if live_only and not live:
                 continue
-            out.append({"host": host_kind, "session_id": rec.get("session_id"),
-                        "task": rec.get("task_id"), "participant": rec.get("participant_id"),
-                        "worktree_realpath": rec.get("worktree_realpath"),
-                        "selected_at": rec.get("selected_at"), "live": live})
-        page, nxt, more = _page(out, lambda r: (r.get("selected_at") or "",
-                                                r.get("session_id") or ""), cursor, limit)
-        return {"host": host_kind, "sessions": page, "returned": len(page),
-                "truncated": more, "next_cursor": nxt}
+            out.append(
+                {
+                    "host": host_kind,
+                    "session_id": rec.get("session_id"),
+                    "task": rec.get("task_id"),
+                    "participant": rec.get("participant_id"),
+                    "worktree_realpath": rec.get("worktree_realpath"),
+                    "selected_at": rec.get("selected_at"),
+                    "live": live,
+                }
+            )
+        page, nxt, more = _page(
+            out,
+            lambda r: (r.get("selected_at") or "", r.get("session_id") or ""),
+            cursor,
+            limit,
+        )
+        return {
+            "host": host_kind,
+            "sessions": page,
+            "returned": len(page),
+            "truncated": more,
+            "next_cursor": nxt,
+        }
 
     def _require_task(self, task_id: str) -> dict:
         t = self.get_task(task_id)
         if not t:
-            raise ProtocolError("unknown_task", task_id, f"no such task {task_id}; attach requires create_task first")
+            raise ProtocolError(
+                "unknown_task",
+                task_id,
+                f"no such task {task_id}; attach requires create_task first",
+            )
         return t
 
     # ------------------------------------------------------------------ participants
     def attach(
-        self, task_id: str, participant_id: str, *, role: str,
-        worktree_realpath: str, host: dict | None = None, allow_transition: bool = False,
+        self,
+        task_id: str,
+        participant_id: str,
+        *,
+        role: str,
+        worktree_realpath: str,
+        host: dict | None = None,
+        allow_transition: bool = False,
     ) -> dict:
         """Explicitly attach a participant. Idempotent per participant_id. Attaching a SUPERVISOR
         grants no repository-write or lifecycle-owner authority (D3/contract §6). A controller whose
@@ -333,9 +465,12 @@ class Coordinator:
             task = self._require_task(task_id)
             # An executor works IN the task's canonical worktree; a supervisor/observer may sit
             # outside it (D3). Bind the executor identity to the task worktree (finding 3).
-            if role == "executor" and not _same_path(worktree_realpath, task.get("worktree_realpath")):
+            if role == "executor" and not _same_path(
+                worktree_realpath, task.get("worktree_realpath")
+            ):
                 raise ProtocolError(
-                    "executor_worktree_mismatch", participant_id,
+                    "executor_worktree_mismatch",
+                    participant_id,
                     "executor worktree_realpath must equal the task's canonical worktree_realpath",
                 )
             prev = self.store.read(rel)
@@ -346,20 +481,25 @@ class Coordinator:
                     prev.get("role") == role
                     and _same_path(prev.get("worktree_realpath"), worktree_realpath)
                     and (prev.get("host") or {}).get("host") == (host or {}).get("host")
-                    and (prev.get("host") or {}).get("session") == (host or {}).get("session")
-                    and (prev.get("host") or {}).get("native_id") == (host or {}).get("native_id")
+                    and (prev.get("host") or {}).get("session")
+                    == (host or {}).get("session")
+                    and (prev.get("host") or {}).get("native_id")
+                    == (host or {}).get("native_id")
                 )
                 if not same and not allow_transition:
                     raise ProtocolError(
-                        "participant_identity_conflict", participant_id,
+                        "participant_identity_conflict",
+                        participant_id,
                         "participant already attached with a different identity/role; pass "
                         "allow_transition for a controlled rebind",
                     )
                 p["attached_at"] = prev.get("attached_at", p["attached_at"])
                 if not same:
                     p["transitioned_from"] = {
-                        "role": prev.get("role"), "host": prev.get("host"),
-                        "worktree_realpath": prev.get("worktree_realpath"), "at": utcnow(),
+                        "role": prev.get("role"),
+                        "host": prev.get("host"),
+                        "worktree_realpath": prev.get("worktree_realpath"),
+                        "at": utcnow(),
                     }
             self.store.write(rel, p)
             # Bind the selection to this native session so startup/compaction resolve to the
@@ -368,11 +508,17 @@ class Coordinator:
             hk = (host or {}).get("host")
             if sid and hk:
                 try:
-                    self._write_selection(hk, sid, task_id, participant_id, worktree_realpath)
+                    self._write_selection(
+                        hk, sid, task_id, participant_id, worktree_realpath
+                    )
                 except (ProtocolError, StoreError):
                     pass
-            self.store.append_receipt(f"{_task_root(task_id)}/audit.jsonl", "attach",
-                                      {"participant_id": participant_id, "role": role}, lock_name=task_id)
+            self.store.append_receipt(
+                f"{_task_root(task_id)}/audit.jsonl",
+                "attach",
+                {"participant_id": participant_id, "role": role},
+                lock_name=task_id,
+            )
             return p
 
     def detach(self, task_id: str, participant_id: str) -> dict:
@@ -381,12 +527,18 @@ class Coordinator:
             rel = f"{_task_root(task_id)}/participants/{participant_id}.json"
             p = self.store.read(rel)
             if not p:
-                raise ProtocolError("unknown_participant", participant_id, "not attached")
+                raise ProtocolError(
+                    "unknown_participant", participant_id, "not attached"
+                )
             p["detached"] = True
             p["detached_at"] = utcnow()
             self.store.write(rel, p)
-            self.store.append_receipt(f"{_task_root(task_id)}/audit.jsonl", "detach",
-                                      {"participant_id": participant_id}, lock_name=task_id)
+            self.store.append_receipt(
+                f"{_task_root(task_id)}/audit.jsonl",
+                "detach",
+                {"participant_id": participant_id},
+                lock_name=task_id,
+            )
             return p
 
     def list_participants(self, task_id: str) -> list[dict]:
@@ -400,33 +552,83 @@ class Coordinator:
     def _participant(self, task_id: str, participant_id: str) -> dict:
         p = self.store.read(f"{_task_root(task_id)}/participants/{participant_id}.json")
         if not p:
-            raise ProtocolError("unknown_participant", participant_id,
-                                f"{participant_id} is not attached to {task_id}")
+            raise ProtocolError(
+                "unknown_participant",
+                participant_id,
+                f"{participant_id} is not attached to {task_id}",
+            )
         # A detached participant must not keep acting merely because its JSON persists
         # (core review finding 3).
         if p.get("detached"):
-            raise ProtocolError("participant_detached", participant_id,
-                                f"{participant_id} is detached; re-attach to act")
+            raise ProtocolError(
+                "participant_detached",
+                participant_id,
+                f"{participant_id} is detached; re-attach to act",
+            )
         return p
 
     # ------------------------------------------------------------------ messages
     def send(
-        self, *, message_id: str, task_id: str, sender: str, recipient: str, kind: str,
-        task_revision, text: str | None = None, artifact_ref: str | None = None,
-        artifacts: list | None = None, reply_to: str | None = None,
-        correlation_id: str | None = None, host: dict | None = None,
+        self,
+        *,
+        message_id: str,
+        task_id: str,
+        sender: str,
+        recipient: str,
+        kind: str,
+        task_revision,
+        text: str | None = None,
+        artifact_ref: str | None = None,
+        artifacts: list | None = None,
+        reply_to: str | None = None,
+        correlation_id: str | None = None,
+        host: dict | None = None,
+        execution_action_id: str | None = None,
+        actionable: bool | None = None,
     ) -> dict:
         """Persist an addressed message. Idempotent by (message_id, content): a repeat with the SAME
         content returns the stored message and does NOT re-append; a repeat with the SAME id but
         DIFFERENT content is rejected (idempotency_conflict). Reading never consumes; redelivery is
-        allowed and consumers deduplicate by message_id."""
+        allowed and consumers deduplicate by message_id.
+
+        Execution gate (review R1): on a MANAGED task (an execution record exists) a NEW message whose
+        kind DISPATCHES work must carry ``execution_action_id`` naming an open, dispatchable reservation
+        bound to (or claimable by) this message. This is fail-closed by the message's intrinsic kind,
+        so a paused/closed managed task cannot get a work request PERSISTED merely by omitting the
+        field. Non-actionable records (ack/status/checkpoint/review-finding/completion/backlog) and
+        unmanaged tasks are unaffected; an idempotent replay of an already-persisted message reconciles
+        without re-gating."""
         require_id(task_id, "task_id")
-        msg = model.build_message(
-            message_id=message_id, task_id=task_id, sender=sender, recipient=recipient,
-            kind=kind, task_revision=task_revision, host=host, reply_to=reply_to,
-            correlation_id=correlation_id, text=text, artifact_ref=artifact_ref,
-            artifacts=artifacts,
+        from .execution import ACTIONABLE_KINDS, ExecutionManager
+
+        # Resolve the message's explicit actionable DISPOSITION (review R1): default by intrinsic kind
+        # (ACTIONABLE_KINDS dispatch work), overridable by a trusted caller, and forced True whenever
+        # the caller names a reservation. A non-actionable message (progress/review_finding/amendment/
+        # status) is a durable notice, never an implicit unmanaged work route. It is a disposition the
+        # trusted agent supplies, not a free-text parse. The disposition is persisted on the message
+        # (and, only when it names a reservation, folded into the idempotency hash) so a native
+        # inbox-reader or the bridge can honour it without re-deriving it.
+        default_actionable = kind in ACTIONABLE_KINDS
+        effective_actionable = (
+            default_actionable or bool(actionable) or (execution_action_id is not None)
         )
+        msg = model.build_message(
+            message_id=message_id,
+            task_id=task_id,
+            sender=sender,
+            recipient=recipient,
+            kind=kind,
+            task_revision=task_revision,
+            host=host,
+            reply_to=reply_to,
+            correlation_id=correlation_id,
+            text=text,
+            artifact_ref=artifact_ref,
+            artifacts=artifacts,
+            execution_action_id=execution_action_id,
+            actionable=effective_actionable,
+        )
+        em = ExecutionManager(self.store)
         idx_rel = f"{_task_root(task_id)}/ids/{message_id}.json"
         with self._lock(task_id):
             self._require_task(task_id)
@@ -440,22 +642,68 @@ class Coordinator:
             if existing is not None:
                 rec, rel = existing
                 if rec.get("content_hash") == msg["content_hash"]:
-                    self.store.write(idx_rel, {"seq": rec["seq"], "content_hash": rec["content_hash"], "rel": rel})
+                    self.store.write(
+                        idx_rel,
+                        {
+                            "seq": rec["seq"],
+                            "content_hash": rec["content_hash"],
+                            "rel": rel,
+                        },
+                    )
                     return {"idempotent": True, "message": rec, "seq": rec["seq"]}
                 raise ProtocolError(
-                    "idempotency_conflict", message_id,
+                    "idempotency_conflict",
+                    message_id,
                     "message_id reused with different content; a payload change requires a new id",
                 )
+            # managed work-request gate (review R1): a NEW actionable message on a managed task CLAIMS
+            # and BINDS its reservation to THIS message id, atomically, under the already-held per-task
+            # lock (re-entrant) — NOT a deferred read-only check. Native Claude reads the inbox
+            # directly, so notify_via_bridge is not a universal dispatch point; binding at publication
+            # is what makes one reservation fund exactly one message even when notify is never called.
+            # An idempotent replay of an already-persisted message returned above, so this never
+            # double-claims. A managed NON-actionable notice persists freely (no reservation).
+            if em.is_managed(task_id):
+                if effective_actionable:
+                    if execution_action_id is None:
+                        raise ProtocolError(
+                            "managed_send_requires_reservation",
+                            message_id,
+                            "a work request on a managed task must name an execution_action_id "
+                            "reservation; a paused/closed task is not made unmanaged by omitting it",
+                        )
+                    claim = em.claim_dispatch(
+                        task_id,
+                        action_id=execution_action_id,
+                        dispatch_identity=message_id,
+                    )
+                    if not claim.get("ok"):
+                        raise ProtocolError(
+                            "refused_by_execution_gate",
+                            message_id,
+                            f"work request refused: {claim.get('reason')}",
+                        )
             seq = self._max_seq(task_id) + 1
             msg["seq"] = seq
             msg_rel = f"{_task_root(task_id)}/messages/{seq:08d}-{message_id}.json"
             # authoritative publication FIRST (atomic rename), then the derived accelerator index.
             self.store.write(msg_rel, msg)
-            self.store.write(idx_rel, {"seq": seq, "content_hash": msg["content_hash"], "rel": msg_rel})
+            self.store.write(
+                idx_rel,
+                {"seq": seq, "content_hash": msg["content_hash"], "rel": msg_rel},
+            )
             self.store.append_receipt(
-                f"{_task_root(task_id)}/audit.jsonl", "send",
-                {"message_id": message_id, "seq": seq, "kind": kind,
-                 "sender": sender, "recipient": recipient}, lock_name=task_id)
+                f"{_task_root(task_id)}/audit.jsonl",
+                "send",
+                {
+                    "message_id": message_id,
+                    "seq": seq,
+                    "kind": kind,
+                    "sender": sender,
+                    "recipient": recipient,
+                },
+                lock_name=task_id,
+            )
             return {"idempotent": False, "message": msg, "seq": seq}
 
     def _all_messages(self, task_id: str) -> list[dict]:
@@ -491,7 +739,9 @@ class Coordinator:
             rec = self.store.read(idx["rel"])
             if rec and rec.get("message_id") == message_id:
                 return rec, idx["rel"]
-        for p in self.store.listdir(f"{_task_root(task_id)}/messages", f"*-{message_id}.json"):
+        for p in self.store.listdir(
+            f"{_task_root(task_id)}/messages", f"*-{message_id}.json"
+        ):
             rel = f"{_task_root(task_id)}/messages/{p.name}"
             rec = self.store.read(rel)
             if rec and rec.get("message_id") == message_id:
@@ -505,23 +755,35 @@ class Coordinator:
         return r == p["participant_id"] or r == p.get("role") or r == RECIPIENT_ALL
 
     def inbox(
-        self, task_id: str, participant_id: str, *, after_seq: int = 0,
-        limit: int = 100, kinds: list[str] | None = None,
+        self,
+        task_id: str,
+        participant_id: str,
+        *,
+        after_seq: int = 0,
+        limit: int = 100,
+        kinds: list[str] | None = None,
     ) -> dict:
         """Bounded read of messages addressed to this participant with seq > after_seq. Does NOT
         consume and does NOT move the stored cursor (reading is side-effect free). Returns messages
         and next_after_seq to pass back."""
         p = self._participant(task_id, participant_id)
-        msgs = [m for m in self._all_messages(task_id)
-                if m.get("seq", 0) > int(after_seq) and self._addressed_to(m, p)]
+        msgs = [
+            m
+            for m in self._all_messages(task_id)
+            if m.get("seq", 0) > int(after_seq) and self._addressed_to(m, p)
+        ]
         if kinds:
             kset = set(kinds)
             msgs = [m for m in msgs if m.get("kind") in kset]
         truncated = len(msgs) > limit
         page = msgs[: max(0, int(limit))]
         next_after = page[-1]["seq"] if page else int(after_seq)
-        return {"messages": page, "next_after_seq": next_after,
-                "truncated": truncated, "returned": len(page)}
+        return {
+            "messages": page,
+            "next_after_seq": next_after,
+            "truncated": truncated,
+            "returned": len(page),
+        }
 
     # ------------------------------------------------------------------ cursor (notification only)
     def get_cursor(self, task_id: str, participant_id: str) -> int:
@@ -535,12 +797,23 @@ class Coordinator:
             rel = f"{_task_root(task_id)}/cursors/{participant_id}.json"
             cur = self.store.read(rel) or {"after_seq": 0}
             new = max(int(cur.get("after_seq", 0)), int(after_seq))
-            rec = {"participant_id": participant_id, "after_seq": new, "updated_at": utcnow()}
+            rec = {
+                "participant_id": participant_id,
+                "after_seq": new,
+                "updated_at": utcnow(),
+            }
             self.store.write(rel, rec)
             return rec
 
-    def mark_delivered(self, task_id: str, message_id: str, *, via: str,
-                       recipient: str | None = None, detail: dict | None = None) -> dict:
+    def mark_delivered(
+        self,
+        task_id: str,
+        message_id: str,
+        *,
+        via: str,
+        recipient: str | None = None,
+        detail: dict | None = None,
+    ) -> dict:
         """Record that a message was EXPOSED to ONE addressed recipient by an out-of-band route
         (e.g. a cmux/bridge notification). This is delivery, NOT acknowledgment and NOT completion —
         it is only recorded when the route actually succeeded. Delivery is tracked PER concrete
@@ -559,21 +832,30 @@ class Coordinator:
                 if r and r != RECIPIENT_ALL and r not in ROLES and valid_id(r):
                     who = r
                 else:
-                    raise ProtocolError("delivery_recipient_required", message_id,
-                                        "a broadcast/role message needs the concrete recipient that "
-                                        "was reached; pass recipient=")
+                    raise ProtocolError(
+                        "delivery_recipient_required",
+                        message_id,
+                        "a broadcast/role message needs the concrete recipient that "
+                        "was reached; pass recipient=",
+                    )
             rp = self.store.read(f"{_task_root(task_id)}/participants/{who}.json")
             if not rp or not self._addressed_to(msg, rp):
-                raise ProtocolError("delivery_not_addressed", message_id,
-                                    f"{who} is not an addressed, attached recipient of {message_id}")
+                raise ProtocolError(
+                    "delivery_not_addressed",
+                    message_id,
+                    f"{who} is not an addressed, attached recipient of {message_id}",
+                )
             rel = f"{_task_root(task_id)}/deliveries/{message_id}.json"
             rec = self.store.read(rel) or {"message_id": message_id, "deliveries": []}
-            rec["deliveries"].append({"via": via, "at": utcnow(), "recipient": who,
-                                      "detail": detail or {}})
+            rec["deliveries"].append(
+                {"via": via, "at": utcnow(), "recipient": who, "detail": detail or {}}
+            )
             self.store.write(rel, rec)
             return rec
 
-    def is_delivered(self, task_id: str, message_id: str, participant_id: str | None = None) -> bool:
+    def is_delivered(
+        self, task_id: str, message_id: str, participant_id: str | None = None
+    ) -> bool:
         """Whether a message was delivered. With participant_id, TRUE only if THAT recipient was
         reached (per-recipient); without one, TRUE if delivered to anyone."""
         rec = self.store.read(f"{_task_root(task_id)}/deliveries/{message_id}.json")
@@ -585,31 +867,48 @@ class Coordinator:
         return any(str(d.get("recipient")) == str(participant_id) for d in ds)
 
     # ------------------------------------------------------------------ acknowledgments
-    def ack(self, task_id: str, participant_id: str, message_id: str, *, note: str = "") -> dict:
+    def ack(
+        self, task_id: str, participant_id: str, message_id: str, *, note: str = ""
+    ) -> dict:
         """Explicitly acknowledge that a specific message was RECEIVED. This is not a claim that its
         requested action completed (contract §Intended outcome). Idempotent per (participant, id)."""
         with self._lock(task_id):
             p = self._participant(task_id, participant_id)
             msg = self.get_message(task_id, message_id)
             if not msg:
-                raise ProtocolError("unknown_message", message_id, "cannot ack a message that does not exist")
+                raise ProtocolError(
+                    "unknown_message",
+                    message_id,
+                    "cannot ack a message that does not exist",
+                )
             # Only an ADDRESSED recipient may acknowledge; an unaddressed observer cannot
             # (core review finding 1).
             if not self._addressed_to(msg, p):
-                raise ProtocolError("ack_not_addressed", message_id,
-                                    f"{participant_id} was not an addressed recipient of {message_id}")
+                raise ProtocolError(
+                    "ack_not_addressed",
+                    message_id,
+                    f"{participant_id} was not an addressed recipient of {message_id}",
+                )
             rel = f"{_task_root(task_id)}/acks/{participant_id}/{message_id}.json"
             rec = self.store.read(rel) or {
-                "participant_id": participant_id, "message_id": message_id,
-                "acked_at": utcnow(), "note": note,
+                "participant_id": participant_id,
+                "message_id": message_id,
+                "acked_at": utcnow(),
+                "note": note,
             }
             self.store.write(rel, rec)
-            self.store.append_receipt(f"{_task_root(task_id)}/audit.jsonl", "ack",
-                                      {"participant_id": participant_id, "message_id": message_id}, lock_name=task_id)
+            self.store.append_receipt(
+                f"{_task_root(task_id)}/audit.jsonl",
+                "ack",
+                {"participant_id": participant_id, "message_id": message_id},
+                lock_name=task_id,
+            )
             return rec
 
     def is_acked(self, task_id: str, participant_id: str, message_id: str) -> bool:
-        return self.store.exists(f"{_task_root(task_id)}/acks/{participant_id}/{message_id}.json")
+        return self.store.exists(
+            f"{_task_root(task_id)}/acks/{participant_id}/{message_id}.json"
+        )
 
     @staticmethod
     def _verify_artifact(entry) -> bool:
@@ -621,6 +920,7 @@ class Coordinator:
             return False
         try:
             from pathlib import Path as _P
+
             p = _P(str(entry["file"]))
             if not p.is_file():
                 return False
@@ -659,7 +959,8 @@ class Coordinator:
             if not arts:
                 continue
             completer = self.store.read(
-                f"{_task_root(task_id)}/participants/{m.get('sender')}.json")
+                f"{_task_root(task_id)}/participants/{m.get('sender')}.json"
+            )
             if not (completer and self._addressed_to(msg, completer)):
                 continue
             claimed = True
@@ -670,21 +971,29 @@ class Coordinator:
         if self.is_acked(task_id, participant_id, message_id):
             return STATE_ACKNOWLEDGED
         # exposed/delivered = past this recipient's cursor OR bridge-notified (contract).
-        if msg.get("seq", 0) <= self.get_cursor(task_id, participant_id) \
-                or self.is_delivered(task_id, message_id, participant_id):
+        if msg.get("seq", 0) <= self.get_cursor(
+            task_id, participant_id
+        ) or self.is_delivered(task_id, message_id, participant_id):
             return STATE_DELIVERED
         return STATE_PERSISTED
 
     # ------------------------------------------------------------------ checkpoints
     def publish_checkpoint(
-        self, task_id: str, *, revision: int, participant_id: str, checkpoint: dict,
+        self,
+        task_id: str,
+        *,
+        revision: int,
+        participant_id: str,
+        checkpoint: dict,
         authorization_ref=None,
     ) -> dict:
         """Publish a VERSIONED checkpoint. A given revision is immutable: re-publishing the same
         revision with identical content is idempotent; with different content it is rejected
         (checkpoint_conflict). authorization_ref is carried, never a grant."""
         require_id(task_id, "task_id")
-        import hashlib, json as _json
+        import hashlib
+        import json as _json
+
         body_hash = hashlib.sha256(
             _json.dumps(checkpoint, sort_keys=True, ensure_ascii=False).encode()
         ).hexdigest()
@@ -701,18 +1010,31 @@ class Coordinator:
                     # rederived from them (checkpoint-recovery review).
                     self._repair_checkpoint_latest(task_id)
                     return {"idempotent": True, "checkpoint": prev}
-                raise ProtocolError("checkpoint_conflict", str(revision),
-                                    "a published checkpoint revision is immutable")
+                raise ProtocolError(
+                    "checkpoint_conflict",
+                    str(revision),
+                    "a published checkpoint revision is immutable",
+                )
             rec = {
-                "schema_version": model.SCHEMA_VERSION, "task_id": task_id,
-                "revision": int(revision), "published_by": participant_id,
-                "authorization_ref": authorization_ref, "content_hash": body_hash,
-                "published_at": utcnow(), "checkpoint": checkpoint,
+                "schema_version": model.SCHEMA_VERSION,
+                "task_id": task_id,
+                "revision": int(revision),
+                "published_by": participant_id,
+                "authorization_ref": authorization_ref,
+                "content_hash": body_hash,
+                "published_at": utcnow(),
+                "checkpoint": checkpoint,
             }
-            self.store.write(rel, rec)  # authoritative publication of the checkpoint body
+            self.store.write(
+                rel, rec
+            )  # authoritative publication of the checkpoint body
             self._repair_checkpoint_latest(task_id)  # derive latest from durable bodies
-            self.store.append_receipt(f"{_task_root(task_id)}/audit.jsonl", "checkpoint",
-                                      {"revision": int(revision), "by": participant_id}, lock_name=task_id)
+            self.store.append_receipt(
+                f"{_task_root(task_id)}/audit.jsonl",
+                "checkpoint",
+                {"revision": int(revision), "by": participant_id},
+                lock_name=task_id,
+            )
             return {"idempotent": False, "checkpoint": rec}
 
     def _max_checkpoint_revision(self, task_id: str):
@@ -735,8 +1057,10 @@ class Coordinator:
         if mx is None:
             return
         body = self.store.read(f"{_task_root(task_id)}/checkpoints/{mx}.json") or {}
-        self.store.write(f"{_task_root(task_id)}/checkpoints/latest.json",
-                         {"revision": mx, "content_hash": body.get("content_hash")})
+        self.store.write(
+            f"{_task_root(task_id)}/checkpoints/latest.json",
+            {"revision": mx, "content_hash": body.get("content_hash")},
+        )
 
     def read_checkpoint(self, task_id: str, revision: int | None = None) -> dict | None:
         if revision is None:
@@ -748,12 +1072,20 @@ class Coordinator:
                 revision = self._max_checkpoint_revision(task_id)
                 if revision is None:
                     return None
-        return self.store.read(f"{_task_root(task_id)}/checkpoints/{int(revision)}.json")
+        return self.store.read(
+            f"{_task_root(task_id)}/checkpoints/{int(revision)}.json"
+        )
 
     # ------------------------------------------------------------------ wait (bounded, no wake)
     def wait(
-        self, task_id: str, participant_id: str, *, after_seq: int = 0,
-        timeout_s: float = 30.0, kinds: list[str] | None = None, poll_s: float = 0.5,
+        self,
+        task_id: str,
+        participant_id: str,
+        *,
+        after_seq: int = 0,
+        timeout_s: float = 30.0,
+        kinds: list[str] | None = None,
+        poll_s: float = 0.5,
     ) -> dict:
         """Bounded wait for NEW addressed messages after a cursor. Truthful: a filesystem poll with a
         finite timeout, NOT a host wake-up. Returns as soon as any qualifying message exists or the
@@ -767,8 +1099,13 @@ class Coordinator:
                 res["timed_out"] = False
                 return res
             if time.monotonic() >= deadline:
-                return {"messages": [], "next_after_seq": int(after_seq),
-                        "truncated": False, "returned": 0, "timed_out": True}
+                return {
+                    "messages": [],
+                    "next_after_seq": int(after_seq),
+                    "truncated": False,
+                    "returned": 0,
+                    "timed_out": True,
+                }
             time.sleep(min(poll_s, max(0.0, deadline - time.monotonic())))
 
     # ------------------------------------------------------------------ resume after compaction
@@ -779,8 +1116,10 @@ class Coordinator:
         task = self._require_task(task_id)
         p = self._participant(task_id, participant_id)
         pending = [
-            m for m in self._all_messages(task_id)
-            if self._addressed_to(m, p) and not self.is_acked(task_id, participant_id, m["message_id"])
+            m
+            for m in self._all_messages(task_id)
+            if self._addressed_to(m, p)
+            and not self.is_acked(task_id, participant_id, m["message_id"])
         ][: max(0, int(limit))]
         return {
             "task": task,
