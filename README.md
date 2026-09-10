@@ -1,11 +1,143 @@
 # SporeDrive
 
-Portable release build of the Codex -> Claude Code coordination workflow: instruction files, the
-`codex-review` skill, the `codex_ask` wrapper, the Codex-side `cmux-driver` skill, the shared
-`mycelium_coord` coordination package, and the Mycelium lifecycle source it integrates with.
+**SporeDrive is a portable, supervised two-agent coding workflow.** It pairs an OpenAI **Codex**
+session acting as *supervisor* with an Anthropic **Claude Code** session acting as *executor*: the
+supervisor relays the owner's brief, reviews, and observes progress, while Claude Code is the single
+agent that actually writes to the repository. The two never share a process -- they coordinate through
+**Mycelium**, a local shared-state protocol (addressed messages, versioned checkpoints, and an
+enforced execution policy), and the supervisor reaches the exact live executor session through a small
+**cmux MCP bridge** that delivers a notification only to the one bound Claude session.
 
-This is a **staged release bundle**, not a live install. Nothing here is wired into any running
-Claude Code or Codex session until you run the installer against your own machine.
+This repository is the installable release of that workflow: the instruction files, the
+`codex-review` skill, the `codex_ask` wrapper, the Codex-side `cmux-driver` skill, the shared
+`mycelium_coord` coordination package, the `cmux_bridge` MCP server, owned install/verify/rollback and
+native-export tooling, and the Mycelium lifecycle source it integrates with. Cloning the repo installs
+nothing on its own -- nothing here is wired into any running Claude Code or Codex session until you run
+the installer (`scripts/wfctl.py install`) and export/activate the plugin against your own machine
+(see [Install / change / rollback](#install--change--rollback-procedure) and
+[Native install & setup](#native-install--setup-portable)).
+
+## Who it is for, and what you get
+
+SporeDrive is for someone running both Codex and Claude Code on a Mac who wants **one agent to
+supervise another with real, auditable limits** rather than two chat windows and copy-paste. You get:
+
+- **A clear division of authority.** Codex supervises and reviews; Claude Code is the sole writer of
+  the worktree. A supervisor's brief is the task of record, but it never edits your repository itself.
+- **Durable coordination that survives compaction.** Every task, message, checkpoint, and execution
+  allowance is persisted to a local state directory, so a session that compacts or restarts resumes
+  from the shared record instead of losing the thread.
+- **Bounded execution.** A managed task carries a spendable budget -- how many work dispatches and
+  reviewer launches it may make, a reviewer time limit, an optional expiry -- enforced atomically in
+  code, not left to an agent's good intentions (see [Bounded execution](#bounded-execution)).
+- **Exact-session delivery.** The bridge notifies the specific bound Claude session (matched by
+  workspace, worktree, session id, and controller), so a message cannot be typed into the wrong
+  window, and a delivery is refused outright if the task is paused or closed.
+- **Owned, reversible installation.** `wfctl.py` snapshots what it replaces and can roll back byte for
+  byte; the exporter builds a self-verifying native Mycelium plugin from bundled source and never
+  touches the canonical source tree.
+
+## How the pieces fit
+
+- **Roles -- Codex supervisor, Claude executor.** The supervisor relays the owner's brief, runs scoped
+  read-only reviews (`codex-review` / `codex_ask`), and watches progress; it holds no repository-write
+  authority. The executor (the Claude Code session) implements, tests, and is the only writer. This
+  mapping is carried in the coordination host identities (`host=codex` supervisor, `host=claude`
+  executor).
+- **Mycelium -- shared coordination state.** `coordination/mycelium_coord/` is a provider-neutral
+  package exposing the same operations over a bundled CLI (`coordination/bin/mycelium-coord`) and, once
+  the plugin is loaded, `coord_*` MCP tools on both hosts. Sessions **attach** to an authorized task,
+  **send** addressed messages of ten fixed kinds, **ack** receipt, and publish/read versioned
+  **checkpoints**. Message states are distinct and meaningful (persisted -> delivered -> acknowledged
+  -> completion_claimed -> completed), and a completion is only *verified* when its artifact evidence
+  (a file plus sha256) actually checks out -- a claim of "done" is not the same as done.
+- **Execution policy -- the enforced part.** On top of plain messaging, a *managed* task opens an
+  execution record that governs what work may be dispatched. Actions must **reserve** from a shared
+  allowance and **claim** that reservation against one concrete dispatch identity before any work goes
+  out; paused, expired, closed, or already-spent reservations are refused (see
+  [Bounded execution](#bounded-execution)).
+- **The cmux bridge -- exact-session delivery.** `bridge/cmux_bridge/` is a minimal
+  `codex-claude-bridge` MCP server over the cmux CLI. The supervisor binds to a specific Claude session
+  (verified by workspace, worktree realpath, session id, and controller id) and submits a
+  notification; immediately before pressing Enter in that session the bridge re-checks the managed
+  execution gate, so a delivery into a paused or closed task is withheld rather than typed. Its
+  operator-side contract is `src/codex/skills/cmux-driver/references/bridge-mcp.md`.
+- **Owned tooling -- install, verify, roll back, export.** `scripts/wfctl.py` installs the instruction
+  files/skills/wrappers with a pre-install snapshot and a byte-exact rollback;
+  `scripts/export_coordination.py` turns the bundled `mycelium-source/` plus this repo's
+  `coordination/` and `bridge/` into one owned, self-verifying native Mycelium plugin candidate. Both
+  are covered in detail under [Native install & setup](#native-install--setup-portable).
+
+## Bounded execution
+
+A supervised workflow is only meaningful if "supervised" is something the code enforces. A managed
+task's execution record (opened with `exec-open`) carries a spendable budget and a lifecycle, seeded
+from the maintained defaults in `coordination/mycelium_coord/execution_policy.json`:
+
+- **Persistent allowances and reservations.** Every work-producing action must first *reserve* from a
+  shared allowance, and a reservation is **bound to one concrete dispatch identity** the first time it
+  funds a real dispatch -- the same reservation can never fund a second, different dispatch, and a
+  reviewer launch can never be spent as a work dispatch. Allowances and reservations live in the
+  persisted record, so they hold across compaction and across both hosts.
+- **Defaults: 4 work dispatches, 2 review launches, a 900-second reviewer deadline.** An ordinary task
+  may make four work-producing dispatches (initial brief, one review, one repair brief, one repair
+  verification) and two reviewer launches; each owned read-only reviewer process carries a hard 900 s
+  wall-clock limit. A brief may only **lower** a limit -- raising one, extending it, or unpausing
+  requires a user-authorization-linked change path, never something a supervisor composes for itself.
+- **Acceptance closure, evidenced repairs, and a backlog.** When work is accepted the task moves to
+  *closure*; after closure only an **evidenced repair** -- a reservation linked to a still-open,
+  evidence-backed acceptance blocker -- may dispatch, and optional non-blocking improvements go to a
+  backlog rather than reopening the task.
+- **Pause and expiry gates.** A task can be paused (it enters a *draining* state) or given an expiry;
+  while paused, expired, or closed, claims and bridge deliveries are refused with a distinct reason
+  (`execution_paused` / `execution_closed`), not silently dropped.
+- **Compaction preserves state.** Because all of this is on disk, a session that compacts or restarts
+  reattaches and reads the same execution record, allowances, and reservations -- the boundary is a
+  scheduled checkpoint, not a lost task.
+- **Technical readiness vs. frozen acceptance.** The workflow separates "the code runs and the tests
+  pass" (technical readiness, which the executor may continue on its own) from the owner's **frozen
+  acceptance criteria** (what makes the task *done*), which the executor does not renegotiate. A smoke
+  or repair dispatch verifies execution, not that a scientific result is correct.
+
+## A task, end to end
+
+A typical run: the owner gives the Codex supervisor a brief. The supervisor **creates a managed task**
+and opens its execution record, then **sends** the brief as an addressed, actionable message to the
+Claude executor over Mycelium. The executor **acks**, does the work as the sole writer, runs tests,
+and **publishes a checkpoint** plus progress messages the supervisor reads back. If a review is
+warranted the supervisor spends a **review launch** on a scoped, read-only `codex_ask` review (bounded
+by the 900 s reviewer deadline); the executor repairs against the named findings. When the owner
+authorizes acceptance, the task moves to **closure**, and the executor sends a **completion_receipt**
+carrying artifact evidence (a file path plus sha256) that Mycelium verifies before the task is marked
+completed. Throughout, the supervisor reaches the executor's exact live session through the cmux
+bridge, and every dispatch is drawn from -- and checked against -- the task's persisted allowance. The
+runnable, command-by-command version of this exchange is in
+[Minimal cross-session exchange example](#4-minimal-cross-session-exchange-example) below.
+
+## What SporeDrive does and does not do
+
+- **Enforcement applies to *managed* tasks.** The allowance/reservation/gate machinery governs a task
+  that has an execution record. Plain coordination messaging still works without one, and whether a
+  managed message is *actionable* (and so subject to reserve/claim gating) is a **trusted-agent
+  disposition** the sending agent supplies -- a boolean it sets honestly, not something parsed out of
+  free text. Unmanaged and legacy messages hash and behave exactly as before and are not gated; the
+  system fails closed on a corrupt managed record rather than treating it as legacy.
+- **No hard desktop token or reasoning cap.** SporeDrive bounds *coordination* -- dispatches, reviews,
+  reviewer wall-clock, and task lifecycle. It does **not** impose a hard token or reasoning-effort
+  ceiling on the desktop Claude/Codex sessions themselves; per-model token and effort preferences are
+  policy and guidance, not a runtime mechanism this repo enforces. The one hard time limit it does
+  enforce is the reviewer deadline on an owned reviewer process.
+- **Shared storage is local, not a cross-machine bus.** The coordination store is a directory on one
+  machine's filesystem (`--root` / `MYCELIUM_COORD_DIR`). Two sessions coordinate by sharing that local
+  path; it is not a network service or an arbitrary cross-machine message bus.
+- **macOS + cmux, and activation is for fresh sessions.** The live path targets macOS with the cmux app
+  (either `cmuxOnly` ancestry or password socket-control mode) and the live `codex`/`claude` CLIs.
+  Installing or re-exporting activates the runtime for **fresh** Claude/Codex sessions; a session that
+  was already running keeps the modules it loaded until it restarts.
+- **It coordinates; it does not reason for the models.** SporeDrive manages the *lifecycle* -- who may
+  write, what may be dispatched, when a task is done -- and the durable record around it. The quality
+  of the actual code and analysis is still the models' own reasoning; this layer makes that work
+  bounded, addressable, and auditable, not smarter.
 
 ## Layout
 
@@ -80,17 +212,16 @@ for it.
 pinned commit. See `PROVENANCE.md` for the exact commit hash, what was excluded from the copy
 (`.git/`, caches), and licensing notes for that subtree.
 
-**Build identity is three distinct things, not one.** This bundle's `mycelium-source/` commit pin is
-the *release bundle's* source input -- it is not necessarily the same commit as (a) an
-already-installed candidate's frozen manifest, or (b) a currently-running acceptance harness. As of
-this writing, an already-installed R3 candidate's manifest is frozen at workflow build `36d2b54`
-(its runtime core/coordination code unchanged since), while the acceptance harness currently
-exercising that candidate runs from a separate commit, `9d18c82`. Do not assume this release bundle
-is byte-identical to whatever full-source tree is already installed on a given machine, and do not
-reinstall or re-export an existing candidate solely because this bundle's docs or other non-runtime
-files changed -- a release can instead be rebuilt from its own final bundled inputs and record its
-own manifest identity (`EXPORT_MANIFEST.json` / the `+<build-id>` suffix in `plugin.json`), distinct
-from both of the above.
+**Build identity is more than one thing.** This bundle's `mycelium-source/` commit pin is the
+*release bundle's* source input; it is not automatically the same commit as (a) an already-installed
+plugin candidate's frozen manifest, or (b) an acceptance harness that exercised it. Do not assume this
+release is byte-identical to whatever full-source tree is already installed on a given machine, and do
+not reinstall or re-export an existing candidate solely because this bundle's docs or other
+non-runtime files changed -- a release can instead be rebuilt from its own final bundled inputs and
+record its own manifest identity (`EXPORT_MANIFEST.json` / the `+<build-id>` suffix in `plugin.json`),
+distinct from both of the above. The concrete commit, manifest, and cache identities for the current
+accepted release are recorded in `PROVENANCE.md` and the accepted release receipt
+`checks/RELEASE-RECEIPT-20260910.json`.
 
 ## Native install & setup (portable)
 
@@ -417,25 +548,36 @@ what was included, what was excluded, and why.
 
 ## Status
 
-This is the **authorized private release** of the SporeDrive coordination bundle. Its source is the
-`codex-claude-workflow` repository: the coordination/bridge parts correspond to source revision
-`9d18c82` (the accepted acceptance harness) with the cross-run view at `ec49e21`, and the bundled
-Mycelium lifecycle source is pinned at `f2b0083` (see `PROVENANCE.md`).
+This is the **authorized private release** of the SporeDrive coordination bundle, and it is complete
+and accepted. The maintained runtime source is the bounded-execution build at commit `664de18` on
+branch `sporedrive-bounded-execution` (bridge `cmux_bridge/core.py` sha256 `54cac34e...`, 18 pre-enter
+gate sites); the bundled Mycelium lifecycle source is pinned at `f2b0083` (see `PROVENANCE.md`). The
+concrete commit, cache, and manifest identities are recorded in the accepted release receipt
+`checks/RELEASE-RECEIPT-20260910.json`.
 
-Testing is complete and accepted. The full acceptance suite passed **40/40** against a real cmux
-session over password-mode socket access (`checks/live-full40-20260910T033947Z`, harness `9d18c82`,
-401.9s; independently accepted, proof `full40-second-independent-proof.json` SHA `d35ac382...`).
-Coverage: 35 real + 4 real+injected + 1 state-manipulated. The offline suites also pass: `py_compile`
-and unit tests, including `tests/test_wfctl.py` against a clean-clone-shaped tree (no `snapshots/`,
-`installed/`, or `receipts/` -- the shape a fresh release clone actually has), plus the 297 canonical
-bridge/coordination tests.
+**Validation (current):**
 
-The earlier 36/40 run (harness `862d173`) is preserved in the source repository as a genuine FAIL, not
-relabeled; those four failures were harness-fixture defects, since fixed (see the r2 outcome report).
-This release records its **own** rebuilt build identity; it does **not** claim byte-identity with the
-installed Mycelium R3 package closure (`36d2b54`), which is a separate installed artifact.
+- **346 offline tests pass** -- coordination 87 (including 5 repair-verification tests), package tests
+  45, bridge 214 -- plus `py_compile` and a clean-clone-shaped `tests/test_wfctl.py` (no `snapshots/`,
+  `installed/`, or `receipts/`, the shape a fresh release clone actually has). `ruff` format is clean
+  on changed sources (five pre-existing `E741` in `live_acceptance.py` left unchanged).
+- **Live host smoke: 40 / 40 PASS, 0 FAIL** against a real cmux session over password-mode socket
+  access, on a `--focus false` disposable surface with focus preserved and every runner-owned surface
+  closed (`checks/live-20260910T091929Z`, head `664de18`).
+- **Fresh-host execution verified.** Two fresh native sessions (a `claude -p` and an isolated
+  `codex exec`, with distinct PIDs, session ids, and plugin caches) loaded the installed package and
+  exercised shared managed pause/resume/closure and evidenced-repair gates; the real disposable-cmux
+  managed gate was driven through the actual `notify_via_bridge` transport (paused and closed
+  deliveries refused with no Enter, the resumed delivery accepted exactly once).
+- **Review budget: 2 / 2 consumed** (a primary review plus one repair verification); no further
+  reviews are allocated for this release.
 
-Limitations carried forward (from the disposition matrix): compaction efficiency and the
-effort-vs-output comparison are descriptive/not-yet-run experiments; runtime enforcement of delegation
-controls is installed policy, not a runtime mechanism; the native lifecycle audit is
-fixture/injected-state (real scientific repositories were never mutated).
+**Honest limitations (carried forward).** A Claude or Codex session that was already running keeps its
+previously-loaded modules until it restarts; the repaired runtime is what **fresh** clients load. In
+the real bridge-gate run, delivering the resumed notification left the disposable target on a modal at
+teardown, so the harness could not confirm a graceful `SessionEnd` and correctly refused to press
+Enter onto a modal -- cleanup was instead reconciled out of band (owned surface closed, owned process
+and descendants exited, writer binding released). The compaction-efficiency and effort-versus-output
+comparisons are descriptive experiments, not yet run. Delegation, token, and effort controls are
+installed *policy*, not a runtime-enforced mechanism. The native lifecycle audit used fixture and
+injected state -- no real scientific repository was mutated.
