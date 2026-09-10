@@ -11,3 +11,5 @@ bridge/.pytest_cache/
 .benchmarks/
 .ruff_cache/
 bridge/.ruff_cache/
+installed/
+receipts/
