@@ -1,0 +1,12 @@
+real-trust-dialog.txt
+  Verbatim rows captured from the real cmux/Claude runtime on 2026-09-08:
+  checks/bridge-20260908T171703Z/summary.json -> cases[R0-modal].evidence.tail
+  Expected classification: modal (dialog text, no NBSP input line).
+
+real-dialog-scrollback-then-idle.txt
+  Composite of two REAL captures, not an invented screen: the dialog rows above kept as
+  scrollback, followed by the real prompt/footer rows recorded verbatim in
+  docs/m3-runtime-facts-2026-09-08.md ('Claude Code screen (read-screen of this session,
+  last 12 rows)'). This is the case `--lines N` produces after the operator answers the
+  dialog: the dialog is still in the window but the input box is back.
+  Expected classification: prompt_idle.

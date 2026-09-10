@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# Deterministic fake `codex` CLI stub for codex_ask.sh receipt-classification tests.
+# kind: simulated — the real codex/ChatGPT-subscription CLI is never invoked by these tests.
+#
+# codex_ask.sh calls:
+#   codex exec --sandbox read-only -m MODEL -c model_reasoning_effort=EFFORT -o LAST_MSG_FILE -
+# with the prompt piped on stdin. This stub consumes stdin (mirroring the real CLI's `-` stdin
+# mode), parses out the -o/--output-last-message path it was given, and emits canned
+# stdout/stderr/exit-code/last-message-artifact combinations selected by the FAKE_CODEX_SCENARIO
+# env var so the wrapper's receipt classification can be exercised deterministically and offline.
+#
+# Mirroring the real codex-cli contract (confirmed via `codex exec --help`): the last-message
+# artifact is written ONLY when the CLI actually produced a genuine final agent message. A
+# banner-only, warning-only, or tool-log-only run never touches that path — exactly like a real
+# run that never reached a final answer.
+cat >/dev/null
+
+LAST_MSG=""
+args=("$@")
+i=0
+while [ "$i" -lt "${#args[@]}" ]; do
+  case "${args[$i]}" in
+    -o|--output-last-message)
+      i=$((i + 1))
+      LAST_MSG="${args[$i]:-}"
+      ;;
+  esac
+  i=$((i + 1))
+done
+
+write_final() {
+  # Simulates the real CLI writing its genuine final agent message to -o/--output-last-message.
+  # No-op if the caller didn't pass -o (keeps this stub usable without it too).
+  [ -n "$LAST_MSG" ] && printf '%s\n' "$1" > "$LAST_MSG"
+}
+
+case "${FAKE_CODEX_SCENARIO:-success}" in
+  success)
+    cat <<'EOF'
+codex response: reviewed the requested files. This is a complete, substantive answer with
+several sentences of real analysis content. No issues found in the reviewed scope.
+EOF
+    write_final 'codex response: reviewed the requested files. This is a complete, substantive answer with several sentences of real analysis content. No issues found in the reviewed scope.'
+    exit 0
+    ;;
+  warning_then_answer)
+    echo "warning: failed to refresh models cache; using last-known model list" >&2
+    cat <<'EOF'
+codex response: despite the nonfatal models-cache warning above, this is a complete substantive
+final answer with real analysis content.
+EOF
+    write_final 'codex response: despite the nonfatal models-cache warning above, this is a complete substantive final answer with real analysis content.'
+    exit 0
+    ;;
+  auth_failure)
+    # No final message is ever produced when auth fails before any generation starts, so the
+    # real CLI never writes the -o artifact here either.
+    echo "Error: not logged in. Run \`codex login\` to authenticate." >&2
+    exit 1
+    ;;
+  empty_output)
+    exit 0
+    ;;
+  partial_output)
+    # Represents a run that DID produce some real final-message content (the CLI wrote to the
+    # -o artifact) but the process itself still exited nonzero (e.g. crashed/errored after
+    # emitting a partial message) — kept distinct from a bare nonzero exit with no artifact at
+    # all, and distinct from a clean rc=0 success.
+    printf 'codex response: the analysis was cut off mid-sen'
+    write_final 'codex response: the analysis was cut off mid-sen'
+    echo "Error: codex exec terminated unexpectedly after partial output" >&2
+    exit 1
+    ;;
+  timeout)
+    printf 'codex response: this output was cut off mid-sen'
+    exit 124
+    ;;
+  killed)
+    printf 'codex response: cut off by a signal'
+    exit 137
+    ;;
+  banner_only)
+    # Real codex-cli 0.146.0 startup banner text (confirmed against a live invocation), with NO
+    # answer body after it and NO -o artifact written at all. exit 0. This must never be
+    # classified complete:true — a banner is startup configuration, not final-answer evidence,
+    # regardless of how many bytes it is.
+    cat <<'EOF'
+OpenAI Codex v0.146.0
+--------
+workdir: /tmp/disposable
+model: gpt-5.6-sol
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: medium
+session id: 11111111-1111-1111-1111-111111111111
+--------
+EOF
+    exit 0
+    ;;
+  warning_only)
+    # A long nonfatal models-cache warning with no banner, no answer body, and no -o artifact.
+    # exit 0. Must never be classified complete:true merely because the warning text is long.
+    echo "WARN codex_core::models_manager: failed to refresh models cache: missing field base_instructions; retaining cached metadata" >&2
+    exit 0
+    ;;
+  auth_prose_in_answer)
+    # A real, complete final answer (rc=0, real -o artifact) that merely DISCUSSES the literal
+    # string "not logged in" as prose/test-data commentary. Must classify as a valid complete
+    # answer, not auth_failure — the phrase appears in assistant prose, not a process/status
+    # channel, and completeness is now decided solely by the -o artifact, never by scanning text.
+    cat <<'EOF'
+model: gpt-5.6-sol
+session id: 11111111-1111-1111-1111-111111111111
+codex
+The string "not logged in" appears in the fixture. That is test data; the actual run succeeded
+and the requested review is complete. No findings.
+EOF
+    write_final 'The string "not logged in" appears in the fixture. That is test data; the actual run succeeded and the requested review is complete. No findings.'
+    exit 0
+    ;;
+  short_valid_answer)
+    # A genuinely short but complete final answer (real -o artifact, no banner, no warning).
+    # Must classify complete:true — length plays no role in completeness at all any more.
+    printf 'Reviewed. LGTM, no issues found.'
+    write_final 'Reviewed. LGTM, no issues found.'
+    exit 0
+    ;;
+  banner_prefixed_by_warning)
+    # A nonfatal models-cache warning BEFORE the ordinary startup banner, no final answer, no -o
+    # artifact. Ordering must not matter: completeness never depends on parsing text position
+    # relative to the banner at all any more, only on the -o artifact.
+    echo "WARN failed to refresh models cache" >&2
+    cat <<'EOF'
+OpenAI Codex v0.146.0
+--------
+workdir: /tmp/disposable
+model: gpt-5.6-sol
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: medium
+session id: 11111111-1111-1111-1111-111111111111
+--------
+EOF
+    exit 0
+    ;;
+  prompt_and_tool_log_no_final)
+    # Normal banner + an echoed user prompt turn + a tool-execution log line, but the run never
+    # produces a final answer, so no -o artifact is written. Must be empty_output/complete:false
+    # regardless of how much raw log text (prompt echo, tool output) surrounds it.
+    cat <<'EOF'
+OpenAI Codex v0.146.0
+--------
+workdir: /tmp/disposable
+model: gpt-5.6-sol
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: medium
+session id: 11111111-1111-1111-1111-111111111111
+--------
+user
+Please review the requested implementation and report findings with evidence.
+exec
+/bin/zsh -lc true succeeded in 42ms
+EOF
+    exit 0
+    ;;
+  final_prose_json_model)
+    # Normal banner + a real, complete final answer (real -o artifact) that happens to quote
+    # example JSON containing a DIFFERENT model slug as sample/test data. Must not be read as
+    # response metadata: model_served stays null and no mismatch is manufactured from prose.
+    cat <<'EOF'
+OpenAI Codex v0.146.0
+--------
+workdir: /tmp/disposable
+model: gpt-5.6-sol
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: medium
+session id: 11111111-1111-1111-1111-111111111111
+--------
+codex
+The fixture contains {"model": "gpt-unrelated"}. This is example input data. The requested
+review completed successfully. No findings.
+EOF
+    write_final 'The fixture contains {"model": "gpt-unrelated"}. This is example input data. The requested review completed successfully. No findings.'
+    exit 0
+    ;;
+  short_complete_token)
+    # Normal banner + a single-word but genuinely complete final answer ("READY") written to the
+    # real -o artifact. Must classify complete:true — no punctuation/length heuristic is used.
+    cat <<'EOF'
+OpenAI Codex v0.146.0
+--------
+workdir: /tmp/disposable
+model: gpt-5.6-sol
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: medium
+session id: 11111111-1111-1111-1111-111111111111
+--------
+codex
+READY
+EOF
+    write_final 'READY'
+    exit 0
+    ;;
+  *)
+    echo "fake codex stub: unknown FAKE_CODEX_SCENARIO=${FAKE_CODEX_SCENARIO}" >&2
+    exit 99
+    ;;
+esac

@@ -1,0 +1,104 @@
+{
+  "skill_name": "prompt-optimizer",
+  "evals": [
+    {
+      "id": 0,
+      "prompt": "I have a prompt that extracts key findings from biomedical papers into structured JSON. It works OK but the outputs are inconsistent — sometimes it extracts 5 findings, sometimes 50, and it keeps using vague language like 'affects' instead of specific predicates. I want to systematically improve it. The prompt is about 8K chars and I have 15 test papers I can evaluate against. How should I approach this?",
+      "expected_output": "Should walk through the full optimization methodology: three-file pattern, metric design (especially density and predicate diversity), scoring function, error analyzer, tournament-based optimization loop. Should ask clarifying questions about the specific schema, what 'good' looks like, and what model runs the prompt.",
+      "files": [],
+      "assertions": [
+        {
+          "id": "a0_three_file",
+          "text": "Mentions or describes the three-file architecture pattern (program.md / artifact / runner)",
+          "type": "content_check"
+        },
+        {
+          "id": "a0_metrics",
+          "text": "Discusses designing metrics or a scoring function with specific examples relevant to extraction (density, diversity, coverage)",
+          "type": "content_check"
+        },
+        {
+          "id": "a0_tournament",
+          "text": "Mentions tournament selection or parallel candidate generation as part of the optimization approach",
+          "type": "content_check"
+        },
+        {
+          "id": "a0_structured_edits",
+          "text": "Recommends structured find/replace edits over full prompt regeneration",
+          "type": "content_check"
+        },
+        {
+          "id": "a0_interview",
+          "text": "Asks clarifying questions about the user's specific setup (schema, model, post-processing, budget)",
+          "type": "content_check"
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "prompt": "My code review prompt keeps missing security vulnerabilities. It catches obvious stuff like SQL injection but misses things like insecure deserialization, SSRF, and race conditions. I've been manually tweaking the prompt for weeks but it feels random — sometimes a change helps one category but hurts another. I have a labeled dataset of 20 code snippets with known vulns that I can test against. Help me set up a systematic optimization process.",
+      "expected_output": "Should adapt the methodology to code review: suggest metrics like vulnerability category coverage, false negative rate, severity accuracy. Should recommend the error analyzer approach to detect which vulnerability categories are systematically missed. Should propose the two-phase approach (quality first, then cost/speed).",
+      "files": [],
+      "assertions": [
+        {
+          "id": "a1_domain_metrics",
+          "text": "Proposes domain-appropriate metrics for code review (vulnerability coverage, detection rate, false positives/negatives, or severity accuracy)",
+          "type": "content_check"
+        },
+        {
+          "id": "a1_error_analysis",
+          "text": "Discusses systematic error analysis — detecting which categories of vulnerabilities are consistently missed",
+          "type": "content_check"
+        },
+        {
+          "id": "a1_iterative",
+          "text": "Describes an iterative improvement loop (not just one-shot prompt rewriting)",
+          "type": "content_check"
+        },
+        {
+          "id": "a1_diversity",
+          "text": "Mentions diversity strategies, different optimization lenses, or avoiding repetitive edits",
+          "type": "content_check"
+        },
+        {
+          "id": "a1_regression",
+          "text": "Addresses the user's specific problem of regressions (fixing one category hurts another) with composite scoring or similar",
+          "type": "content_check"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "I want to optimize my customer support email drafting prompt for cost. It currently uses Claude Opus and costs $0.12 per email. Quality is great (our QA team rates 94% of drafts as ready-to-send) but we process 10K emails/day so the cost is killing us. Can we get comparable quality with a cheaper model or a more efficient prompt? I need a structured way to verify we don't tank quality while reducing cost.",
+      "expected_output": "Should recognize this as a Phase 2 (cost reduction) scenario since quality is already high. Should recommend establishing a quality floor (e.g., >90% ready-to-send rate), then optimizing for cost. Should discuss prompt compression, model downgrade testing, and quality monitoring.",
+      "files": [],
+      "assertions": [
+        {
+          "id": "a2_phase2",
+          "text": "Recognizes this as primarily a cost optimization problem (Phase 2) since quality is already high at 94%",
+          "type": "content_check"
+        },
+        {
+          "id": "a2_quality_floor",
+          "text": "Recommends establishing a quality floor or minimum threshold before cost cutting",
+          "type": "content_check"
+        },
+        {
+          "id": "a2_cost_strategies",
+          "text": "Suggests concrete cost reduction strategies (prompt compression, shorter instructions, removing redundant examples, model downgrade)",
+          "type": "content_check"
+        },
+        {
+          "id": "a2_measurement",
+          "text": "Proposes a way to measure both quality and cost together to verify the tradeoff",
+          "type": "content_check"
+        },
+        {
+          "id": "a2_iterative_not_yolo",
+          "text": "Recommends iterative cost reduction with quality verification at each step, not a one-shot model swap",
+          "type": "content_check"
+        }
+      ]
+    }
+  ]
+}

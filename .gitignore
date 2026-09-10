@@ -1,0 +1,13 @@
+__pycache__/
+.DS_Store
+checks/*/raw/
+*.wfctl-tmp
+*.wfctl-staging
+*.wfctl-old
+snapshots/
+.scratch/
+bridge/.pytest_cache/
+.pytest_cache/
+.benchmarks/
+.ruff_cache/
+bridge/.ruff_cache/

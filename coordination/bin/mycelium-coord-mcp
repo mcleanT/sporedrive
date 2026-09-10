@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Bundled launcher for the shared coordination MCP server (stdio). Self-locating. The MCP server
+# requires fastmcp; the host's default python3 may be a runtime WITHOUT it (e.g. Apple
+# CommandLineTools), so probe for a fastmcp-capable interpreter. Override with MYCELIUM_COORD_PYTHON.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="$(cd "$HERE/.." && pwd)${PYTHONPATH:+:$PYTHONPATH}"
+pick_python() {
+  if [ -n "${MYCELIUM_COORD_PYTHON:-}" ]; then printf '%s\n' "$MYCELIUM_COORD_PYTHON"; return; fi
+  for py in python3 python3.13 python3.12 python3.11 \
+            ${CONDA_PREFIX:+"$CONDA_PREFIX/bin/python3"} "$HOME/miniconda3/bin/python3"; do
+    if command -v "$py" >/dev/null 2>&1 && "$py" -c 'import fastmcp' >/dev/null 2>&1; then
+      printf '%s\n' "$py"; return
+    fi
+  done
+  printf 'python3\n'  # last resort — will fail visibly if fastmcp is genuinely absent
+}
+exec "$(pick_python)" -m mycelium_coord.mcp_server

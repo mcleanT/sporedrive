@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Bundled launcher for the shared coordination CLI. Self-locates the plugin-bundled package so it
+# works regardless of which plugin-root variable (PLUGIN_ROOT / CLAUDE_PLUGIN_ROOT) the host sets.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="$(cd "$HERE/.." && pwd)${PYTHONPATH:+:$PYTHONPATH}"
+exec "${MYCELIUM_COORD_PYTHON:-python3}" -m mycelium_coord "$@"

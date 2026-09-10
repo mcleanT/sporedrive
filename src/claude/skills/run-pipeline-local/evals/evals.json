@@ -1,0 +1,56 @@
+{
+  "skill_name": "run-pipeline-local",
+  "evals": [
+    {
+      "id": 1,
+      "name": "multi-team-full-pipeline",
+      "prompt": "Run the pipeline on: 'How does spatial gene co-expression change during neural development?' Use multi-team mode with 3 teams, N=3, high-diversity personas, shared lit review, full tiered reanalysis, iterative deepening. This is a DRY RUN — output your complete execution plan listing every stage in order with: stage name, model, MCP tools used, validation checks, output files. Do NOT actually execute.",
+      "expected_output": "Complete execution plan listing all 17 multi-team stages including: lit review with MCP tools, hypothesis gen, branching, approach gen with dataset search, data acquisition with MCP downloads, MANDATORY analysis planner, iterative deepening loop (main-context-orchestrated), MANDATORY figure composition, paper gen with figure embedding, gene panel overlap, meta-comparison with claim extraction, reanalysis WITH code execution, final synthesis, and ALL 6 post-synthesis chain steps (supplementary tables, figure composition plan, reference validation, findings network, graphical abstract, audit manifest).",
+      "files": [],
+      "assertions": [
+        {"text": "Plan includes literature review using MCP search tools (search_pubmed, search_semantic_scholar, search_openalex)", "type": "content_check"},
+        {"text": "Plan includes Analysis Planner as mandatory/always-on stage (not optional)", "type": "content_check"},
+        {"text": "Plan includes Figure Composition as a distinct stage between Analysis and Paper", "type": "content_check"},
+        {"text": "Plan describes iterative deepening as main-context-orchestrated loop with separate Round and Reflection subagent dispatches", "type": "content_check"},
+        {"text": "Plan includes Gene Panel Overlap as explicit stage after team pipelines", "type": "content_check"},
+        {"text": "Plan includes Meta-Comparison as explicit stage with atomic claim extraction", "type": "content_check"},
+        {"text": "Reanalysis description requires Python code execution (not just narrative reconciliation)", "type": "content_check"},
+        {"text": "Plan includes ALL 6 post-synthesis chain steps: supplementary tables, figure composition plan, reference validation, findings network, graphical abstract, audit manifest", "type": "content_check"},
+        {"text": "Plan mentions other_team_focuses or cross-team dataset complementarity", "type": "content_check"},
+        {"text": "Plan mentions branching integrator or thread allocation after hypothesis generation", "type": "content_check"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "single-team-simple",
+      "prompt": "Run a quick single-team pipeline on: 'Role of TP53 in treatment resistance across solid tumors'. Use N=1, standard mode. This is a DRY RUN — output your complete execution plan listing every stage in order with: stage name, model, MCP tools used, validation checks, output files. Do NOT actually execute.",
+      "expected_output": "Even in simple N=1 mode, plan should include ALL 9 single-team stages: lit review with MCP tools, hypothesis gen, approach gen, data acquisition, MANDATORY analysis planner, analysis with iterative deepening, MANDATORY figure composition, paper gen with figure embedding, post-processing with PDFs and supplementary tables.",
+      "files": [],
+      "assertions": [
+        {"text": "Plan includes literature review using MCP search tools (not LLM recall)", "type": "content_check"},
+        {"text": "Plan includes Analysis Planner as mandatory even for N=1", "type": "content_check"},
+        {"text": "Plan includes Figure Composition as mandatory even for N=1", "type": "content_check"},
+        {"text": "Plan includes iterative deepening with reflection loop even for N=1", "type": "content_check"},
+        {"text": "Paper generation mentions embedding figures with ![caption](path) syntax", "type": "content_check"},
+        {"text": "Post-processing includes supplementary tables (CSV)", "type": "content_check"},
+        {"text": "Plan has 9 distinct stages (not fewer)", "type": "content_check"}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "resume-mid-pipeline",
+      "prompt": "The literature review and hypothesis generation are already done for a multi-team run on 'Spatial transcriptomics of tumor microenvironment heterogeneity'. The outputs are in experiment outputs/tme_spatial_2026-03-14/. Continue from approach generation through the end. This is a DRY RUN — output your complete execution plan for the REMAINING stages with: stage name, model, MCP tools, validation checks, output files. Do NOT actually execute.",
+      "expected_output": "Plan should list all remaining stages starting from approach generation, NOT skip any downstream stages just because we're resuming. Must include: approach gen, data acquisition, MANDATORY analysis planner, analysis with iterative deepening, MANDATORY figure composition, paper gen, all cross-team stages (gene panel overlap, meta-comparison, reanalysis with code execution, final synthesis, ALL 6 post-synthesis steps), post-processing.",
+      "files": [],
+      "assertions": [
+        {"text": "Plan starts from approach generation (not re-running lit review or hypothesis)", "type": "content_check"},
+        {"text": "Plan includes Analysis Planner as mandatory", "type": "content_check"},
+        {"text": "Plan includes Figure Composition as mandatory", "type": "content_check"},
+        {"text": "Plan includes iterative deepening with reflection loop", "type": "content_check"},
+        {"text": "Plan includes all cross-team stages (gene panel overlap, meta-comparison, reanalysis, final synthesis)", "type": "content_check"},
+        {"text": "Plan includes ALL 6 post-synthesis chain steps", "type": "content_check"},
+        {"text": "Reanalysis requires code execution", "type": "content_check"}
+      ]
+    }
+  ]
+}

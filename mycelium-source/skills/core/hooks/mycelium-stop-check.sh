@@ -1,0 +1,754 @@
+#!/usr/bin/env bash
+# mycelium-stop-check.sh — Claude Code Stop hook
+# 1. Auto-finalizes session log in .living/log/ (factual record, guaranteed)
+# 2. Blocks session end if meaningful work was performed but .living/
+#    learnings/decisions were not updated (enforces reflection)
+# Does NOT block read-only or config-only sessions.
+#
+# Install: Add to .claude/settings.local.json under "Stop" hooks
+# Input: JSON on stdin with session metadata
+# Output: JSON with {"decision": "block", "reason": "..."} to prevent stop if needed
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$HERE/mycelium-hook-lib.sh"
+
+mycelium_handoff_has_headings() {
+  local file="$1"
+  local heading=""
+  shift
+  for heading in "$@"; do
+    grep -Fqx "$heading" "$file" 2>/dev/null || return 1
+  done
+  return 0
+}
+
+# Consume the hook payload. Claude Code and Codex set stop_hook_active=true
+# after a Stop hook asks the model to continue. That flag must not bypass an
+# outstanding Mycelium reminder: the state checks below naturally stop
+# blocking once .living/ has been updated, which is the recursion guard.
+INPUT=$(cat)
+HOST_SESSION_ID=$(printf '%s' "$INPUT" | mycelium_json_get 'session_id')
+# Per https://code.claude.com/docs/en/hooks#stop-decision-control,
+# hookSpecificOutput.additionalContext on a Stop hook is NOT a one-shot,
+# non-blocking notice: it continues the conversation under the same
+# stop_hook_active flag and the same continuation cap as decision:block.
+# Any Stop-time diagnostic that is not meant to re-fire on every subsequent
+# continuation Stop for the same unresolved condition must therefore check
+# this flag itself and go silent once it is true. mycelium_json_get only
+# prints scalar leaves and treats a JSON boolean as its Python str(), so
+# stop_hook_active is decoded explicitly here rather than reused.
+HOST_STOP_HOOK_ACTIVE=$(printf '%s' "$INPUT" | python3 -c '
+import json, sys
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    payload = {}
+print("true" if payload.get("stop_hook_active") is True else "false")
+' 2>/dev/null || echo "false")
+
+# Determine repo root early (used by both log finalization and .living/ checks)
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+if [ -z "$REPO_ROOT" ]; then
+  exit 0
+fi
+mycelium_prepare_state_dir "$REPO_ROOT" || exit 0
+if ! mycelium_acquire_stop_lock "$STATE_DIR"; then
+  # A concurrent owner may still fail or be interrupted, so accepting this Stop
+  # would bypass lifecycle enforcement. Preserve state and ask the host to retry.
+  mycelium_emit_stop_block \
+    "STOP BLOCKED — the lifecycle transaction lock remained busy. Active state was preserved; wait for the other lifecycle hook to finish, then retry Stop."
+  exit 0
+fi
+trap mycelium_release_stop_lock EXIT
+
+# Resolve and validate the active transaction before any Stop-side mutation.
+# The host session ID is per invocation; repository timestamps are shared and
+# therefore cannot distinguish a primary from a concurrently running child.
+ACTIVE_LOG_FILE="$STATE_DIR/active-session-log.tmp"
+ACTIVE_OWNER_FILE="$STATE_DIR/active-session-owner-id.tmp"
+ACTIVE_MARKER_VALID=false
+SESSION_OWNERSHIP="legacy"
+LOG_PATH=""
+OWNER_TS=""
+OWNER_FORMAT=""
+if [ -f "$ACTIVE_LOG_FILE" ]; then
+  if _ACTIVE_MARKER=$(mycelium_read_active_log_marker "$REPO_ROOT" "$ACTIVE_LOG_FILE"); then
+    ACTIVE_MARKER_VALID=true
+    LOG_PATH=$(printf '%s\n' "$_ACTIVE_MARKER" | sed -n '1p')
+    OWNER_TS=$(printf '%s\n' "$_ACTIVE_MARKER" | sed -n '2p')
+    OWNER_FORMAT=$(printf '%s\n' "$_ACTIVE_MARKER" | sed -n '3p')
+  else
+    # Never trust a separate owner token when the marker it supposedly owns is
+    # invalid. Remove both and continue to independent lifecycle enforcement.
+    rm -f "$ACTIVE_LOG_FILE" "$ACTIVE_OWNER_FILE"
+  fi
+fi
+
+if [[ "$ACTIVE_MARKER_VALID" == true \
+  && ( "$OWNER_FORMAT" == "owner-id-v1" \
+    || -e "$ACTIVE_OWNER_FILE" || -L "$ACTIVE_OWNER_FILE" ) ]]; then
+  if ! OWNER_SESSION_ID=$(mycelium_read_session_owner_id "$ACTIVE_OWNER_FILE") \
+    || [[ ! "$HOST_SESSION_ID" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || (( ${#HOST_SESSION_ID} > 200 )); then
+    mycelium_emit_stop_block \
+      "STOP BLOCKED — active session ownership could not be validated. The primary lifecycle state was preserved; repair the owner marker or retry from its host session."
+    exit 0
+  elif [[ "$OWNER_SESSION_ID" != "$HOST_SESSION_ID" ]]; then
+    # Not the active transaction owner. Two distinct situations reach here:
+    #  (a) a genuine ephemeral subagent of the owning session, with no
+    #      provenance of its own -- stay silent, as before, so ordinary
+    #      subagent Stop events produce no noise.
+    #  (b) a second ROOT writer session (e.g. a concurrent Claude/Codex host
+    #      session) that performed real, independently-attributed edits
+    #      while a different session holds the repo-wide owner/transaction.
+    #      Full multi-owner finalization remains deferred, but a silent
+    #      `exit 0` here made that limitation indistinguishable from
+    #      "nothing happened" -- that silent success was the defect. Detect
+    #      (b) from the per-edit provenance ledger (mycelium-foreign-activity.tmp,
+    #      appended by mycelium-activity-tracker.sh for every root session
+    #      regardless of ownership) and surface an explicit, non-blocking
+    #      diagnostic instead of empty stdout.
+    # Neither case consolidates lineage, finalizes/deletes the primary log,
+    # or touches any of the owner's shared enforcement state -- (b) only
+    # gets a message, never ownership of the transaction, and its ledger
+    # entries are left exactly as they are (nothing here deletes or rewrites
+    # them), so its evidence is preserved for a later, independent finalize.
+    _FOREIGN_LEDGER_SELF="$STATE_DIR/mycelium-foreign-activity.tmp"
+    _SELF_PATHS=""
+    if [[ -f "$_FOREIGN_LEDGER_SELF" && ! -L "$_FOREIGN_LEDGER_SELF" \
+      && "$HOST_SESSION_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      _SELF_PATHS=$(awk -v sid="$HOST_SESSION_ID" '
+        { owner = $1; line = $0; sub(/^[^ ]+ /, "", line); if (owner == sid) print line }
+      ' "$_FOREIGN_LEDGER_SELF" | sort -u)
+    fi
+    # additionalContext continues the conversation under the SAME
+    # stop_hook_active/continuation-cap machinery as decision:block (see the
+    # docs note above) -- emitting it unconditionally here would make this
+    # diagnostic re-fire on every subsequent continuation Stop for the same
+    # unresolved-ownership condition, which is not a one-shot notice, it is
+    # a repeating continuation. Scope the one-shot guard to THIS nonowner
+    # branch only: emit on the first Stop (stop_hook_active is false/absent)
+    # and go silent on any continuation Stop (stop_hook_active is true).
+    # This does not touch the owner-path decision:block above/below, which
+    # must keep re-firing every Stop until the real owner reflects.
+    if [[ -n "$_SELF_PATHS" && "$HOST_STOP_HOOK_ACTIVE" != "true" ]]; then
+      _SELF_COUNT=$(printf '%s\n' "$_SELF_PATHS" | grep -c . || true)
+      _SELF_COUNT=${_SELF_COUNT:-0}
+      _SELF_NAMES=$(printf '%s\n' "$_SELF_PATHS" | head -15 \
+        | while IFS= read -r _sp; do basename "$_sp"; done \
+        | tr '\n' ',' | sed 's/,$//; s/,/, /g')
+      mycelium_emit_context "Stop" \
+        "MYCELIUM NOTICE — this session (${HOST_SESSION_ID}) has ${_SELF_COUNT} tracked edit(s) (${_SELF_NAMES}) but is not the current repository-wide lifecycle owner (${OWNER_SESSION_ID:-unknown attribution}). Multi-owner finalization is deferred: this session's evidence remains in the provenance ledger, untouched and unattributed to the owner. Re-run the mycelium session-end protocol from this session once it can become the active owner, or coordinate manually with the current owner." \
+        "Mycelium: a second concurrent root writer session's Stop is not yet independently finalizable (multi-owner finalization deferred); this session's tracked edits are preserved."
+    fi
+    exit 0
+  else
+    SESSION_OWNERSHIP="host-id"
+  fi
+fi
+
+# Consolidate lineage in-process before lifecycle enforcement. Hook runtimes
+# launch sibling command hooks concurrently, so registering consolidation as a
+# separate Stop handler would race the accepted-Stop cleanup below.
+LINEAGE_HOOK="$HERE/mycelium-data-lineage-stop.sh"
+if [[ -s "$STATE_DIR/mycelium-data-events.tmp" ]]; then
+  if [[ ! -x "$LINEAGE_HOOK" ]] \
+    || ! printf '%s' "$INPUT" | "$LINEAGE_HOOK"; then
+    mycelium_emit_stop_block \
+      "STOP BLOCKED — data-lineage consolidation failed. Raw events and active session state were preserved; inspect the lineage status sentinel or hook installation, then retry Stop."
+    exit 0
+  fi
+fi
+LINEAGE_EVENT_COUNT=0
+if [[ -s "$STATE_DIR/mycelium-data-events.tmp" ]]; then
+  LINEAGE_EVENT_COUNT=1
+fi
+
+# Accepting Stop owns final cleanup of data-lineage state. Retaining both files
+# across a blocked Stop lets later analysis append to the same manifest.
+mycelium_accept_lineage_session() {
+  local session_marker="$STATE_DIR/data-lineage-session-id.tmp"
+  local events_file="$STATE_DIR/mycelium-data-events.tmp"
+  local session_id
+  session_id=$(head -1 "$session_marker" 2>/dev/null || echo "")
+  if [[ -z "$session_id" ]]; then
+    session_id="$HOST_SESSION_ID"
+  fi
+  if [[ ! "$session_id" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    session_id="unattributed-$(date +%s)"
+  fi
+
+  if [[ -f "$events_file" ]]; then
+    local prev_dir="$STATE_DIR/mycelium-data-events-prev"
+    mkdir -p "$prev_dir"
+    mv "$events_file" "$prev_dir/${session_id}.tmp"
+    # Keep only the 20 most recent raw-event archives.
+    ls -t "$prev_dir"/*.tmp 2>/dev/null | tail -n +21 | xargs rm -f 2>/dev/null || true
+  fi
+  rm -f "$session_marker"
+}
+
+# Resolve this hook's mycelium-core dir once, in absolute form. Used to locate
+# the upsert script and the log-scribe template. BASH_SOURCE may be unset in
+# weird invocations (e.g. `sh -c "$(...)"`), so fall back to $0; if even that
+# fails, leave SCRIPT_DIR empty and downstream existence checks will skip.
+HOOK_SOURCE="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR=$(cd "$(dirname "$(dirname "$HOOK_SOURCE")")" 2>/dev/null && pwd || echo "")
+UPSERT_SCRIPT="${MYCELIUM_REGISTRY_UPSERT_HELPER:-$SCRIPT_DIR/scripts/upsert_registry_row.py}"
+FINALIZE_LOG_SCRIPT="${MYCELIUM_LOG_FINALIZER_HELPER:-$SCRIPT_DIR/scripts/finalize_session_log.py}"
+FINALIZE_HANDOFF_SCRIPT="${MYCELIUM_HANDOFF_FINALIZER_HELPER:-$SCRIPT_DIR/scripts/finalize_handoff.py}"
+
+# --- Session log finalization ---
+if [[ "$ACTIVE_MARKER_VALID" == true ]]; then
+  OUR_TS=$(cat "$STATE_DIR/session-start-ts.tmp" 2>/dev/null || echo "")
+
+  # Backward compatibility for an active session created before owner IDs were
+  # introduced. New sessions use the per-host identity gate above.
+  if [[ "$SESSION_OWNERSHIP" == "legacy" \
+    && "$OWNER_TS" =~ ^[0-9]{1,18}$ \
+    && "$OUR_TS" =~ ^[0-9]{1,18}$ \
+    && "$OWNER_TS" != "$OUR_TS" ]]; then
+      # Subagent: skip all finalization and .living/ checks
+      # File activity is tracked in the shared activity file for the primary session
+      exit 0
+  fi
+
+  if [[ "$ACTIVE_MARKER_VALID" == true && -f "$LOG_PATH" ]]; then
+    # Compute session duration. Prefer the frontmatter `started:` field
+    # (set when the SessionStart hook created this log) over
+    # session-start-ts.tmp, which can be stale across crashed sessions and
+    # produce nonsense durations like 14794 minutes for a 55-second session.
+    LOG_REPO="$REPO_ROOT"
+    START_FILE="$STATE_DIR/session-start-ts.tmp"
+    NOW_TS=$(date +%s)
+    DURATION_MIN=0
+    START_TS=""
+
+    FM_STARTED=$({ grep -m1 '^started:' "$LOG_PATH" 2>/dev/null || true; } | sed 's/^started:[[:space:]]*//; s/[[:space:]]*$//')
+    if [ -n "$FM_STARTED" ]; then
+      # Try BSD date (macOS) first, then GNU date (Linux). Frontmatter format
+      # is e.g. 2026-04-26T06:43:53-0400.
+      START_TS=$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "$FM_STARTED" +%s 2>/dev/null \
+                 || date -d "$FM_STARTED" +%s 2>/dev/null \
+                 || echo "")
+    fi
+    if [ -z "$START_TS" ] && [ -f "$START_FILE" ]; then
+      START_TS=$(cat "$START_FILE" 2>/dev/null || echo "")
+    fi
+    if [ -n "$START_TS" ] && [ "$START_TS" -gt 0 ] 2>/dev/null; then
+      DURATION_MIN=$(( (NOW_TS - START_TS) / 60 ))
+      [ "$DURATION_MIN" -lt 0 ] && DURATION_MIN=0
+    fi
+
+    # Build one unique, session-local file set. SessionStart snapshots the
+    # pre-existing dirty state, so an uncommitted repository does not make
+    # every old path look like work from this session.
+    ACTIVITY_FILE_CHECK="$STATE_DIR/mycelium-session-activity.tmp"
+    SESSION_BASELINE_FILE="$STATE_DIR/session-file-baseline.json"
+    SESSION_CHANGES_SCRIPT="${MYCELIUM_SESSION_CHANGES_HELPER:-$SCRIPT_DIR/scripts/session_file_changes.py}"
+    ACTIVE_LOG_REL=""
+    case "$LOG_PATH" in
+      "$LOG_REPO"/*) ACTIVE_LOG_REL="${LOG_PATH#"$LOG_REPO"/}" ;;
+    esac
+    if [ -f "$SESSION_CHANGES_SCRIPT" ]; then
+      _CHANGE_ARGS=(collect --repo-root "$LOG_REPO" --baseline "$SESSION_BASELINE_FILE" --cache "$STATE_DIR/mycelium-fingerprint-cache.json" --activity-file "$ACTIVITY_FILE_CHECK")
+      if [ -n "$START_TS" ] && [ "$START_TS" -gt 0 ] 2>/dev/null; then
+        _CHANGE_ARGS+=(--start-ts "$START_TS")
+      fi
+      if [ -n "$ACTIVE_LOG_REL" ]; then
+        _CHANGE_ARGS+=(--exclude "$ACTIVE_LOG_REL")
+      fi
+      _CHANGE_ARGS+=(--exclude ".living/log/LOG_REGISTRY.md")
+      _CHANGE_ARGS+=(--exclude-prefix ".living/log/")
+      SESSION_CHANGED_FILES=$(python3 "$SESSION_CHANGES_SCRIPT" "${_CHANGE_ARGS[@]}" 2>/dev/null || true)
+    else
+      # Compatibility fallback for an incomplete/older installation.
+      SESSION_CHANGED_FILES=$(
+        {
+          if [ -n "$START_TS" ] && [ "$START_TS" -gt 0 ] 2>/dev/null; then
+            git -C "$LOG_REPO" log --since="@${START_TS}" --name-only --pretty=format: 2>/dev/null || true
+          fi
+          if [ -f "$ACTIVITY_FILE_CHECK" ]; then
+            while IFS= read -r activity_path; do
+              [ -z "$activity_path" ] && continue
+              # NOTE: a `case` whose pattern contains `)` inside a $(...) command
+              # substitution fails to parse under bash 3.2 (macOS system bash) —
+              # "syntax error near unexpected token ';;'". Use if + ${x#prefix}
+              # instead; behavior is identical (strip repo-root prefix if present).
+              if [ "${activity_path#"$LOG_REPO"/}" != "$activity_path" ]; then
+                printf '%s\n' "${activity_path#"$LOG_REPO"/}"
+              else
+                printf '%s\n' "$activity_path"
+              fi
+            done < "$ACTIVITY_FILE_CHECK"
+          fi
+        } | sed '/^[[:space:]]*$/d' | sort -u
+      )
+    fi
+    # Exclude a changed path only when the provenance ledger's most recently
+    # recorded writer for THAT path is a different, identified session than
+    # the one stopping now (genuine per-edit provenance -- last write wins).
+    # A path with no provenance entry at all is never excluded: absence of
+    # evidence keeps the existing default attribution to the stopping owner
+    # (the git-diff fallback for Bash writes with no tracker at all still
+    # works, see T3). A path this session itself wrote LAST -- even after an
+    # earlier foreign write to the same path -- is never excluded either, so
+    # a genuine later self-edit reclaims it instead of being suppressed by a
+    # stale foreign touch.
+    FOREIGN_LEDGER="$STATE_DIR/mycelium-foreign-activity.tmp"
+    FOREIGN_EXCLUDED_COUNT=0
+    FOREIGN_SESSION_IDS=""
+    if [ -f "$FOREIGN_LEDGER" ] && [ ! -L "$FOREIGN_LEDGER" ] && [ -n "$SESSION_CHANGED_FILES" ]; then
+      _LAST_OWNERS=$(awk '
+        { owner=$1; line=$0; sub(/^[^ ]+ /, "", line); last[line]=owner }
+        END { for (p in last) print last[p], p }
+      ' "$FOREIGN_LEDGER")
+      _FOREIGN_ATTRIBUTABLE=""
+      while IFS= read -r _changed_path; do
+        [ -z "$_changed_path" ] && continue
+        _owner=$(printf '%s\n' "$_LAST_OWNERS" | awk -v p="$_changed_path" '{ line=$0; sub(/^[^ ]+ /, "", line); if (line == p) print $1 }')
+        if [ -n "$_owner" ] && [ "$_owner" != "$HOST_SESSION_ID" ]; then
+          _FOREIGN_ATTRIBUTABLE="${_FOREIGN_ATTRIBUTABLE}${_changed_path}
+"
+        fi
+      done <<< "$SESSION_CHANGED_FILES"
+      if [ -n "$_FOREIGN_ATTRIBUTABLE" ]; then
+        SESSION_CHANGED_FILES=$(comm -23 <(printf '%s\n' "$SESSION_CHANGED_FILES" | sort -u) <(printf '%s\n' "$_FOREIGN_ATTRIBUTABLE" | sort -u))
+        FOREIGN_EXCLUDED_COUNT=$(printf '%s\n' "$_FOREIGN_ATTRIBUTABLE" | grep -c . || true)
+        FOREIGN_EXCLUDED_COUNT=${FOREIGN_EXCLUDED_COUNT:-0}
+        FOREIGN_SESSION_IDS=$(awk '{print $1}' "$FOREIGN_LEDGER" | sort -u | tr '\n' ',' | sed 's/,$//; s/,/, /g')
+      fi
+    fi
+
+    FILES_CHANGED=0
+    if [ -n "$SESSION_CHANGED_FILES" ]; then
+      FILES_CHANGED=$(printf '%s\n' "$SESSION_CHANGED_FILES" | grep -c . || true)
+      FILES_CHANGED=${FILES_CHANGED:-0}
+    fi
+
+    # Explicit Edit/Write activity is an independent work signal. The helper's
+    # file set already includes committed and Bash-mutated paths.
+    ACTIVITY_COUNT=0
+    if [ -f "$ACTIVITY_FILE_CHECK" ]; then
+      ACTIVITY_COUNT=$(sort -u "$ACTIVITY_FILE_CHECK" | grep -c . 2>/dev/null || true)
+      ACTIVITY_COUNT=${ACTIVITY_COUNT:-0}
+    fi
+    REMINDER_COUNT=0
+    if [ -f "$STATE_DIR/mycelium-reminded.tmp" ]; then
+      REMINDER_COUNT=1
+    fi
+
+    # Decide whether Stop is accepted before mutating any final state. File
+    # changes discovered from Git are an enforcement signal even when a Bash
+    # command bypassed the editor/activity hook. Lineage-only inline work keeps
+    # its log and session ID but does not require a scientific reflection.
+    ENFORCEMENT_REQUIRED=0
+    if [ "$ACTIVITY_COUNT" -gt 0 ] \
+      || [ "$REMINDER_COUNT" -gt 0 ] \
+      || [ "$FILES_CHANGED" -gt 0 ]; then
+      ENFORCEMENT_REQUIRED=1
+    fi
+    if [ "$ENFORCEMENT_REQUIRED" -eq 1 ]; then
+      WORK_TS=$(head -1 "$STATE_DIR/mycelium-reminded.tmp" 2>/dev/null || echo "$START_TS")
+      [[ "$WORK_TS" =~ ^[0-9]+$ ]] || WORK_TS=0
+      LIVING_BASELINE_FILE="$STATE_DIR/living-reminder-baseline.json"
+      if [[ ! -f "$LIVING_BASELINE_FILE" ]]; then
+        LIVING_BASELINE_FILE="$SESSION_BASELINE_FILE"
+      fi
+      if ! mycelium_living_changed \
+        "$REPO_ROOT" "$LIVING_BASELINE_FILE" "$SESSION_CHANGES_SCRIPT" "$WORK_TS"; then
+        FILE_NAMES=$(printf '%s\n' "$SESSION_CHANGED_FILES" | head -15 \
+          | while IFS= read -r changed_path; do basename "$changed_path"; done \
+          | tr '\n' ',' | sed 's/,$//; s/,/, /g')
+        REASON="STOP BLOCKED — ${FILES_CHANGED} files changed (${FILE_NAMES}) but .living/ not updated. Run mycelium session-end protocol: triage to learnings/decisions/conventions/findings, then update last-session.md."
+        if [ "$FOREIGN_EXCLUDED_COUNT" -gt 0 ]; then
+          REASON="${REASON} (${FOREIGN_EXCLUDED_COUNT} additional file(s) attributed to other session(s) [${FOREIGN_SESSION_IDS}] — excluded, not this session's responsibility.)"
+        fi
+        ESCAPED_REASON=$(printf '%s' "$REASON" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" 2>/dev/null)
+        printf '{"decision": "block", "reason": %s}\n' "$ESCAPED_REASON"
+        exit 0
+      fi
+    fi
+
+    # Skip finalization only if NO evidence of work exists in any signal.
+    # Lineage-only inline analyses still reserve their session ID and manifest.
+    if [ "$ACTIVITY_COUNT" -eq 0 ] \
+      && [ "$REMINDER_COUNT" -eq 0 ] \
+      && [ "$FILES_CHANGED" -eq 0 ] \
+      && [ "$LINEAGE_EVENT_COUNT" -eq 0 ]; then
+      rm -f "$LOG_PATH"
+      rm -f "$ACTIVE_LOG_FILE"
+      rm -f "$ACTIVE_OWNER_FILE"
+      rm -f "$STATE_DIR/session-start-ts.tmp"
+      rm -f "$SESSION_BASELINE_FILE"
+      rm -f "$STATE_DIR/living-reminder-baseline.json"
+      # No registry row, no finalization — clean exit (noise session)
+    else
+      # Prepare the finalization transaction, but do not stamp the log as
+      # accepted until every required registry/context write has succeeded.
+      # SessionStart treats a nonempty `ended:` field as definitive cleanup
+      # evidence, so writing it before a failed registry upsert loses retry
+      # ownership on resume/compact.
+      LOG_DIR=$(dirname "$LOG_PATH")
+
+      # Append to LOG_REGISTRY.md
+      PROJECT_SLUG=$({ grep '^project:' "$LOG_PATH" || echo "project: unknown"; } | sed 's/^project: *//')
+      SESSION_ID=$({ grep '^session_id:' "$LOG_PATH" || echo "session_id: unknown"; } | sed 's/^session_id: *//')
+      BRANCH=$({ grep '^branch:' "$LOG_PATH" || echo "branch: unknown"; } \
+        | sed 's/^branch: *//' \
+        | python3 -c '
+import json
+import sys
+
+raw = sys.stdin.read().strip()
+try:
+    value = json.loads(raw)
+except (TypeError, ValueError):
+    value = raw
+print(value if isinstance(value, str) and "\n" not in value else "unknown")
+')
+      if [[ ! "$SESSION_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        mycelium_emit_stop_block \
+          "STOP BLOCKED — session registry finalization failed because the session ID is invalid. Active state was preserved for repair and retry."
+        exit 0
+      fi
+      # Summary from the first 3 paths in the same unique session file set.
+      SUMMARY=""
+      if [ -n "$SESSION_CHANGED_FILES" ]; then
+        SUMMARY=$(printf '%s\n' "$SESSION_CHANGED_FILES" | head -3 \
+          | while IFS= read -r changed_path; do basename "$changed_path"; done \
+          | tr '\n' ',' | sed 's/,$//; s/,/, /g')
+        if [ "$FILES_CHANGED" -gt 3 ]; then
+          SUMMARY="${SUMMARY} (+$((FILES_CHANGED - 3)) more)"
+        fi
+      fi
+      # Prefer commit subjects when the agent has not already authored a row.
+      # Compute the best machine fallback before the single preserving upsert;
+      # otherwise a preliminary filename row looks "authored" to a second
+      # upsert and accidentally defeats this deterministic summary.
+      if [ -n "$START_TS" ] && [ "$START_TS" -gt 0 ] 2>/dev/null; then
+        DETERMINISTIC_SUMMARY=$(
+          { git -C "$LOG_REPO" log --since="@${START_TS}" --pretty=format:'%s' 2>/dev/null || true; } \
+            | head -3 | tr '\n' ';' | sed 's/;$//; s/;/; /g'
+        )
+        if [ ${#DETERMINISTIC_SUMMARY} -gt 200 ]; then
+          DETERMINISTIC_SUMMARY="${DETERMINISTIC_SUMMARY:0:197}..."
+        fi
+        if [ -n "$DETERMINISTIC_SUMMARY" ]; then
+          SUMMARY="$DETERMINISTIC_SUMMARY"
+        fi
+      fi
+      PROJECT_SLUG=$(printf '%s' "$PROJECT_SLUG" | mycelium_registry_cell)
+      BRANCH=$(printf '%s' "$BRANCH" | mycelium_registry_cell)
+      SUMMARY=$(printf '%s' "$SUMMARY" | mycelium_registry_cell)
+      LOG_BASENAME=$(basename "$LOG_PATH")
+      # Atomic upsert via the script resolved at the top of this hook ($UPSERT_SCRIPT).
+      NEW_ROW="| $(date +%Y-%m-%d) | ${SESSION_ID} | ${PROJECT_SLUG} | ${BRANCH} | ${DURATION_MIN}m | ${FILES_CHANGED} | ${SUMMARY} | | complete | | [log](${LOG_BASENAME}) |"
+      REGISTRY_OK=false
+      if [ -f "$LOG_DIR/LOG_REGISTRY.md" ]; then
+        if [ -f "$UPSERT_SCRIPT" ]; then
+          # If the script rejects (e.g. wrong pipe count), the error stays in
+          # .upsert_registry_row.err for operator debugging. Do NOT echo the
+          # row on rejection — that would defeat the validation the script
+          # exists to perform.
+          python3 "$UPSERT_SCRIPT" --preserve-authored "$LOG_DIR/LOG_REGISTRY.md" "$SESSION_ID" "$NEW_ROW" \
+            >/dev/null 2>"$LOG_DIR/.upsert_registry_row.err" \
+            && { rm -f "$LOG_DIR/.upsert_registry_row.err"; REGISTRY_OK=true; }
+        fi
+      fi
+      if [[ "$REGISTRY_OK" != true ]]; then
+        mycelium_emit_stop_block \
+          "STOP BLOCKED — session registry finalization failed. The active log and session baselines were preserved; inspect .living/log/.upsert_registry_row.err or the helper installation, then retry Stop."
+        exit 0
+      fi
+
+      # Auto-write last-session.md for next session context
+      _SESSION_FILE="$STATE_DIR/last-session.md"
+      _SESSION_COMPLETE=true
+      _SESSION_FRESH=false
+      _SESSION_MTIME=0
+      if [ -f "$_SESSION_FILE" ] && [ ! -L "$_SESSION_FILE" ]; then
+        _SESSION_MTIME=$(mycelium_file_mtime "$_SESSION_FILE" 2>/dev/null || echo "0")
+        if mycelium_handoff_has_headings "$_SESSION_FILE" \
+          "## What was worked on" \
+          "## Key decisions made" \
+          "## Blockers & surprises" \
+          "## Current state" \
+          "## Next steps" \
+          || mycelium_handoff_has_headings "$_SESSION_FILE" \
+          "## Current State" \
+          "## What Was Done" \
+          "## Key Decisions" \
+          "## Next Steps" \
+          "## Relevant Files"; then
+          _SESSION_COMPLETE=true
+        else
+          _SESSION_COMPLETE=false
+        fi
+        if [[ "$START_TS" =~ ^[0-9]+$ \
+          && "$_SESSION_MTIME" =~ ^[0-9]+$ \
+          && "$_SESSION_MTIME" -ge "$START_TS" ]]; then
+          _SESSION_FRESH=true
+        fi
+      else
+        _SESSION_COMPLETE=false
+      fi
+
+      # Preserve a complete handoff authored during this session. If it is
+      # absent, stale, or partial, publish a complete deterministic fallback
+      # atomically instead of replacing a rich handoff with two headings.
+      if [[ "$_SESSION_COMPLETE" != true || "$_SESSION_FRESH" != true ]]; then
+        _WORK_LINES=""
+        # Try recent commit messages first
+        if [ -n "${START_TS:-}" ]; then
+          _WORK_LINES=$(
+            { git -C "$REPO_ROOT" log --since="@${START_TS}" --pretty=format:"- %s" 2>/dev/null || true; } \
+              | head -10
+          )
+        fi
+        # Fall back to the de-duplicated modified file list.
+        if [ -z "$_WORK_LINES" ] && [ -n "$SESSION_CHANGED_FILES" ]; then
+          _WORK_LINES=$(printf '%s\n' "$SESSION_CHANGED_FILES" | head -10 | while IFS= read -r _f; do echo "- Modified \`$(basename "$_f")\`"; done)
+        fi
+        if [ -z "$_WORK_LINES" ] && [ "$LINEAGE_EVENT_COUNT" -gt 0 ]; then
+          _WORK_LINES="- Captured data-lineage provenance"
+        fi
+        # Last resort: generic summary
+        if [ -z "$_WORK_LINES" ]; then
+          _WORK_LINES="- Session: ${FILES_CHANGED} files changed over ${DURATION_MIN}m"
+        fi
+        _UNCOMMITTED_COUNT=$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+        _BRANCH_NOTE="Branch: \`${BRANCH}\`"
+        [ "$_UNCOMMITTED_COUNT" -gt 0 ] && _BRANCH_NOTE="${_BRANCH_NOTE}, ${_UNCOMMITTED_COUNT} uncommitted changes"
+        _SESSION_TMP=$(mktemp "$STATE_DIR/.last-session.tmp.XXXXXX") || {
+          mycelium_emit_stop_block \
+            "STOP BLOCKED — session handoff finalization failed. Active state was preserved for retry."
+          exit 0
+        }
+        if ! cat > "$_SESSION_TMP" << LAST_SESSION_EOF
+SESSION RESUME — Last session ($(date '+%Y-%m-%d %H:%M')):
+
+## What was worked on
+${_WORK_LINES}
+
+## Key decisions made
+- See \`.living/decisions.md\` for decisions recorded during this session.
+
+## Blockers & surprises
+- See the finalized session log and \`.living/learnings.md\` for recorded issues.
+
+## Current state
+- ${_BRANCH_NOTE}
+
+## Next steps
+- Review the finalized session log and continue from the current branch state.
+LAST_SESSION_EOF
+        then
+          rm -f "$_SESSION_TMP"
+          mycelium_emit_stop_block \
+            "STOP BLOCKED — session handoff finalization failed. Active state was preserved for retry."
+          exit 0
+        fi
+        if ! mv -f "$_SESSION_TMP" "$_SESSION_FILE"; then
+          rm -f "$_SESSION_TMP"
+          mycelium_emit_stop_block \
+            "STOP BLOCKED — session handoff finalization failed. Active state was preserved for retry."
+          exit 0
+        fi
+      fi
+
+      if [ ! -f "$FINALIZE_HANDOFF_SCRIPT" ]; then
+        mycelium_emit_stop_block \
+          "STOP BLOCKED — session handoff finalization failed. Active state was preserved for retry."
+        exit 0
+      fi
+
+      # All other transaction participants have accepted the session. Publish
+      # the completed frontmatter and matching footer with one atomic replace,
+      # so SessionStart can never observe an ended log without its footer.
+      # A retry sentinel distinguishes a fully accepted ended log from the
+      # narrow state where the log committed but handoff publication did not.
+      # It also pins the timestamp so a retry cannot make frontmatter/footer
+      # disagree about when Stop was accepted.
+      HANDOFF_PENDING_FILE="$STATE_DIR/handoff-finalization-pending.tmp"
+      ENDED=""
+      END_TIME_SHORT=""
+      if [[ ( -e "$HANDOFF_PENDING_FILE" || -L "$HANDOFF_PENDING_FILE" ) \
+        && ( ! -f "$HANDOFF_PENDING_FILE" || -L "$HANDOFF_PENDING_FILE" ) ]]; then
+        mycelium_emit_stop_block \
+          "STOP BLOCKED — handoff retry state is unsafe. Active state was preserved for repair."
+        exit 0
+      fi
+      if [ -f "$HANDOFF_PENDING_FILE" ] && [ ! -L "$HANDOFF_PENDING_FILE" ]; then
+        _HANDOFF_PENDING_LINES=$(awk 'END { print NR }' "$HANDOFF_PENDING_FILE" 2>/dev/null || true)
+        if [ "$_HANDOFF_PENDING_LINES" = 2 ]; then
+          ENDED=$(sed -n '1p' "$HANDOFF_PENDING_FILE" 2>/dev/null || true)
+          END_TIME_SHORT=$(sed -n '2p' "$HANDOFF_PENDING_FILE" 2>/dev/null || true)
+        fi
+      fi
+      if [[ ! "$ENDED" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{4}$ \
+        || ! "$END_TIME_SHORT" =~ ^[0-9]{2}:[0-9]{2}$ ]]; then
+        ENDED=$(date +%Y-%m-%dT%H:%M:%S%z)
+        END_TIME_SHORT=$(date +%H:%M)
+        _HANDOFF_PENDING_TMP=$(mktemp "$STATE_DIR/.handoff-finalization-pending.tmp.XXXXXX") || {
+          mycelium_emit_stop_block \
+            "STOP BLOCKED — session handoff finalization could not reserve retry state. Active state was preserved."
+          exit 0
+        }
+        if ! printf '%s\n%s\n' "$ENDED" "$END_TIME_SHORT" > "$_HANDOFF_PENDING_TMP" \
+          || ! mv -f "$_HANDOFF_PENDING_TMP" "$HANDOFF_PENDING_FILE"; then
+          rm -f "$_HANDOFF_PENDING_TMP"
+          mycelium_emit_stop_block \
+            "STOP BLOCKED — session handoff finalization could not reserve retry state. Active state was preserved."
+          exit 0
+        fi
+      fi
+      if [ ! -f "$FINALIZE_LOG_SCRIPT" ] \
+        || ! printf '%s' "$SESSION_CHANGED_FILES" \
+          | python3 "$FINALIZE_LOG_SCRIPT" \
+            --log-path "$LOG_PATH" \
+            --ended "$ENDED" \
+            --duration-minutes "$DURATION_MIN" \
+            --files-changed "$FILES_CHANGED" \
+            --end-time "$END_TIME_SHORT" \
+            >/dev/null 2>"$LOG_DIR/.finalize_session_log.err"; then
+        mycelium_emit_stop_block \
+          "STOP BLOCKED — session log finalization failed. The active log and session baselines were preserved; inspect the helper installation, then retry Stop."
+        exit 0
+      fi
+      rm -f "$LOG_DIR/.finalize_session_log.err"
+
+      # Only now is it truthful to publish an authoritative accepted state in
+      # the rich handoff. If this atomic write fails, the pending sentinel keeps
+      # SessionStart and Stop on the same retryable transaction.
+      if ! python3 "$FINALIZE_HANDOFF_SCRIPT" \
+        --handoff "$_SESSION_FILE" \
+        --accepted-at "$ENDED" \
+        >/dev/null 2>"$LOG_DIR/.finalize_handoff.err"; then
+        mycelium_emit_stop_block \
+          "STOP BLOCKED — session handoff finalization failed. Active state was preserved for retry."
+        exit 0
+      fi
+      rm -f "$LOG_DIR/.finalize_handoff.err"
+      # Keep the active marker and retry sentinel until the shared enforcement
+      # and lineage phase below accepts and archives the whole transaction.
+    fi
+  else
+    # Log file doesn't exist (was deleted?) — clean up sentinels
+    rm -f "$ACTIVE_LOG_FILE"
+    rm -f "$ACTIVE_OWNER_FILE"
+    if [[ "${ACTIVE_MARKER_VALID:-false}" == true ]]; then
+      rm -f "$STATE_DIR/session-file-baseline.json"
+    fi
+  fi
+fi
+
+# Not in a git repo — nothing further to check
+if [ -z "$REPO_ROOT" ]; then
+  exit 0
+fi
+
+# If no .living/ directory, skip (SessionStart hook handles scaffolding)
+LIVING_DIR="$REPO_ROOT/.living"
+if [ ! -d "$LIVING_DIR" ]; then
+  rm -f "$ACTIVE_LOG_FILE"
+  rm -f "$ACTIVE_OWNER_FILE"
+  rm -f "$STATE_DIR/handoff-finalization-pending.tmp"
+  rm -f "$STATE_DIR/session-file-baseline.json"
+  rm -f "$STATE_DIR/living-reminder-baseline.json"
+  # Dispose of the transient foreign-provenance ledger via the archive helper,
+  # which atomically claims it and preserves any second-root-writer evidence
+  # first (failure-safe). The helper OWNS deletion -- do not rm the ledger here,
+  # or a racing lock-free append that recreated it after the claim would be lost.
+  mycelium_archive_foreign_provenance "$STATE_DIR" "$HOST_SESSION_ID" || true
+  rm -f "$STATE_DIR/mycelium-provenance-baseline.json"
+  mycelium_accept_lineage_session
+  exit 0
+fi
+
+# Check if any work was done this session.
+# Work detected by: mycelium-reminded.tmp (analysis or Edit/Write) or mycelium-session-activity.tmp
+REMINDER_FILE="$STATE_DIR/mycelium-reminded.tmp"
+ACTIVITY_FILE="$STATE_DIR/mycelium-session-activity.tmp"
+if [ ! -f "$REMINDER_FILE" ] && [ ! -f "$ACTIVITY_FILE" ]; then
+  rm -f "$ACTIVE_LOG_FILE"
+  rm -f "$ACTIVE_OWNER_FILE"
+  rm -f "$STATE_DIR/handoff-finalization-pending.tmp"
+  rm -f "$STATE_DIR/session-start-ts.tmp"
+  rm -f "$STATE_DIR/session-file-baseline.json"
+  rm -f "$STATE_DIR/living-reminder-baseline.json"
+  # Dispose of the transient foreign-provenance ledger via the archive helper,
+  # which atomically claims it and preserves any second-root-writer evidence
+  # first (failure-safe). The helper OWNS deletion -- do not rm the ledger here,
+  # or a racing lock-free append that recreated it after the claim would be lost.
+  mycelium_archive_foreign_provenance "$STATE_DIR" "$HOST_SESSION_ID" || true
+  rm -f "$STATE_DIR/mycelium-provenance-baseline.json"
+  mycelium_accept_lineage_session
+  exit 0
+fi
+
+# Use reminder timestamp if available, otherwise session start timestamp
+if [ -f "$REMINDER_FILE" ]; then
+  WORK_TS=$(cat "$REMINDER_FILE")
+elif [ -f "$STATE_DIR/session-start-ts.tmp" ]; then
+  WORK_TS=$(cat "$STATE_DIR/session-start-ts.tmp")
+else
+  WORK_TS=0
+fi
+
+# Post-action hook fired. Check if .living/ was updated AFTER the reminder.
+REMINDER_TS="$WORK_TS"
+
+LIVING_UPDATED=false
+LIVING_BASELINE_FILE="$STATE_DIR/living-reminder-baseline.json"
+if [[ ! -f "$LIVING_BASELINE_FILE" ]]; then
+  LIVING_BASELINE_FILE="$STATE_DIR/session-file-baseline.json"
+fi
+SESSION_CHANGES_SCRIPT="${MYCELIUM_SESSION_CHANGES_HELPER:-$SCRIPT_DIR/scripts/session_file_changes.py}"
+if mycelium_living_changed \
+  "$REPO_ROOT" "$LIVING_BASELINE_FILE" "$SESSION_CHANGES_SCRIPT" "$REMINDER_TS"; then
+  LIVING_UPDATED=true
+fi
+
+# Build file context for triage instructions
+FILE_COUNT=0
+FILE_NAMES=""
+if [ -f "$ACTIVITY_FILE" ]; then
+  FILE_COUNT=$(sort -u "$ACTIVITY_FILE" | grep -c . || true)
+  FILE_COUNT=${FILE_COUNT:-0}
+  FILE_NAMES=$(sort -u "$ACTIVITY_FILE" | head -15 | xargs -I {} basename {} 2>/dev/null | tr '\n' ', ' | sed 's/,$//')
+fi
+
+# --- Session-end triage (short signals — full protocol is in the mycelium skill) ---
+
+# If any was updated after the post-action hook fired, protocol was followed
+if [ "$LIVING_UPDATED" = true ]; then
+  # Clean up reminder file — cycle complete
+  rm -f "$REMINDER_FILE"
+  rm -f "$ACTIVITY_FILE"
+  rm -f "$ACTIVE_LOG_FILE"
+  rm -f "$ACTIVE_OWNER_FILE"
+  rm -f "$STATE_DIR/handoff-finalization-pending.tmp"
+  rm -f "$STATE_DIR/session-start-ts.tmp"
+  rm -f "$STATE_DIR/session-file-baseline.json"
+  rm -f "$STATE_DIR/living-reminder-baseline.json"
+  # Dispose of the transient foreign-provenance ledger via the archive helper,
+  # which atomically claims it and preserves any second-root-writer evidence
+  # first (failure-safe). The helper OWNS deletion -- do not rm the ledger here,
+  # or a racing lock-free append that recreated it after the claim would be lost.
+  mycelium_archive_foreign_provenance "$STATE_DIR" "$HOST_SESSION_ID" || true
+  rm -f "$STATE_DIR/mycelium-provenance-baseline.json"
+
+  ENHANCE_MSG=".living/ updated. Enhance .mycelium/last-session.md with work, decisions, blockers, current state, and next steps. The deterministic LOG_REGISTRY summary is already in place."
+  mycelium_emit_context "Stop" "$ENHANCE_MSG"
+  mycelium_accept_lineage_session
+  exit 0
+fi
+
+# Block: work happened but .living/ was never updated
+REASON="STOP BLOCKED — ${FILE_COUNT} files changed (${FILE_NAMES}) but .living/ not updated. Run mycelium session-end protocol: triage to learnings/decisions/conventions/findings, then update last-session.md."
+
+ESCAPED_REASON=$(printf '%s' "$REASON" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" 2>/dev/null)
+printf '{"decision": "block", "reason": %s}\n' "$ESCAPED_REASON"

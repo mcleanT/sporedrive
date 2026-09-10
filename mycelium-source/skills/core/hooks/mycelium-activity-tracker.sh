@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# mycelium-activity-tracker.sh — Claude/Codex PostToolUse edit hook
+# Tracks file modifications so the stop hook enforces .living/ updates for ALL
+# sessions with meaningful work, not just analysis execution.
+#
+# The existing mycelium-post-action.sh only fires on Bash commands matching
+# Python/R/Jupyter patterns. This hook closes the gap for Edit/Write operations.
+#
+# Install: Add to .claude/settings.local.json under "PostToolUse" hooks
+#   with matcher "Edit|Write"
+# Input: Claude provides tool_input.file_path. Codex apply_patch provides
+# tool_input.command with one or more "*** <Action> File:" headers.
+# Output: Silent (no additionalContext) — enforcement happens at Stop hook
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$HERE/mycelium-hook-lib.sh"
+
+INPUT=$(cat)
+
+# PostToolUse payloads describe attempted edits as well as successful ones.
+# Ignore an explicitly failed result; an absent status remains compatible with
+# Claude's Edit/Write payloads and older Codex versions.
+TOOL_SUCCEEDED=$(printf '%s' "$INPUT" | python3 -c '
+import json, re, sys
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    print("unknown")
+    raise SystemExit
+response = payload.get("tool_response")
+
+def structured_exit_code(value):
+    if isinstance(value, dict):
+        if value.get("isError") is True or value.get("success") is False:
+            return 1
+        for key in ("exit_code", "exitCode", "return_code", "returncode"):
+            candidate = value.get(key)
+            if isinstance(candidate, int) and not isinstance(candidate, bool):
+                return candidate
+        for candidate in value.values():
+            found = structured_exit_code(candidate)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for candidate in value:
+            found = structured_exit_code(candidate)
+            if found is not None:
+                return found
+    elif isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except Exception:
+            decoded = None
+        if decoded is not None and decoded != value:
+            found = structured_exit_code(decoded)
+            if found is not None:
+                return found
+    return None
+
+def textual_exit_code(value):
+    if isinstance(value, dict):
+        for candidate in value.values():
+            found = textual_exit_code(candidate)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for candidate in value:
+            found = textual_exit_code(candidate)
+            if found is not None:
+                return found
+    elif isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except Exception:
+            decoded = None
+        if decoded is not None and decoded != value:
+            found = textual_exit_code(decoded)
+            if found is not None:
+                return found
+        if re.match(
+            r"^\s*(?:error|failed|patch failed|invalid (?:context|patch))\b",
+            value,
+            re.IGNORECASE,
+        ):
+            return 1
+        match = re.search(
+            r"(?:exit(?:ed)?(?:[ _-]with)?(?:[ _-]code)?|return(?:[ _-]code)?)"
+            r"[\":= ]+(-?\d+)",
+            value,
+            re.IGNORECASE,
+        )
+        if match:
+            return int(match.group(1))
+    return None
+
+status = structured_exit_code(response)
+if status is None:
+    status = textual_exit_code(response)
+print("unknown" if status is None else ("true" if status == 0 else "false"))
+')
+if [[ "$TOOL_SUCCEEDED" == false ]]; then
+  exit 0
+fi
+
+# --- Repo and .living/ checks ---
+
+SESSION_CWD=$(printf '%s' "$INPUT" | mycelium_json_get 'cwd')
+if [[ -z "$SESSION_CWD" ]]; then
+  SESSION_CWD=$(pwd)
+fi
+REPO_ROOT=$(git -C "$SESSION_CWD" rev-parse --show-toplevel 2>/dev/null || echo "")
+if [[ -z "$REPO_ROOT" ]]; then
+  exit 0
+fi
+
+# Decode the edited/patched paths once. Used both for this invocation's own
+# activity ledger below and, when ownership turns out not to belong to this
+# invocation, for explicit foreign-session attribution — a write from a
+# session that is not the active owner must never be folded into the owner's
+# transaction, and must never be silently dropped either.
+CANDIDATE_PATHS=$(printf '%s' "$INPUT" | python3 -c '
+import json, os, re, sys
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(0)
+session_cwd = os.path.realpath(sys.argv[1])
+repo_root = os.path.realpath(sys.argv[2])
+
+def emit(raw_path):
+    if not isinstance(raw_path, str) or not raw_path:
+        return
+    path = os.path.expanduser(raw_path)
+    if not os.path.isabs(path):
+        path = os.path.join(session_cwd, path)
+    path = os.path.realpath(path)
+    relative = os.path.relpath(path, repo_root)
+    if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+        return
+    print(relative)
+
+tool_input = payload.get("tool_input") or {}
+path = tool_input.get("file_path")
+emit(path)
+command = tool_input.get("command")
+if isinstance(command, str):
+    for line in command.splitlines():
+        match = re.match(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$", line)
+        if match:
+            emit(match.group(1))
+' "$SESSION_CWD" "$REPO_ROOT")
+
+# Record genuine per-edit provenance for every candidate path this
+# invocation is known to have touched, while a transaction is live and
+# regardless of which session OWNS it. This is per-edit provenance (who
+# actually wrote this path, in
+# call order), not the prior "ever touched by a non-owner" path ledger: a
+# later genuine edit by the real owner must be able to reclaim a path an
+# earlier foreign session touched, and a non-owner's write must still be
+# attributed to that non-owner explicitly rather than silently dropped.
+HOST_SESSION_ID=$(printf '%s' "$INPUT" | mycelium_json_get 'session_id')
+if [[ -n "$HOST_SESSION_ID" && -n "$CANDIDATE_PATHS" ]] \
+  && [[ "$HOST_SESSION_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  _PROV_PATHS=()
+  while IFS= read -r _fp; do
+    [[ -z "$_fp" ]] && continue
+    _PROV_PATHS+=("$_fp")
+  done <<< "$CANDIDATE_PATHS"
+  if [[ ${#_PROV_PATHS[@]} -gt 0 ]]; then
+    mycelium_record_provenance "$REPO_ROOT" "$HOST_SESSION_ID" "${_PROV_PATHS[@]}"
+  fi
+fi
+
+mycelium_prepare_post_tool_state "$REPO_ROOT" "$INPUT" || exit 0
+
+# Only enforce in mycelium-enabled repos
+if [[ ! -d "$REPO_ROOT/.living" ]]; then
+  exit 0
+fi
+
+# --- Accumulate modified files for session summary ---
+
+mkdir -p "$STATE_DIR"
+ACTIVITY_FILE="$STATE_DIR/mycelium-session-activity.tmp"
+touched=false
+while IFS= read -r FILE_PATH; do
+  [[ -z "$FILE_PATH" ]] && continue
+
+  # Avoid circular enforcement and ignore local agent/runtime configuration.
+  if [[ "$FILE_PATH" == .living/* || "$FILE_PATH" == *"/.living/"* ||
+        "$FILE_PATH" == .mycelium/* || "$FILE_PATH" == *"/.mycelium/"* ||
+        "$FILE_PATH" == .claude/* || "$FILE_PATH" == *"/.claude/"* ||
+        "$FILE_PATH" == .codex/* || "$FILE_PATH" == *"/.codex/"* ]]; then
+    continue
+  fi
+
+  if [[ "$FILE_PATH" == *"/node_modules/"* ||
+        "$FILE_PATH" == *"/__pycache__/"* ||
+        "$FILE_PATH" == *".pyc" ||
+        "$FILE_PATH" == *".lock" ]]; then
+    continue
+  fi
+
+  if ! grep -qxF "$FILE_PATH" "$ACTIVITY_FILE" 2>/dev/null; then
+    printf '%s\n' "$FILE_PATH" >> "$ACTIVITY_FILE"
+  fi
+  touched=true
+done <<< "$CANDIDATE_PATHS"
+
+if [[ "$touched" != true ]]; then
+  exit 0
+fi
+
+# --- Start or refresh the lifecycle work cycle ---
+
+# The baseline fingerprints .living/ content before the agent records this
+# work. If the prior cycle was already documented, refresh it so subsequent
+# edits cannot be accepted using an older lifecycle update.
+SESSION_CHANGES_HELPER="${MYCELIUM_SESSION_CHANGES_HELPER:-$HERE/../scripts/session_file_changes.py}"
+mycelium_refresh_work_cycle "$REPO_ROOT" "$SESSION_CHANGES_HELPER" || true
+
+exit 0

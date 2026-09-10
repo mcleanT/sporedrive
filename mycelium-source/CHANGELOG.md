@@ -1,0 +1,190 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.6.0] - 2026-08-02
+
+### Added
+
+- **Codex plugin support and shared Agent Skills.** The Claude-only `commands/` workflows now live in the cross-platform `skills/<name>/SKILL.md` format with Codex UI metadata and a `.codex-plugin/plugin.json` manifest. Project initialization creates canonical `MYCELIUM.md` guidance, thin `CLAUDE.md` and `AGENTS.md` adapters, provider-neutral `.mycelium/` state, and hook configurations for both hosts. Hooks emit each host's wire format, parse Codex `apply_patch` activity, retain Stop enforcement and data lineage, and no longer launch a provider-specific background CLI. New compatibility tests cover packaging, initialization, SessionStart, PostToolUse, apply-patch tracking, and Stop behavior.
+- **Cross-host maintainer skills.** New shared `develop` and `lifecycle-audit` skills turn the recurring compatibility-review lessons into reusable workflows: branch-wide error-pattern sweeps, observed red/green TDD, whole-operation safety checks, exact installed-artifact verification, and black-box Claude Code/Codex lifecycle audits that never substitute manual hook calls for host dispatch.
+
+### Fixed
+
+- **Current Claude Code hook context delivery.** SessionStart and PostToolUse
+  responses now place `additionalContext` inside the event-specific
+  `hookSpecificOutput` envelope required by current Claude Code, restoring
+  model-visible summaries and post-action reminders while preserving Codex's
+  structured context and Stop behavior.
+
+- **Live-owner and lineage-recovery follow-up.** Host-identified late
+  PostToolUse events can no longer recreate lifecycle state after their active
+  transaction ends, while a concurrent root SessionStart preserves a live
+  owner's transaction and only supersedes owners proven inactive by the normal
+  liveness checks without deleting the retained owner's activity evidence.
+  Repository-assisted lineage now follows unambiguous literals through proven
+  I/O expressions, requires actual supported imports for reader aliases,
+  rejects runtime filename concatenation, derives direction from the
+  reader/writer call, skips discovery for already-resolved static I/O, and
+  fails safely at a fixed scan bound instead of fabricating provenance or
+  walking indefinitely.
+
+- **Lifecycle smoke hardening.** Fresh root SessionStart events now supersede
+  abandoned owners while preserving their logs and raw lineage, and all shared
+  PostToolUse writers reject late events from superseded tasks. Mycelium
+  control-plane utilities no longer reopen analysis work cycles. Stop preserves
+  authored registry summaries/outputs/tags and publishes authoritative handoff
+  acceptance without retaining stale pending-Stop lines. Abandoned-lineage
+  recovery refuses non-regular runtime objects before any archive mutation.
+  Lineage recovers uniquely named files from dynamic repository Path composition
+  without duplicating direct paths or aliasing absolute external literals, decision
+  templates use the indexed heading level, Jupyter parsing ignores unquoted
+  shell comments, and scientific review reports gain root-cause deduplication,
+  cross-input comparability checks, and deterministic finding-tally validation.
+
+- **Review validation and orchestration hardening.** Review-report validation
+  now ignores fenced Markdown examples, limits tally parsing to its section,
+  validates zero-finding categories, and rejects unexpected categories.
+  Six-perspective reviews respect host subagent capacity, run in waves, and
+  retry or complete a checklist in-line after a thread-limit failure.
+
+- **Codex cachebuster validation.** Cross-host manifest checks now compare the
+  shared semantic base version while permitting the documented single
+  `+codex.<token>` development suffix; divergent base versions and malformed
+  cachebusters still fail validation.
+
+- **Codex compatibility follow-up.** Explicit skill prompts now use the installed `mycelium:` namespace; generated project guidance resolves bundled resources through `.mycelium/plugin-root`; migrations preserve existing project-specific `CLAUDE.md` guidance for Codex; scaffolds create the documented todo registry and item template; and Codex hook configuration is always gitignored. Stop-time lineage consolidation is serialized inside the registered lifecycle hook; lineage-only sessions retain unique IDs; failed finalization remains unfinalized across resumed or compacted SessionStart events so the same transaction can retry; accepted log frontmatter plus its completion footer are now published atomically; and Stop preserves a fresh five-section agent handoff while generating a complete atomic fallback only when needed. Concurrent SessionStart and Stop transactions now share the lifecycle lock, SessionStart selects the next unused daily log number without overwriting gaps, and it publishes the two-line active marker atomically. Rich Codex `tool_response` forms are decoded recursively with structured exit status taking precedence over command-output prose, while the current native empty response preserves exit status and wall time as unknown instead of fabricating success; failed edits do not become activity. Bash lineage requires execution evidence, rejecting unsupported compound structures and non-command text matches while retaining commands reached through statically proven failed `||` alternatives. Shell-structure checks ignore quoted Python/R syntax, while PostToolUse tooling exclusions classify the executed program, module, or script instead of matching command-like substrings in arguments. Python, Rscript, and Jupyter lineage detection preserves concatenated quoted, bare, and backslash-escaped interpreter, flag, script, and inline-source words, including whitespace, escaped quotes, and quoted shell metacharacters; requires complete shell-word boundaries; rejects terminal help/version options before apparent payloads; recognizes nested `time`, `exec`, `nice`, and `timeout` execution wrappers; applies cwd-changing `env`, `conda run`, and `uv run` options; and conservatively rejects argv-rewriting `env --split-string` forms. Session change accounting handles reflog boundaries, unavailable reflogs, rewritten history, content-producing rebases, and temporary branches that return to the baseline HEAD. Codex shell hooks use the host's canonical `Bash` matcher, and their plugin adapter exits silently when Claude Code cross-discovers the same conventional `hooks/hooks.json` path, preventing duplicate native lifecycle dispatch. Globally dispatched hooks now validate `.living` and `.mycelium` containment and symlinks before any project write, and refresh the plugin-root pointer atomically. Initialization and migration reject symlinked managed guidance, hook configuration, todo, index, and runtime-state outputs before mutation; JSON-valid but structurally malformed Claude and Codex hook configurations are now rejected before the first managed write; legacy session, global knowledge, and provider MEMORY imports reject linked files and linked ancestors before reading or writing, with whole-operation preflight to avoid partial migrations. Text replacements are atomic and preserve existing permissions. Migration now repairs earlier `exec_command` registrations, standalone lineage Stop handlers, misplaced or stale Claude hooks, obsolete Codex hook guidance, and repo-local bundled-resource commands; dry-runs audit all six Claude registrations, and no-op migrations avoid rewriting unchanged Claude settings. Hook-approval guidance distinguishes the Codex CLI from the desktop app and points older CLIs to `codex update`.
+- **Lifecycle ownership, locking, and notebook attribution.** Active sessions now publish a distinct host-session owner token and encode that ownership format in the atomic active marker, so a nested subagent Stop cannot consolidate, finalize, or delete its primary session's shared lifecycle state; malformed, multiline, or missing new-format identity fails closed, while timestamp comparison remains as an upgrade-compatible fallback for already-active legacy sessions. Recent lifecycle locks whose recorded owner process has terminated are reclaimed immediately, while ownerless locks retain protection for the publication race; if a live owner remains busy through the retry budget, Stop now blocks instead of silently bypassing lifecycle enforcement. SessionStart now resolves unborn Git branches without concatenating `rev-parse`'s partial `HEAD` output with a fallback and quotes the branch as a valid YAML scalar. Jupyter lineage parsing now consumes known separated option values such as `--to` and `--output`, preventing option values from hiding or impersonating the true notebook input, and rejects terminal configuration modes such as `--show-config` and `--generate-config` anywhere in the matched simple command, including across shell redirections without treating redirection targets as Jupyter argv.
+- **Cross-platform hook timestamps.** Hook mtime checks now return numeric epoch values on both GNU/Linux and BSD/macOS, restoring debounce, session-resume, and `.living/` update detection on Linux.
+
+### Changed
+
+- **`report-generator` convention pack (0.2.0 → 0.3.0): worked-example provenance, audience tiers, narrative-vs-structured Results, and shape-budget check.** Surfaced from comparing the v0.2.0 baseline output against the legacy report on a real A191 analysis. Six follow-ups: (1) Phase 1 manifest gains a `worked_examples[]` section with row-level provenance so Phase 6 can catch confabulated worked-example values (the failure mode the v0.2.0 worked-example gate could not detect — presence was enforced, contents were not); (2) Phase 0 gains an audience-tier ladder (A lay / B adjacent-field default / C in-field PI), recorded in `manifest.policies.acronym_*` and `intuition_leadin_default_form`, which the Phase 4 plain-English lint reads to modulate strictness; (3) Phase 0 gains a Results-structure question (narrative default vs structured Q/F/I headers), recorded in `manifest.policies.results_structure`; (4) Phase 5 framing critique gains an explicit subsection-title-states-finding test (topic-only Results titles get flagged); (5) Phase 6 numerical re-verify gains a Provenance-section completeness check that lists analysis scripts and flags any missing from the report's Provenance; (6) Phase 7 records main-text page count and flags shape-budget overruns (overview > 6 pages; overview+supplement > 14 pages; comprehensive < 5 pages) in `.compile-log.md`. Manifest example extended with `policies`, `worked_examples`, and a failure-mode worked example for the supplement.
+
+- **`report-generator` convention pack (0.1.0 → 0.2.0): phase-based agentic redesign.** The old 5-step procedural flow (gather context → copy template → fill sections → compile → verify) is replaced by a 9-phase flow that orchestrates the work and pushes most of the review burden onto three blind sub-agents. The user is in the loop only at Phase 0 (planning brief — headline question, baseline of comparison, primary metric, audience, standalone-vs-addendum, report shape) and optionally Phase 8 (headline preview). Internal phases: 0.5 memory consultation (reads `.living/` and emits a names+concepts cheatsheet); 0.75 section outline + main/supplement designation; 1 source-of-truth manifest (every number and coined term registered with provenance); 2 draft (sources values from the manifest, terms from the glossary); 3 worked-example gate (one healthy example per new aggregation analysis type in main text; failure-mode examples in supplement); 4–6 blind sub-agent reviewers for plain-English/glossary lint, framing critique, and numerical re-verify with provenance/style split (mirroring `mycelium:review`'s synthesis structure); 7 recompile with PDF sha + reviewer verdicts in `.compile-log.md`. Three template variants: `report-template-overview.tex`, `report-template-comprehensive.tex`, `report-template-overview-supplement.tex` (default). Sub-agent prompts live in `references/phase-prompts.md`; cross-cutting craft (acronym discipline, intuitive-before-technical, worked-examples, denominator discipline, overloaded-name guard) lives in `references/section-guide.md`; QC checklist restructured into provenance/style sections.
+
+### Fixed
+
+- **Migrator no longer creates duplicate hook entries** when the same script is already registered at a different path (e.g. marketplace install vs. dev-repo checkout). `install_claude_hooks` in `init_repo.py` now matches existing hooks by script *basename* (`mycelium-health.sh`, etc.), not full command path. A new pre-pass also consolidates pre-existing duplicates, preferring the marketplace path. The pre-pass also detects entries whose command path no longer exists on disk (stale install dirs) and replaces them with a fresh path — but only when a known-good replacement is available, so transient filesystem hiccups don't make a bad situation worse. Run the migrator on a previously-migrated repo to clean up. New `_consolidate_duplicate_hooks` helper + 10 unit tests.
+
+### Added
+
+- **`/mycelium:codex-review` skill** (#60): a pure-prose command for responding to Codex review comments on a PR. Instead of patching only the single line Codex flagged, it generalizes each comment into an underlying *error pattern* and audits the whole branch (a `git diff` against the PR's base ref plus a pattern search of the touched modules) for other instances of that same pattern, fixing them all in one pass so later Codex rounds don't surface the same mistake one instance at a time. Auto-detects scope (a specific comment if pointed to one, else all open Codex comments), verifies fixes against the project's tests, and drafts a reply summarizing both the targeted fix and the branch-wide audit. The `@codex review` re-trigger is appended only when prior Codex activity on the PR is detected (evidence of access); otherwise it asks. Posting is always draft → confirm → post. Covered by a content-contract test (`test_codex_review_command.py`).
+- **Heuristic INDEX.md summary** (`generate_index.py --summary-heuristic`): Tag-aware clustering that produces a `<!-- BEGIN KNOWLEDGE SUMMARY -->` block in <1s without LLM calls. Three subsections — tag clusters (≥2 entries), 10 most-recent entries, and a tag → entry-ID inverted index. Closes the gap that left every existing `INDEX.md` sentinel-less and the SessionStart injection path silently dead.
+- **`recall_lessons.py`** — query `.living/learnings.md` and `decisions.md` by tag, ID, or date. Cheap progressive-disclosure tool: fetches matching entries instead of pulling whole files into context. Supports ANY-match within `--tag` and `--id`, AND across filter types.
+- **`migrate_existing_repos.py`** — idempotent backfill for repos started on earlier mycelium versions. Re-anchors CLAUDE.md on `.living/INDEX.md`, tops up missing hooks (especially read-tracker), regenerates the heuristic SUMMARY block, and appends the Global Knowledge Domains routing table to MEMORY.md. Supports `--repo`, `--scan`, `--dry-run`.
+- **CLAUDE.md.template re-anchor**: New repos point at `.living/INDEX.md` as the *first* knowledge entry point and explicitly mention `recall_lessons.py` for targeted lookup. Old "read learnings.md / decisions.md directly" pattern is dropped.
+- **MEMORY.md routing table append in `init_knowledge.py`**: SKILL.md previously claimed this happened, but the script had no MEMORY.md code. Now actually appends the table to `~/.claude/projects/*/memory/MEMORY.md` (idempotent — checks for `## Global Knowledge Domains` header). New `--memory-only` flag for the migrator.
+- **`recall` and `migrate` modes documented in SKILL.md**, plus a "How to verify" section listing the seven commands an agent can run to confirm the system is wired correctly.
+
+### Fixed
+
+- **`mycelium-read-tracker.sh` is now installed by default** in `init_repo.py`'s 5-hook bundle. Previously the hook shipped but had to be installed manually per project — meaning `.living/` access metrics required ad-hoc setup. The bundle now is: SessionStart→health, PostToolUse(Bash)→post-action, PostToolUse(Edit\|Write)→activity-tracker, PostToolUse(Read)→read-tracker (new default), Stop→stop-check.
+- **SessionStart hook calls `--summary-heuristic` by default**, with fallback to `--counts-only` if the local copy of `generate_index.py` predates the new flag. Previously the hook only called `--counts-only`, which never produces a SUMMARY block — leaving the injection path at line ~376 of `mycelium-health.sh` permanently dead for every project on the machine.
+
+### Changed
+
+- **SKILL.md honest about dormant modes**: `transfer` (requires meta-project layout), `contribute` (requires prior `crystallize`), and `file-issue` (manual workflow only) now carry "Dormant by design" callouts explaining what triggers them and what does not. Prevents agents from inferring they fire automatically.
+
+### Wired (previously orphan templates)
+
+- `algorithm-readme.md` and `analysis-readme.md` are now copied as `_README_TEMPLATE.md` into `algorithms/` and `analysis/` at init.
+- `decision-log-entry.md` and `learning-entry.md` are now cited by name in the `.living/decisions.md` and `.living/learnings.md` stub content. The learnings stub also notes that `**Tags**:` annotations feed `--summary-heuristic`.
+- `marimo-notebook-header.py` is now referenced in the CLAUDE.md.template Workflow section.
+
+## [0.5.0] - 2026-04-11
+
+### Added
+
+- **Knowledge transfer lifecycle** (#23): Cross-project knowledge transfer as a native lifecycle phase. New `/mycelium:transfer` command cross-pollinates learnings across sibling projects in a meta-project, with auto-application and audit trail. Lifecycle is now: accumulate → crystallize → transfer → contribute.
+- **Skill trigger description overhaul** (#25): Rewrote all 5 skill descriptions for semantic intent matching. Recall jumped from 0–20% to 80–100% across skills, with 90–100% specificity.
+- **Knowledge promotion pipeline** (#24): Post-action hook and audit now promote transferable learnings from `.living/learnings.md` to global `~/.claude/knowledge/{domain}.md` files. Audit cadence moved from weekly to daily.
+
+## [0.4.0] - 2026-04-04
+
+### Added
+
+- **Read-path telemetry** (#22): `mycelium-read-tracker.sh` hook logs every `.living/` file access for consumption measurement.
+- **INDEX.md LLM summarization** (#22): `generate_index.py --summarize` generates knowledge cluster summaries; `--counts-only` mode for fast refresh at session start.
+- **INDEX.md injection at SessionStart** (#22): Health hook injects knowledge summary clusters directly into agent context — no manual INDEX.md reading required.
+- **LOG_REGISTRY semantic summaries** (#22): Stop hook instructs Claude to fill Summary and Key Outputs columns with meaningful content instead of filename stubs.
+- **Universal conventions crystallization** (#22): Post-action protocol now includes a dedicated step to crystallize recurring learnings (3+) into `.living/conventions.md` with source citations.
+
+### Fixed
+
+- **Stop hook debounce** (#22): 5-minute debounce before blocking session end prevents premature blocks on quick sessions.
+
+## [0.3.2] - 2026-03-28
+
+### Fixed
+
+- **Two-phase report write order** (#21): Reports now enforce data-driven sections first (Problem Statement, Methods, Results), then interpretive sections (Conclusions, Abstract, Next Steps) — prevents conclusions templated from hypotheses before results are read.
+- **Stop hook verbosity** (#20): Replaced 30-line inline triage instructions with 1–2 line signal messages. Full protocol lives in the skill definition.
+
+## [0.3.1] - 2026-03-24
+
+### Added
+
+- **Edit/Write activity tracker** (#18): `mycelium-activity-tracker.sh` hook tracks file modifications (not just Bash execution), closing a blind spot where Edit/Write-only sessions went unrecorded.
+- **Auto session log finalization** (#18): Stop hook auto-finalizes session logs with computed duration, files changed, and registry row — no Claude compliance needed.
+- **Blocking stop hook enforcement** (#18): Stop hook now uses `{"decision": "block"}` JSON instead of non-blocking warnings.
+
+### Fixed
+
+- **8 hook reliability gaps** (#19): Global session log pointer clobbering, unbounded activity file, over-broad `python -m` exclusion, fragile path derivation, session timestamp leak, stale sentinel persistence, dead reminder check.
+- **Convention/findings enforcement** (#19): `conventions.md` added to mtime validation; prescriptive triage routing replaces weak "or" phrasing; findings directory enforcement added. Audit of 358-entry learnings.md revealed 19.6% scientific findings and 13.4% conventions misrouted to learnings.
+
+## [0.3.0] - 2026-03-20
+
+### Added
+
+- **Scientific findings crystallization** (#16): Topic-organized findings in `.living/findings/{topic}.md` with evidence ledgers, status tracking (preliminary → supported → robust → contradicted), FINDINGS_REGISTRY, and cross-project indexing via `crystallize_findings.py`.
+- **Incremental session logger** (#15): Hook-driven running log throughout each session, persisted in `.living/log/` with LOG_REGISTRY. SessionStart creates log files, PostToolUse injects append directives, Stop auto-cleans short sessions.
+- **Cross-session continuity** (#14): Crystallization writes structured 5-section session summary to `.claude/last-session.md`; SessionStart hook loads it for both agent and user; Stop hook warns if not written.
+- **Progressive disclosure knowledge system** (#13): Three-tier system with global `~/.claude/knowledge/` domain files, per-project INDEX.md summaries, and MEMORY.md routing tables. Weekly silent audit for staleness, dedup, and regeneration. `init_knowledge.py` and `generate_index.py` scripts.
+- **PostToolUse hook for post-action enforcement** (#12): `mycelium-post-action.sh` detects code execution and injects mandatory post-action protocol directives. Debounced per work cycle. Stop hook rewritten to complement (fires only when post-action was ignored).
+- **Spot-check and failure-mode-analysis conventions** (#11): Two new reference docs in robust-analysis pack for outlier investigation and algorithm failure characterization.
+- **Agent-driven workflow templates** (#17): 5 new templates (`generated-convention.md`, `convention-pack.yaml`, `schema.yaml`, `provenance.md`, `summary_stats.md`). Crystallization guide enriched with worked example and explicit thresholds. Contribute mode rewritten as fully agent-driven. 4 non-functional stub scripts removed.
+
+### Changed
+
+- **Init auto-registers all hooks** (#12): `init_repo.py` registers SessionStart, PostToolUse, and Stop hooks in `.claude/settings.local.json` during initialization.
+
+## [0.2.0] - 2026-03-07
+
+### Changed
+
+- **Architecture**: Separated skills (actions) from conventions (reference material)
+  - Skills are Claude Code slash commands: `/mycelium:skill`, `/mycelium:analyze`, `/mycelium:report`, `/mycelium:ideas`
+  - Convention packs are swappable markdown reference docs that skills route to
+- **Directory structure**: `skill/` -> `skills/core/`, `network/skills/` -> `network/conventions/`
+- **Convention packs**: `SKILL_PACK.yaml` -> `CONVENTION_PACK.yaml`
+- **In repos**: `.living/skills/` -> `.living/conventions/`, `ACTIVE_SKILLS.yaml` -> `ACTIVE_CONVENTIONS.yaml`
+- **Scripts**: `install_domain_skill.py` -> `install_convention.py`, `prepare_contribution.py` updated for conventions
+
+### Added
+
+- `/mycelium:analyze` — dedicated analysis skill that routes to installed analysis conventions
+- `/mycelium:report` — dedicated report skill that routes to installed report conventions
+- `/mycelium:ideas` — dedicated ideation skill that routes to installed idea conventions
+- `marketplace.json` now registers all four skills
+
+## [0.1.0] - 2024-01-01
+
+### Added
+
+- Core mycelium skill (`skill/SKILL.md`) with modes: init, ingest, analyze, report, install-skill, crystallize, contribute, file-issue
+- Post-action hook protocol for living repository maintenance
+- Reference documents: folder structure, environment setup, analysis conventions, statistical conventions, writing conventions, data ingestion conventions, marketplace guide, skill generation guide
+- Templates: CLAUDE.md, analysis README, manifest entries, decision log, learning entry, LaTeX report, marimo notebook header, algorithm README
+- Scripts (functional): init_repo, validate_structure, install_domain_skill
+- Scripts (stubs, later removed): update_manifests, ingest_dataset, crystallize_learnings, prepare_contribution — these workflows are now handled agent-driven via mode definitions in core.md
+- `validate_structure.py` — functional validation of mycelium repo structure
+- Bioinformatics domain skill pack: RNA-seq and single-cell conventions, statistical methods, QC checklist, templates
+- Image analysis domain skill pack: segmentation standards, preprocessing conventions, QC checklist, templates
+- GitHub issue templates: convention gap, new domain request, skill improvement
+- GitHub PR template with checklists for different contribution types
+- CI workflow for validating skill packs and repo structure

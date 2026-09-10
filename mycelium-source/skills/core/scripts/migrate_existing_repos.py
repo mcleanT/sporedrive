@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""Idempotent backfill for repos initialized on earlier mycelium versions.
+
+Performs the provider-neutral upgrade actions needed by current Mycelium repos:
+
+1. **CLAUDE.md re-anchor** — inserts a "Knowledge index" callout pointing
+   at `.living/INDEX.md` if no INDEX.md reference is present.
+2. **Hook top-up** — adds any of the 6-hook default bundle that the repo
+   is missing, preserving existing hook entries (no duplicates).
+3. **INDEX.md regen** — runs `generate_index.py --summary-heuristic` so
+   the freshly-anchored INDEX.md actually has cluster content.
+4. **MEMORY.md routing** — appends the Global Knowledge Domains routing
+   table to `~/.claude/projects/*/memory/MEMORY.md` files.
+
+All actions are idempotent: re-running on an already-migrated repo is a
+no-op (each action prints "skipped" instead of "applied").
+
+Usage:
+    migrate_existing_repos.py --repo /path/to/repo
+    migrate_existing_repos.py --scan /Users/x/code  # finds all .living/ repos
+    migrate_existing_repos.py --repo /path --dry-run
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+# Bring in helpers from sibling scripts.
+_SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_SCRIPT_DIR))
+
+import init_knowledge as ik  # noqa: E402
+import init_repo as ir  # noqa: E402
+
+# The "Knowledge index" callout that gets inserted into CLAUDE.md if missing.
+# Single-block insertion is safer than rewriting Quick Orientation in
+# repos with heavily-customized CLAUDE.md files.
+LEGACY_RECALL_COMMAND = "python3 skills/core/scripts/recall_lessons.py"
+PLUGIN_RECALL_COMMAND = (
+    'python3 "$(cat .mycelium/plugin-root)/skills/core/scripts/recall_lessons.py"'
+)
+KNOWLEDGE_INDEX_CALLOUT = f"""\
+> **Knowledge index (read first):** [`.living/INDEX.md`](.living/INDEX.md) is an auto-generated map of tag clusters, most-recent entries, and a tag → entry-ID inverted index. The SessionStart hook keeps it fresh — trust it. For targeted lookup: `{PLUGIN_RECALL_COMMAND} --living-dir .living/ --tag <tag>` (also `--id L-42`, `--since YYYY-MM-DD`).
+"""
+
+# Markers used to detect "already migrated" — any of these strings means
+# the CLAUDE.md was upgraded and the callout should be skipped.
+INDEX_MENTIONED_MARKERS = (
+    ".living/INDEX.md",
+    "Knowledge index (read first)",
+)
+
+
+def _action_status(applied: bool) -> str:
+    return "applied" if applied else "skipped (already up-to-date)"
+
+
+def reanchor_claude_md(repo_path: Path, dry_run: bool = False) -> bool:
+    """Insert the Knowledge index callout into CLAUDE.md.
+
+    Returns True if applied, False if no-op or CLAUDE.md missing.
+    """
+    claude_md = repo_path / "CLAUDE.md"
+    ir.ensure_safe_regular_file(claude_md)
+    if not claude_md.exists():
+        return False
+
+    content = claude_md.read_text(encoding="utf-8")
+    repaired_content = content.replace(LEGACY_RECALL_COMMAND, PLUGIN_RECALL_COMMAND)
+    if any(marker in content for marker in INDEX_MENTIONED_MARKERS):
+        if repaired_content == content:
+            return False
+        if not dry_run:
+            ir._atomic_write_text(claude_md, repaired_content)
+        return True
+
+    content = repaired_content
+
+    # Insert the callout right after the first "## Quick Orientation" header
+    # if present, otherwise after the first H1.
+    lines = content.splitlines(keepends=True)
+    insert_idx: int | None = None
+
+    for i, line in enumerate(lines):
+        if line.strip().startswith("## Quick Orientation"):
+            # Find the next blank line after the header
+            for j in range(i + 1, min(i + 5, len(lines))):
+                if lines[j].strip() == "":
+                    insert_idx = j + 1
+                    break
+            else:
+                insert_idx = i + 1
+            break
+
+    if insert_idx is None:
+        # Fallback: after the first H1
+        for i, line in enumerate(lines):
+            if line.startswith("# "):
+                # Find next blank line
+                for j in range(i + 1, min(i + 5, len(lines))):
+                    if lines[j].strip() == "":
+                        insert_idx = j + 1
+                        break
+                else:
+                    insert_idx = i + 1
+                break
+
+    if insert_idx is None:
+        # Empty/atypical CLAUDE.md — prepend
+        insert_idx = 0
+
+    new_lines = (
+        lines[:insert_idx]
+        + [KNOWLEDGE_INDEX_CALLOUT, "\n"]
+        + lines[insert_idx:]
+    )
+    new_content = "".join(new_lines)
+
+    if not dry_run:
+        ir._atomic_write_text(claude_md, new_content)
+    return True
+
+
+def topup_hooks(repo_path: Path, dry_run: bool = False) -> bool:
+    """Top up missing hooks in .claude/settings.local.json.
+
+    Reuses init_repo.install_claude_hooks which is already idempotent.
+    Returns True if any hook was added, False if all 6 were already present.
+    """
+    claude_dir = ir.ensure_safe_project_directory(
+        repo_path, ".claude", create=not dry_run
+    )
+    settings_path = claude_dir / "settings.local.json"
+    ir.ensure_safe_regular_file(settings_path)
+    before_signature = ""
+    if settings_path.exists():
+        existing = ir.load_hook_config(settings_path)
+        before_signature = json.dumps(
+            existing.get("hooks", {}),
+            sort_keys=True,
+        )
+
+    if dry_run:
+        # We'd need to simulate without writing — easiest is to return
+        # whether the bundle is incomplete by inspecting what's there.
+        if not settings_path.exists():
+            return True
+        existing = ir.load_hook_config(settings_path)
+        hooks = existing.get("hooks", {})
+        for event, matcher, basename in ir.CLAUDE_HOOK_SPECS:
+            matches = [
+                handler
+                for group in hooks.get(event, [])
+                if group.get("matcher", "") == matcher
+                for handler in group.get("hooks", [])
+                if ir._hook_basename(handler.get("command", "")) == basename
+                and ir._hook_command_path(handler.get("command", "")).exists()
+            ]
+            if len(matches) != 1:
+                return True
+
+        all_mycelium_commands = [
+            handler.get("command", "")
+            for groups in hooks.values()
+            for group in groups
+            for handler in group.get("hooks", [])
+            if ir._hook_basename(handler.get("command", ""))
+            in ir.ALL_MYCELIUM_HOOK_BASENAMES
+        ]
+        return (
+            len(all_mycelium_commands) != len(ir.CLAUDE_HOOK_SPECS)
+            or any(
+                ir._hook_basename(command) in ir.LEGACY_MYCELIUM_HOOK_BASENAMES
+                for command in all_mycelium_commands
+            )
+        )
+
+    # Actual install: reuse init_repo's idempotent installer
+    ir.install_claude_hooks(repo_path)
+    after_signature = json.dumps(
+        json.loads(settings_path.read_text()).get("hooks", {}),
+        sort_keys=True,
+    )
+    return before_signature != after_signature
+
+
+def ensure_cross_agent_guidance(repo_path: Path, dry_run: bool = False) -> bool:
+    """Create MYCELIUM.md and ensure Claude/Codex routing adapters exist."""
+    paths = [repo_path / name for name in ("MYCELIUM.md", "CLAUDE.md", "AGENTS.md")]
+    for path in paths:
+        ir.ensure_safe_regular_file(path)
+    before = {path.name: path.read_text() if path.exists() else None for path in paths}
+    if dry_run:
+        canonical_template = (
+            _SCRIPT_DIR.parent / "templates" / "MYCELIUM.md.template"
+        ).read_text(encoding="utf-8")
+        return (
+            any(value is None for value in before.values())
+            or any(
+                value is not None and "<!-- MYCELIUM:BEGIN -->" not in value
+                for name, value in before.items()
+                if name != "MYCELIUM.md"
+            )
+            or any(
+                value is not None and LEGACY_RECALL_COMMAND in value
+                for value in before.values()
+            )
+            or (
+                before["MYCELIUM.md"] is not None
+                and ir.refresh_generated_guidance(
+                    before["MYCELIUM.md"], canonical_template
+                )
+                != before["MYCELIUM.md"]
+            )
+        )
+    ir.create_agent_guidance(repo_path)
+    for path in paths:
+        if not path.exists():
+            continue
+        content = path.read_text(encoding="utf-8")
+        repaired = content.replace(LEGACY_RECALL_COMMAND, PLUGIN_RECALL_COMMAND)
+        if repaired != content:
+            ir._atomic_write_text(path, repaired)
+    after = {path.name: path.read_text() if path.exists() else None for path in paths}
+    return before != after
+
+
+def migrate_runtime_state(repo_path: Path, dry_run: bool = False) -> bool:
+    """Move durable session context from .claude/ to provider-neutral state."""
+    legacy_dir = ir.ensure_safe_project_directory(
+        repo_path, ".claude", create=False
+    )
+    legacy = legacy_dir / "last-session.md"
+    ir.ensure_safe_regular_file(legacy)
+    state_dir = ir.ensure_safe_project_directory(
+        repo_path, ".mycelium", create=not dry_run
+    )
+    destination = state_dir / "last-session.md"
+    ir.ensure_safe_regular_file(destination)
+    needs_copy = legacy.exists() and not destination.exists()
+    gitignore = state_dir / ".gitignore"
+    ir.ensure_safe_regular_file(gitignore)
+    needs_gitignore = not gitignore.exists()
+    pointer = state_dir / "plugin-root"
+    ir.ensure_safe_regular_file(pointer)
+    expected_pointer = f"{ir.mycelium_plugin_root()}\n"
+    needs_pointer = (
+        not pointer.exists()
+        or pointer.read_text(encoding="utf-8") != expected_pointer
+    )
+    if dry_run:
+        return needs_copy or needs_gitignore or needs_pointer
+    if not gitignore.exists():
+        ir._atomic_write_text(gitignore, "*\n!.gitignore\n")
+    if needs_copy:
+        ir._atomic_write_text(destination, legacy.read_text(encoding="utf-8"))
+    ir.write_plugin_root_pointer(repo_path)
+    return needs_copy or needs_gitignore or needs_pointer
+
+
+def topup_codex_hooks(repo_path: Path, dry_run: bool = False) -> bool:
+    """Remove cache-path Codex hooks now superseded by plugin hooks."""
+    codex_dir = ir.ensure_safe_project_directory(repo_path, ".codex", create=False)
+    hooks_path = codex_dir / "hooks.json"
+    ir.ensure_safe_regular_file(hooks_path)
+    before = hooks_path.read_text() if hooks_path.exists() else None
+    gitignore = codex_dir / ".gitignore"
+    ir.ensure_safe_regular_file(gitignore)
+    gitignore_before = gitignore.read_text() if gitignore.exists() else None
+    if dry_run:
+        if before is None:
+            return False
+        config = ir.validate_hook_config(json.loads(before), hooks_path)
+        expected = json.loads(json.dumps(config))
+        return ir._remove_codex_hooks_config(expected)
+    ir.install_codex_hooks(repo_path)
+    after = hooks_path.read_text() if hooks_path.exists() else None
+    gitignore_after = gitignore.read_text() if gitignore.exists() else None
+    return before != after or gitignore_before != gitignore_after
+
+
+def ensure_todo_contract(repo_path: Path, dry_run: bool = False) -> bool:
+    """Ensure the registry and item template used by the core skill exist."""
+    todo_dir = ir.ensure_safe_project_directory(
+        repo_path, "todo", create=not dry_run
+    )
+    required = [
+        todo_dir / "TODO_REGISTRY.md",
+        todo_dir / "TODO_ITEM_TEMPLATE.md",
+    ]
+    for path in required:
+        ir.ensure_safe_regular_file(path)
+    missing = any(not path.exists() for path in required)
+    if dry_run:
+        return missing
+    if missing:
+        ir.create_todo_list(repo_path)
+    return missing
+
+
+def regen_index(repo_path: Path, dry_run: bool = False) -> bool:
+    """Run generate_index.py --summary-heuristic on .living/.
+
+    Returns True if regenerated, False if no .living/ dir or dry-run.
+    """
+    living_dir = ir.ensure_safe_project_directory(
+        repo_path, ".living", create=False
+    )
+    if not living_dir.is_dir():
+        return False
+    ir.ensure_safe_regular_file(living_dir / "INDEX.md")
+    if dry_run:
+        return True
+
+    script = _SCRIPT_DIR / "generate_index.py"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--living-dir",
+            str(living_dir),
+            "--summary-heuristic",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def append_memory_routing(dry_run: bool = False) -> tuple[int, int]:
+    """Append the routing table to MEMORY.md files.
+
+    Returns (appended, skipped). Dry-run reports without writing.
+    """
+    mycelium_root = (_SCRIPT_DIR / ".." / ".." / "..").resolve()
+    if dry_run:
+        # Count what we WOULD append by inspecting each file
+        projects_dir = Path.home() / ".claude" / "projects"
+        candidates = ik._glob_memory_files(projects_dir)
+        appended = sum(
+            1
+            for p in candidates
+            if ik.MEMORY_ROUTING_HEADER not in p.read_text(encoding="utf-8")
+        )
+        return (appended, len(candidates) - appended)
+    return ik.append_routing_to_memory_files(mycelium_root)
+
+
+def migrate_one(repo_path: Path, dry_run: bool = False) -> dict[str, str]:
+    """Run all four upgrade actions on a single repo.
+
+    Returns a dict of action → status string.
+    """
+    repo_path = repo_path.resolve()
+    if not (repo_path / ".living").is_dir():
+        return {"_skip": f"no .living/ at {repo_path}"}
+    managed_directories = (".living", ".mycelium", ".claude", ".codex", "todo")
+    for relative in managed_directories:
+        ir.ensure_safe_project_directory(repo_path, relative, create=False)
+    ir.ensure_directory_tree_has_no_symlinks(repo_path / ".living")
+    managed_files = (
+        "MYCELIUM.md",
+        "CLAUDE.md",
+        "AGENTS.md",
+        ".living/INDEX.md",
+        ".mycelium/.gitignore",
+        ".mycelium/plugin-root",
+        ".mycelium/last-session.md",
+        ".claude/settings.local.json",
+        ".claude/last-session.md",
+        ".codex/hooks.json",
+        ".codex/.gitignore",
+        "todo/TODO_REGISTRY.md",
+        "todo/TODO_ITEM_TEMPLATE.md",
+    )
+    for relative in managed_files:
+        ir.ensure_safe_regular_file(repo_path / relative)
+    ir.preflight_hook_config_files(repo_path)
+
+    claude_md_applied = reanchor_claude_md(repo_path, dry_run=dry_run)
+    guidance_applied = ensure_cross_agent_guidance(repo_path, dry_run=dry_run)
+    runtime_applied = migrate_runtime_state(repo_path, dry_run=dry_run)
+    hooks_applied = topup_hooks(repo_path, dry_run=dry_run)
+    codex_hooks_applied = topup_codex_hooks(repo_path, dry_run=dry_run)
+    todo_applied = ensure_todo_contract(repo_path, dry_run=dry_run)
+    index_applied = regen_index(repo_path, dry_run=dry_run)
+
+    return {
+        "CLAUDE.md re-anchor": _action_status(claude_md_applied),
+        "Cross-agent guidance": _action_status(guidance_applied),
+        "Runtime state migration": _action_status(runtime_applied),
+        "Claude hooks top-up": _action_status(hooks_applied),
+        "Legacy Codex hook cleanup": _action_status(codex_hooks_applied),
+        "Todo contract": _action_status(todo_applied),
+        "INDEX.md regen": _action_status(index_applied),
+    }
+
+
+def scan_for_repos(scan_root: Path) -> list[Path]:
+    """Find all repos with `.living/` directories under scan_root (depth 1)."""
+    if not scan_root.is_dir():
+        return []
+    repos: list[Path] = []
+    for child in sorted(scan_root.iterdir()):
+        if (
+            child.is_dir()
+            and not child.is_symlink()
+            and (child / ".living").is_dir()
+            and not (child / ".living").is_symlink()
+        ):
+            repos.append(child)
+    return repos
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Idempotent migration for repos started on earlier mycelium "
+            "versions. Re-anchors CLAUDE.md, tops up hooks, regenerates "
+            "INDEX.md SUMMARY block, and appends MEMORY.md routing tables."
+        )
+    )
+    target_group = parser.add_mutually_exclusive_group(required=True)
+    target_group.add_argument(
+        "--repo",
+        type=Path,
+        help="Migrate one repo by absolute path.",
+    )
+    target_group.add_argument(
+        "--scan",
+        type=Path,
+        help="Scan a parent directory for child dirs containing .living/ and migrate each.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report intended changes without writing.",
+    )
+    parser.add_argument(
+        "--skip-memory",
+        action="store_true",
+        help="Skip the MEMORY.md routing append step (per-repo migration only).",
+    )
+    args = parser.parse_args()
+
+    repos: list[Path] = []
+    if args.repo:
+        repos = [args.repo.expanduser().resolve()]
+    elif args.scan:
+        repos = scan_for_repos(args.scan.expanduser().resolve())
+        if not repos:
+            print(f"No repos with .living/ found under {args.scan}", file=sys.stderr)
+            sys.exit(1)
+
+    print(f"Migrating {len(repos)} repo(s){' (dry-run)' if args.dry_run else ''}")
+    print()
+
+    for repo in repos:
+        print(f"=== {repo} ===")
+        result = migrate_one(repo, dry_run=args.dry_run)
+        if "_skip" in result:
+            print(f"  Skipped: {result['_skip']}")
+        else:
+            for action, status in result.items():
+                print(f"  {action}: {status}")
+        print()
+
+    if not args.skip_memory:
+        print("=== MEMORY.md routing (global) ===")
+        appended, skipped = append_memory_routing(dry_run=args.dry_run)
+        prefix = "would append" if args.dry_run else "appended"
+        print(f"  {prefix} {appended}, skipped {skipped} (already present)")
+
+
+if __name__ == "__main__":
+    main()
