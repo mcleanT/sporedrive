@@ -1138,7 +1138,15 @@ class Runner:
         # seq169) — and macOS resolves /tmp to /private/tmp, so both aliases are granted. This is a
         # reads-only, path-scoped grant: Bash stays the narrow sleep/cat/od allowlist and approval
         # mode stays on, so an unexpected op still hits the modal and R0-modal's unknown-modal
-        # refusal is preserved (seq168). No broad --add-dir / Read(*) / Bash(*) / trust-off.
+        # refusal is preserved (seq168). A Read()-tool rule does NOT govern a Bash command's
+        # file access, so the executor's OWN sed byte-extraction of its delivered brief (R3),
+        # which lives under <state-dir>/tasks/** OUTSIDE the worktree, still hit the working-
+        # directory boundary and raised an unanswerable "Do you want to proceed?" modal
+        # (live-20260910T083422Z; dialog captured on surface:131). A NARROW run-owned
+        # `--add-dir <state-dir>/tasks` is therefore added at launch (below) so those Bash
+        # reads proceed without a modal (fixture-fix-decision). Still no BROAD --add-dir /
+        # Read(*) / Bash(*) / trust-off, and approval mode stays on so an UNLISTED command
+        # still hits the modal.
         read_allow = [
             f"Read(/{d}/tasks/**)"
             for d in dict.fromkeys(
@@ -1234,9 +1242,19 @@ class Runner:
             "cmp",
         )
         bash_allow = "Bash(sleep *) " + " ".join(f"Bash({t} *)" for t in inspect_tools)
+        # Grant EXACTLY this run's owned task subtree as an additional trusted directory so the
+        # executor's own allowlisted Bash reads of its delivered brief do not hit the working-
+        # directory modal (see the read_allow note above). Narrow + run-owned; both /tmp and
+        # /private/tmp aliases so the path resolves regardless of the macOS symlink.
+        tasks_dir = self.state_dir / "tasks"
+        tasks_dir.mkdir(parents=True, exist_ok=True)
+        add_dir_flags = " ".join(
+            f"--add-dir {d}"
+            for d in dict.fromkeys([str(tasks_dir), os.path.realpath(tasks_dir)])
+        )
         cmd = (
             f"claude --model {self.a.model} --permission-mode acceptEdits "
-            f"--allowedTools '{bash_allow}' "
+            f"--allowedTools '{bash_allow}' {add_dir_flags} "
             f"--disallowedTools Agent Workflow --session-id {self.session_uuid} "
             f"--settings {ev_dir / 'settings.json'}\n"
         )
