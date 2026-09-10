@@ -21,6 +21,7 @@ import hashlib
 import os
 import sys
 
+from .execution import ExecutionManager
 from .model import ProtocolError, utcnow
 from .store import ID_RE
 
@@ -153,7 +154,8 @@ def _notification_line(task_id: str, msg: dict) -> str:
 
 def notify_via_bridge(co, *, task_id: str, message_id: str, binding_id: str,
                       controller_id: str, expected_revision: int,
-                      accept_timeout_s: float = 12.0) -> dict:
+                      accept_timeout_s: float = 12.0,
+                      execution_action_id: str | None = None) -> dict:
     msg = co.get_message(task_id, message_id)
     if not msg:
         raise ProtocolError("unknown_message", message_id, "cannot notify for a message that does not exist")
@@ -186,6 +188,19 @@ def notify_via_bridge(co, *, task_id: str, message_id: str, binding_id: str,
         raise ProtocolError("unknown_binding", binding_id,
                             "bridge binding not found; bind the executor session first")
     _verify_binding_identity(binding, recip, controller_id)
+
+    # Execution gate (PLAN section 3): for a MANAGED work-producing dispatch, recheck the bound
+    # execution IMMEDIATELY before sending so a request queued before a newer pause/expiry cannot
+    # still fire, and a stale (already-settled) reservation cannot re-dispatch. Read-only; message
+    # delivery state stays separate from permission to execute (an ack/progress path is unaffected).
+    if execution_action_id is not None:
+        gate = ExecutionManager(co.store).dispatch_check(task_id, execution_action_id)
+        if not gate.get("ok"):
+            out = {"delivered": False, "state": "refused_by_execution_gate",
+                   "reason": gate.get("reason"), "execution_action_id": execution_action_id,
+                   "execution_status": gate.get("status")}
+            _record(out, recip.get("participant_id", ""))
+            return {"message_id": message_id, "bridge_request_id": req_id, **out}
 
     text = _notification_line(task_id, msg)
     try:

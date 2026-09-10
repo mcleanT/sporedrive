@@ -23,6 +23,9 @@ That reference also covers per-host plugin registration and how to reach the pro
 `coord_*` MCP tools when the plugin is loaded; for the bare CLI (which is not on PATH) use
 `scripts/locate-mycelium-coord.sh`. Resolve the current checkpoint at use (`checkpoint-read TASK`
 with no revision, or `resume TASK PARTICIPANT`) rather than trusting a hand-copied current pointer.
+Read `references/integration-readiness.md` on demand, before a task's first live acceptance
+cycle against a real provider or a representative multi-stage runtime path — it does not apply
+to documentation or ordinary local edits, so most briefs never need it.
 
 ## Operating rules
 
@@ -41,6 +44,22 @@ with no revision, or `resume TASK PARTICIPANT`) rather than trusting a hand-copi
    necessary or marked as an assumption). Record a request ID and text hash. A material correction
    supersedes the previous brief and says so; a small addition is a scoped amendment. Reconcile any
    work already started under a superseded revision.
+
+   Fix the task's required outcomes and checks before sending the brief; routine implementation
+   choices stay Claude's to make autonomously within that scope, and a new user requirement is an
+   explicit amendment — never invent a new acceptance gate from your own reading of the task. State
+   the review/repair allowance explicitly: one scoped review, then one verification of its
+   repairs, is the default; a further substantive review needs an explicitly allocated additional
+   allowance. A project's own ratified contract (additional stages, review panels) is carried into
+   the brief explicitly and is never replaced by this ordinary default. Add this to every brief:
+
+   ```text
+   Acceptance: [observable outcomes and named checks]
+   Work limits: [review allowance, owned review deadline, unattended expiry if applicable]
+   Reopen only for: [new evidence of failure in required behavior]
+   Other findings: [bounded backlog]
+   On limit: Preserve results; report incomplete work; do not renew automatically.
+   ```
 4. **Reuse authorization.** Keep the owner's instruction and its scope in the checkpoint. Continue
    reversible in-scope work; ask only for unresolved material ambiguity or an action outside that
    authority. Ratified scientific gates remain binding; summaries and reviewer verdicts never
@@ -86,8 +105,11 @@ with no revision, or `resume TASK PARTICIPANT`) rather than trusting a hand-copi
    `type:user`-only match misses this route, and an `enqueue` — or any removal or hook event — alone
    is never acceptance (a removal may instead be the owner recalling the message).
 8. **Wait without repeated reasoning.** Use `cmux events --after <seq>` with a cursor, or a bounded
-   `read-screen`, with a timeout. If nothing changed, keep waiting. Notify the user for meaningful
-   progress, failure, a decision, or completion.
+   `read-screen`, with a timeout. Supervise on meaningful events only: an empty, timed-out wait
+   with unchanged last_action is reissued silently within the task's own deadline, and a terminal
+   task (completed, paused, expired) ends the wait loop rather than being polled again.
+   Acknowledgments and telemetry do not each require a reciprocal acknowledgment. Notify the user
+   for meaningful progress, failure, a decision, or completion — never for unchanged state.
 9. **Compact deliberately.** Track Codex context and Claude context separately. Mark Claude's
    compaction **due when its context-used meter reaches about 30%** (used, not remaining; the
    Claude Code footer shows `Ctx Used: NN%`); run it at the next safe checkpoint and **before 40%

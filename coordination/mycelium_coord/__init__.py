@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from . import model
 from .coord import Coordinator
+from .execution import ExecutionManager, EXEC_SCHEMA_VERSION, PHASES as EXEC_PHASES, STATUSES as EXEC_STATUSES
 from .model import (
     KINDS,
     RECIPIENT_ALL,
@@ -26,7 +27,8 @@ from .model import (
 from .store import CoordStore, StoreError, valid_id
 
 __all__ = [
-    "Coordinator", "CoordStore", "StoreError", "ProtocolError", "model",
+    "Coordinator", "ExecutionManager", "EXEC_SCHEMA_VERSION", "EXEC_PHASES", "EXEC_STATUSES",
+    "CoordStore", "StoreError", "ProtocolError", "model",
     "KINDS", "ROLES", "STATES", "RECIPIENT_ALL", "SCHEMA_VERSION", "gen_id", "valid_id",
     "STATE_PERSISTED", "STATE_DELIVERED", "STATE_ACKNOWLEDGED",
     "STATE_COMPLETION_CLAIMED", "STATE_COMPLETED",

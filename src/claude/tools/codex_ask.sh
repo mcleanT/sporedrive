@@ -28,6 +28,14 @@
 #                     The read-only sandbox reads any path the user can read (in or out of the repo)
 #                     and denies all writes; it is not a privacy boundary.
 #   -o  outfile      write codex output to this exact path (else an auto-named temp file)
+#   -t  seconds      hard elapsed deadline for an OWNED codex process group (routes through the
+#                    adjacent codex_launch.py launcher). On expiry the owned group is gracefully then
+#                    forcibly terminated and the run reports timed_out (rc=124, complete:false); the
+#                    remote inference is NOT proven stopped and is never auto-relaunched. Omit for the
+#                    ordinary inline (no-deadline) path, which is byte-identical to before.
+#   -x  exec_ref     managed execution id/reference recorded in the receipt (ties a review launch to
+#                    an execution record). Additive; does not change output/stdout/exit contracts.
+#   -a  action_ref   reserved action id recorded in the receipt (the reservation this launch settles).
 #   -n  dry-run      assemble and print the prompt only; do NOT call codex
 # Env: CODEX_ASK_OUTDIR overrides the temp dir for prompt/output files.
 # Output: codex's stdout AND stderr are merged into the output file (BYTE-IDENTICAL to before this
@@ -75,9 +83,12 @@ OUTFILE=""
 FILES=()
 OUTDIR="${CODEX_ASK_OUTDIR:-${TMPDIR:-/tmp}}"
 OUTDIR="${OUTDIR%/}"
+DEADLINE=""
+EXECUTION_REF=""
+ACTION_REF=""
 
 usage() {
-  echo 'Usage: codex_ask [-m MODEL] [-e low|medium|high|xhigh|ultra|max] [-f FILE]... [-o OUTFILE] [-n] "QUESTION"' >&2
+  echo 'Usage: codex_ask [-m MODEL] [-e low|medium|high|xhigh|ultra|max] [-f FILE]... [-o OUTFILE] [-t SECONDS] [-x EXEC_REF] [-a ACTION_REF] [-n] "QUESTION"' >&2
   exit 64
 }
 
@@ -130,7 +141,7 @@ extract_identity_from_text() {
 # distinguish a banner, a warning, echoed prompt/tool-log text, or a short-but-real token like
 # "READY" from an actual answer; only the CLI's own last-message artifact can).
 write_receipt() {
-  local out_file="$1" rc="$2" duration_s="$3" invoked_at="$4" model_req="$5" effort="$6" prompt_file="$7" last_msg_file="$8" fresh_established="${9:-1}"
+  local out_file="$1" rc="$2" duration_s="$3" invoked_at="$4" model_req="$5" effort="$6" prompt_file="$7" last_msg_file="$8" fresh_established="${9:-1}" execution_ref="${10:-}" action_ref="${11:-}"
   local receipt_file="${out_file}.receipt.json"
   local out_size=0 out_nonblank="" parse_status="ok" error_class="" complete="true"
   local -a warnings=()
@@ -237,7 +248,7 @@ write_receipt() {
 
   {
     printf '{\n'
-    printf '  "schema_version": "1.0.0",\n'
+    printf '  "schema_version": "1.1.0",\n'
     printf '  "tool": "codex_ask",\n'
     printf '  "invoked_at": %s,\n' "$(json_str_or_null "$invoked_at")"
     printf '  "exit_code": %s,\n' "$rc"
@@ -246,6 +257,8 @@ write_receipt() {
     printf '  "model_resolved": %s,\n' "$(json_str_or_null "$model_resolved")"
     printf '  "model_served": %s,\n' "$(json_str_or_null "$model_served")"
     printf '  "effort": %s,\n' "$(json_str_or_null "$effort")"
+    printf '  "execution_ref": %s,\n' "$(json_str_or_null "$execution_ref")"
+    printf '  "action_ref": %s,\n' "$(json_str_or_null "$action_ref")"
     printf '  "session_id": %s,\n' "$(json_str_or_null "$session_id")"
     printf '  "artifact_path": %s,\n' "$(json_str_or_null "$out_file")"
     printf '  "prompt_path": %s,\n' "$(json_str_or_null "$prompt_file")"
@@ -259,12 +272,15 @@ write_receipt() {
   } > "$receipt_file"
 }
 
-while getopts ":m:e:f:o:nh" opt; do
+while getopts ":m:e:f:o:t:x:a:nh" opt; do
   case "$opt" in
     m) MODEL="$OPTARG" ;;
     e) EFFORT="$OPTARG" ;;
     f) FILES+=("$OPTARG") ;;
     o) OUTFILE="$OPTARG" ;;
+    t) DEADLINE="$OPTARG" ;;
+    x) EXECUTION_REF="$OPTARG" ;;
+    a) ACTION_REF="$OPTARG" ;;
     n) DRY_RUN=1 ;;
     h) usage ;;
     \?) echo "Unknown option -$OPTARG" >&2; usage ;;
@@ -335,6 +351,23 @@ else
   OUT_FILE="$(mktemp "${OUTDIR}/codex_${SLUG:-ask}.XXXXXX.txt")"
 fi
 
+# --- Resolve the owned-process launcher when a deadline is requested (symlink-safe) -------------
+LAUNCHER=""
+if [ -n "$DEADLINE" ]; then
+  case "$DEADLINE" in
+    ''|*[!0-9.]*) echo "[codex_ask] -t deadline must be numeric seconds" >&2; exit 64 ;;
+  esac
+  _src="${BASH_SOURCE[0]}"
+  while [ -h "$_src" ]; do
+    _dir="$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)"
+    _src="$(readlink "$_src")"
+    [ "${_src#/}" = "$_src" ] && _src="$_dir/$_src"   # relative link target -> anchor to its dir
+  done
+  _scriptdir="$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)"
+  LAUNCHER="$_scriptdir/codex_launch.py"
+  [ -f "$LAUNCHER" ] || { echo "[codex_ask] -t requested but launcher not found at $LAUNCHER" >&2; exit 70; }
+fi
+
 # --- Invoke codex: prompt via stdin, output DIRECT to file (no tail/head pipe) ---
 # LAST_MSG_FILE: a CHECKED, UNIQUE per-invocation artifact for codex's own -o/--output-last-message
 # flag (confirmed supported: `codex exec --help` lists "-o, --output-last-message <FILE>"). Created
@@ -361,12 +394,20 @@ SECONDS=0
 CODEX_ARGS=(exec --sandbox read-only -m "$MODEL" -c model_reasoning_effort="$EFFORT")
 [ -n "$LAST_MSG_FILE" ] && CODEX_ARGS+=(-o "$LAST_MSG_FILE")
 CODEX_ARGS+=(-)
-cat "$PROMPT_FILE" | codex "${CODEX_ARGS[@]}" > "$OUT_FILE" 2>&1
-RC=$?
+if [ -n "$DEADLINE" ]; then
+  # Owned-process deadline path: the launcher writes OUT_FILE itself, owns codex in its own process
+  # group, and returns 124 on deadline (the same code the receipt classifies as timeout/incomplete).
+  cat "$PROMPT_FILE" | python3 "$LAUNCHER" --deadline "$DEADLINE" --out "$OUT_FILE" -- codex "${CODEX_ARGS[@]}"
+  RC=$?
+else
+  # Ordinary inline path — byte-identical to the pre-deadline contract.
+  cat "$PROMPT_FILE" | codex "${CODEX_ARGS[@]}" > "$OUT_FILE" 2>&1
+  RC=$?
+fi
 DURATION_S="$SECONDS"
 
 # --- Adjacent structured JSON result receipt (additive-only; see header comment) ----------------
-write_receipt "$OUT_FILE" "$RC" "$DURATION_S" "$INVOKED_AT" "$MODEL" "$EFFORT" "$PROMPT_FILE" "$LAST_MSG_FILE" "$FRESH_ARTIFACT" 2>/dev/null \
+write_receipt "$OUT_FILE" "$RC" "$DURATION_S" "$INVOKED_AT" "$MODEL" "$EFFORT" "$PROMPT_FILE" "$LAST_MSG_FILE" "$FRESH_ARTIFACT" "$EXECUTION_REF" "$ACTION_REF" 2>/dev/null \
   || echo "[codex_ask] warning: failed to write result receipt (non-fatal, raw output at ${OUT_FILE} is unaffected)" >&2
 
 echo "$OUT_FILE"

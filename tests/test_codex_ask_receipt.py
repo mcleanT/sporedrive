@@ -314,3 +314,56 @@ def test_stale_derived_artifact_never_trusted_when_output_dir_readonly(tmp_path)
     assert receipt["error_class"] is not None
     # The stale predictable-path artifact is preserved untouched — never consulted, never removed.
     assert stale.read_text() == "OLD ANSWER FROM A PRIOR RUN"
+
+
+def test_deadline_times_out_via_owned_launcher(tmp_path):
+    """codex_ask.sh -t routes through the owned-process launcher (codex_launch.py), which owns the
+    codex process group and enforces a hard deadline. A slow run is terminated and reported
+    timed_out (rc=124, complete:false) even with partial raw output; -x/-a are recorded."""
+    out_file = tmp_path / "out.txt"
+    env = dict(os.environ)
+    env["PATH"] = f"{FAKE_CODEX_DIR}:{env.get('PATH', '')}"
+    env["FAKE_CODEX_SCENARIO"] = "slow"
+    env["CODEX_ASK_OUTDIR"] = str(tmp_path)
+    args = [
+        "bash", str(WRAPPER), "-o", str(out_file),
+        "-t", "1", "-x", "exec-XYZ", "-a", "act-1", "slow fixture question",
+    ]
+    proc = subprocess.run(args, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=30)
+    receipt_file = out_file.with_name(out_file.name + ".receipt.json")
+    receipt = json.loads(receipt_file.read_text())
+    assert proc.returncode == 124
+    assert receipt["exit_code"] == 124
+    assert receipt["parse_status"] == "timeout"
+    assert receipt["error_class"] == "timeout"
+    assert receipt["complete"] is False
+    assert receipt["execution_ref"] == "exec-XYZ"
+    assert receipt["action_ref"] == "act-1"
+    raw = out_file.read_text()
+    assert "starting a long review" in raw          # partial raw output preserved
+    assert "deadline of" in raw                       # launcher's explicit deadline marker
+    assert proc.stdout.strip() == str(out_file)       # stdout contract: only the output path
+
+
+def test_execution_and_action_refs_default_null_and_schema_bumped(tmp_path):
+    """Without -x/-a the receipt records nulls, and the additive fields bump the schema minor."""
+    proc, out_file, receipt = run_wrapper(tmp_path, "success")
+    assert receipt["execution_ref"] is None
+    assert receipt["action_ref"] is None
+    assert receipt["schema_version"] == "1.1.0"
+
+
+def test_deadline_path_success_is_still_complete(tmp_path):
+    """A fast run UNDER the deadline still classifies exactly like the inline path (rc 0, complete)."""
+    out_file = tmp_path / "out.txt"
+    env = dict(os.environ)
+    env["PATH"] = f"{FAKE_CODEX_DIR}:{env.get('PATH', '')}"
+    env["FAKE_CODEX_SCENARIO"] = "success"
+    env["CODEX_ASK_OUTDIR"] = str(tmp_path)
+    args = ["bash", str(WRAPPER), "-o", str(out_file), "-t", "20", "fast fixture question"]
+    proc = subprocess.run(args, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=30)
+    receipt = json.loads((out_file.with_name(out_file.name + ".receipt.json")).read_text())
+    assert proc.returncode == 0
+    assert receipt["parse_status"] == "ok"
+    assert receipt["complete"] is True
+    assert receipt["final_artifact"] is not None

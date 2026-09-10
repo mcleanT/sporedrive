@@ -1,0 +1,20 @@
+{
+  "policy_version": 1,
+  "description": "Maintained, versioned SporeDrive execution-policy defaults. These limits seed a managed task's execution record. A brief may LOWER a limit; raising an initial limit, extending it later, or unpausing requires the user-authorization-linked change path (change_limits with an authorization_ref) and is never a value a supervisor can compose for itself. See PLAN.md sections 1-2 and Fable finding F2.",
+  "defaults": {
+    "work_dispatches": 4,
+    "review_launches": 2,
+    "review_deadline_seconds": 900,
+    "expires_at": null,
+    "technical_calls": null,
+    "acceptance_calls": null
+  },
+  "notes": {
+    "work_dispatches": "Ordinary-task default: initial brief, one review, one repair brief, one repair verification. Every work-producing dispatch (including documentation/provenance) consumes it.",
+    "review_launches": "Primary review plus one repair verification. A review launch consumes BOTH this and the shared work_dispatches allowance.",
+    "review_deadline_seconds": "Hard elapsed limit per owned read-only reviewer process (owned CLI). Desktop active-review time is advisory only.",
+    "expires_at": "Explicit timestamp for unattended execution; null when attended. A finite value is required for any unattended/automation-driven task.",
+    "technical_calls": "Task-specific technical-debug adapter allowance, or null when the task has no model-call adapter.",
+    "acceptance_calls": "Task-specific frozen-acceptance adapter allowance, or null when not applicable."
+  }
+}

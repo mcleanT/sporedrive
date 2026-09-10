@@ -15,6 +15,29 @@ A methodology for autonomous, metric-driven prompt optimization using iterative 
 - You want to optimize for cost while maintaining quality
 - You have (or can create) test cases to evaluate against
 
+## Operating mode: this is the computational-optimization entrypoint
+
+This skill implements one of three distinct operating modes, and the difference matters
+because each carries different stopping rules:
+
+- **Ordinary design discussion** (a prompt-wording debate with no automated loop) — one
+  defined question, one critique round, one synthesis by default; unresolved disagreement
+  is preserved rather than forced to consensus. Do not run this skill's loop for that; just
+  discuss and edit.
+- **Computational optimization — this skill.** Before the run, fix the objective (the
+  composite score), the maximum calls/iterations, an elapsed-time window, what counts as
+  practical improvement, and the stagnation/patience rule (Phase 6/7 below: consecutive-reject
+  escalation, then stop). These are task-specific numbers sized to the corpus and budget, not
+  a universal convergence constant — do not silently reuse another project's `--max-iterations`
+  or reject thresholds. Changing the objective, test corpus or executing model mid-run does not
+  implicitly reset the consumed allowance; treat that as a new run. At the limit, return the
+  high-water-mark candidate plus its known limitations — not a claim of convergence.
+- **Scientific protocols** (ratified minimum rounds, fixed role assignments, held-out
+  separation, defined interventions, required reporting) — this skill's loop is not that
+  either. If the prompt under optimization feeds a scientific pipeline with its own ratified
+  review/round requirements, honor that contract on top of this loop; do not let this skill's
+  reject/patience counters substitute for a required scientific round.
+
 ## Core Architecture: The Three-File Pattern
 
 Every prompt optimization project uses three files:

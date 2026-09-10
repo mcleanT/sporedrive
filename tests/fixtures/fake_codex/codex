@@ -209,6 +209,15 @@ EOF
     write_final 'READY'
     exit 0
     ;;
+  slow)
+    # Starts, emits a little partial output, then hangs well past any short deadline. Exercises
+    # codex_ask.sh's -t owned-process deadline (codex_launch.py) end to end: the launcher must
+    # terminate this owned process group and report rc=124/timeout. No -o artifact is ever written.
+    printf 'codex response: starting a long review that will not finish in time'
+    sleep 30
+    write_final 'this should never be written; the deadline fires first'
+    exit 0
+    ;;
   *)
     echo "fake codex stub: unknown FAKE_CODEX_SCENARIO=${FAKE_CODEX_SCENARIO}" >&2
     exit 99

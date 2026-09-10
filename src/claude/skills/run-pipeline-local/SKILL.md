@@ -30,6 +30,25 @@ This is a **hard execution contract**. Every stage listed here MUST execute unle
 
 **2026-09-08 restructure note**: the full execution contract (dispatch cards, gates, ratified model table) previously lived inline in this file below the interview. It has been relocated verbatim into `refs/` — see the Loading Checklist below — so this entrypoint stays a lean router. Nothing was deleted; see "Gate-preservation verification" in `.living/` history / the audit report for the grep evidence. Original pre-restructure file preserved at `~/tools/codex-claude-workflow/snapshots/skills-20260908T202743Z/run-pipeline-local/SKILL.md`.
 
+## Operating mode: this is a scientific protocol, not an ordinary review
+
+Three distinct operating modes exist and each has different stopping rules; this pipeline is
+the third one:
+
+- **Ordinary design discussion** — one defined question, one critique round, one synthesis by
+  default. Not what this skill runs.
+- **Computational optimization** — objective, max calls/evaluations, elapsed-time window,
+  improvement criterion and a stagnation/patience rule fixed before the run, sized to the
+  task. Not what this skill runs (see the `prompt-optimizer` skill for that mode).
+- **Scientific protocol — this pipeline.** The ratified minimum rounds, per-stage model
+  assignments, stage gates, validator requirements and held-out/reporting boundaries carried
+  in the Loading Checklist below and its `refs/` files are the mandated content of this mode.
+  **Do not apply an ordinary one-review-then-close software cap to shorten them** — e.g. do
+  not collapse a required analysis round, skip a validator gate, or treat adversarial review
+  (Phase 3.5) as an optional single pass, on the theory that "one review is enough." Any
+  reduction in required rounds/gates needs an explicit, scoped project amendment, not a
+  general review-proportionality default.
+
 ---
 
 ## MODE ROUTER (run this FIRST — before any interview, before any dispatch)

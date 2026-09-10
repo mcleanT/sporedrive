@@ -169,3 +169,81 @@ if __name__ == "__main__":
     for fn in fns:
         fn(); print(f"PASS {fn.__name__}")
     print(f"\nbridge_link adapter: {len(fns)} tests PASS")
+
+
+# ---- execution gate (PLAN section 3 / cases 7 & 12): recheck immediately before send ----
+def _em(co):
+    from mycelium_coord.execution import ExecutionManager
+    em = ExecutionManager(co.store)
+    em.open_execution("t1", execution_id="e1", scope_ref="/s", authorization_ref="/a")
+    return em
+
+
+def test_execution_gate_allows_open_reservation():
+    with tempfile.TemporaryDirectory() as t:
+        co = _mk(t); _fake(status="accepted")
+        bridge_link._read_binding = lambda bid: dict(BINDING_OK)
+        _em(co).reserve("t1", action_id="act1", kind="work_dispatch")
+        r = bridge_link.notify_via_bridge(co, task_id="t1", message_id="m1", binding_id="b1",
+                                          controller_id="ctl", expected_revision=0,
+                                          execution_action_id="act1")
+        assert r["delivered"] and r["state"] == "delivered"
+
+
+def test_execution_gate_refuses_paused_before_send():
+    with tempfile.TemporaryDirectory() as t:
+        co = _mk(t); spy = {"called": False}; _fake(status="accepted", spy=spy)
+        bridge_link._read_binding = lambda bid: dict(BINDING_OK)
+        em = _em(co)
+        em.reserve("t1", action_id="act1", kind="work_dispatch")
+        em.pause("t1", authorization_ref="/a")   # a newer pause after the reservation
+        r = bridge_link.notify_via_bridge(co, task_id="t1", message_id="m1", binding_id="b1",
+                                          controller_id="ctl", expected_revision=0,
+                                          execution_action_id="act1")
+        assert r["state"] == "refused_by_execution_gate"
+        assert r["reason"] == "execution_paused"
+        assert spy["called"] is False                      # nothing was dispatched
+        assert co.message_state("t1", "cl", "m1") != "delivered"
+
+
+def test_execution_gate_refuses_stale_settled_reservation():
+    with tempfile.TemporaryDirectory() as t:
+        co = _mk(t); spy = {"called": False}; _fake(status="accepted", spy=spy)
+        bridge_link._read_binding = lambda bid: dict(BINDING_OK)
+        em = _em(co)
+        em.reserve("t1", action_id="act1", kind="work_dispatch")
+        em.settle("t1", action_id="act1", outcome="success")  # already reconciled -> stale for dispatch
+        r = bridge_link.notify_via_bridge(co, task_id="t1", message_id="m1", binding_id="b1",
+                                          controller_id="ctl", expected_revision=0,
+                                          execution_action_id="act1")
+        assert r["state"] == "refused_by_execution_gate"
+        assert r["reason"] == "reservation_not_open"
+        assert spy["called"] is False
+
+
+def test_execution_gate_refuses_expired_before_send():
+    with tempfile.TemporaryDirectory() as t:
+        co = _mk(t); spy = {"called": False}; _fake(status="accepted", spy=spy)
+        bridge_link._read_binding = lambda bid: dict(BINDING_OK)
+        from mycelium_coord.execution import ExecutionManager
+        em = ExecutionManager(co.store)
+        em.open_execution("t1", execution_id="e1", scope_ref="/s", authorization_ref="/a",
+                          expires_at="2000-01-01T00:00:00+00:00")
+        # cannot reserve on an expired execution; the gate must still refuse the dispatch outright
+        r = bridge_link.notify_via_bridge(co, task_id="t1", message_id="m1", binding_id="b1",
+                                          controller_id="ctl", expected_revision=0,
+                                          execution_action_id="act1")
+        assert r["state"] == "refused_by_execution_gate"
+        assert r["reason"] == "execution_expired"
+        assert spy["called"] is False
+
+
+def test_unmanaged_notify_ignores_execution_gate():
+    """A notify WITHOUT an execution_action_id is unmanaged transport and is unaffected by the gate
+    (message delivery state stays separate from execution permission)."""
+    with tempfile.TemporaryDirectory() as t:
+        co = _mk(t); _fake(status="accepted")
+        bridge_link._read_binding = lambda bid: dict(BINDING_OK)
+        r = bridge_link.notify_via_bridge(co, task_id="t1", message_id="m1", binding_id="b1",
+                                          controller_id="ctl", expected_revision=0)
+        assert r["delivered"] and r["state"] == "delivered"
