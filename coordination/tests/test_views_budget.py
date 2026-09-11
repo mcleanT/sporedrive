@@ -23,7 +23,7 @@ def test_fit_batch_keeps_leading_items_and_flags_truncation():
     assert out["truncated"] is True and out["omitted"] == 40 - out["returned"]
     assert 0 < out["returned"] < 40
     assert out["next_cursor"] == out["items"][-1]["job_id"]
-    assert views.encoded_size(out["items"]) <= 4096 - 256
+    assert views.encoded_size(out) <= 4096  # the whole response, as emitted
     small = views.fit_batch(items[:3], budget=4096, cursor_key="job_id")
     assert small == {"items": items[:3], "returned": 3, "omitted": 0, "truncated": False,
                      "next_cursor": None, "budget_bytes": 4096}
@@ -53,11 +53,41 @@ def test_shrink_tails_trims_inline_text_keeps_references_and_flags():
     assert fits["truncated"] is False
 
 
-def test_shrink_tails_reports_over_budget_when_nothing_trimmable_remains():
-    rec = {"job_id": "j", "reason": "r" * 5000}
+def test_shrink_trims_long_metadata_with_a_marker_and_never_references():
+    rec = {"job_id": "j" * 100, "reason": "r" * 5000, "stdout_sha256": "s" * 64}
     out = views.shrink_tails(rec, budget=512)
-    assert out["truncated"] is True and out["over_budget"] is True
-    assert out["reason"] == rec["reason"]  # non-tail fields are never silently cut
+    assert views.encoded_size(out) <= 512 and out["truncated"] is True
+    assert out["reason_truncated"] is True and out["reason"].startswith("rrr") and len(out["reason"]) < 5000
+    assert out["job_id"] == rec["job_id"] and out["stdout_sha256"] == rec["stdout_sha256"]
+    assert out["truncation"]["trimmed_fields"] == ["reason"] and "over_budget" not in out
+    hopeless = views.shrink_tails({"job_id": "j" * 2000}, budget=512)
+    assert hopeless["over_budget"] is True and hopeless["job_id"] == "j" * 2000  # never silently cut
+
+
+def test_read_bounded_pages_cut_on_character_boundaries_and_fit_a_wire_budget(tmp_path):
+    p = tmp_path / "cjk.log"
+    data = ("\u754c" * 2000).encode("utf-8")
+    p.write_bytes(data)
+    got, offset, pages = "", 0, 0
+    while offset is not None:
+        chunk = views.read_bounded(p, offset=offset, limit=4096)
+        assert chunk["returned"] % 3 == 0 and chunk["lossy"] is False
+        got += chunk["text"]
+        offset = chunk["next_offset"]
+        pages += 1
+    assert got == "\u754c" * 2000 and pages == 2
+    fitted = views.read_bounded(p, offset=0, limit=4096, budget=4096,
+                                envelope={"job_id": "cjk", "stream": "stdout"})
+    assert views.encoded_size(fitted) <= 4096 and fitted["job_id"] == "cjk" and fitted["lossy"] is False
+    assert 0 < fitted["returned"] < 4096 and fitted["next_offset"] == fitted["returned"]
+    tail = views.read_bounded(p, limit=4, tail=True)
+    assert tail["text"] == "\u754c" and tail["offset"] == len(data) - 3 and tail["lossy"] is False
+    odd = views.read_bounded(p, offset=1, limit=6)
+    assert odd["lossy"] is True and odd["returned"] == 5
+    binary = tmp_path / "bin.log"
+    binary.write_bytes(b"\xff\xfe" * 10)
+    b = views.read_bounded(binary)
+    assert b["lossy"] is True and b["truncated"] is False
 
 
 def test_read_bounded_offset_limit_tail_and_full_retrieval(tmp_path):

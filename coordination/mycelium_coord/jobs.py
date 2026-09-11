@@ -34,7 +34,7 @@ from pathlib import Path
 from .execution import ExecutionManager
 from .model import ProtocolError, utcnow
 from .store import CoordStore, StoreError, require_id, valid_id
-from .views import BATCH_BUDGET_BYTES, execution_view, fit_batch, read_bounded, stops_wait
+from .views import encoded_size, BATCH_BUDGET_BYTES, execution_view, fit_batch, read_bounded, stops_wait
 
 JOB_SCHEMA_VERSION = "1.0.0"
 JOIN_MAX_S = 50.0
@@ -57,9 +57,9 @@ STATUS_UNKNOWN = "unknown"        # supervisor failed to record an outcome
 TERMINAL = frozenset({STATUS_EXITED, STATUS_TIMED_OUT, STATUS_CANCELLED, STATUS_STOPPED,
                       STATUS_REFUSED, STATUS_UNKNOWN})
 
-_STATUS_FIELDS = ("job_id", "status", "effective_status", "state_version", "exit_code", "signal",
+_STATUS_FIELDS = ("job_id", "status", "effective_status", "state_version", "exit_code", "signal", "cleanup",
                   "reason", "started_at", "ended_at", "elapsed_s", "deadline_s", "task_id",
-                  "action_id", "label", "supervisor_alive", "pid")
+                  "action_id", "label", "supervisor_alive", "pid", "recorded_pid_alive")
 _LIST_FIELDS = ("job_id", "status", "effective_status", "exit_code", "started_at", "ended_at",
                 "task_id", "action_id", "label", "command")
 
@@ -84,6 +84,65 @@ def _pid_alive(pid) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _proc_start(pid):
+    """The kernel's start time of ``pid`` as ``ps`` prints it: ownership evidence recorded at launch
+    and re-read before any recovery signal, so a recycled pid is never mistaken for the owned child.
+    None when unavailable (then recovery refuses to signal)."""
+    try:
+        r = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))], capture_output=True,
+                           text=True, timeout=5)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    s = r.stdout.strip()
+    return s or None
+
+
+def _group_alive(pgid) -> bool:
+    try:
+        os.killpg(int(pgid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_group_empty(pgid: int, timeout_s: float, *, proc=None) -> bool:
+    """Wait (bounded) until nothing is left in the group; the leader is reaped first when this
+    process owns it, so a zombie never keeps the group looking alive."""
+    end = _now_s() + max(0.0, float(timeout_s))
+    while True:
+        if proc is not None:
+            proc.poll()
+        if (proc is None or proc.returncode is not None) and not _group_alive(pgid):
+            return True
+        if _now_s() >= end:
+            return False
+        time.sleep(0.05)
+
+
+def _terminate_group(pgid: int, *, proc=None, grace_s: float = GRACE_S) -> dict:
+    """Bounded, escalating termination of ONE process group this wrapper created: SIGTERM, wait up
+    to ``grace_s`` for the leader to exit AND the whole group to empty, else SIGKILL the group and
+    wait again. Reports what actually happened: ``group_empty`` False means owned work may still be
+    alive and no caller may claim otherwise."""
+    cleanup = {"pgid": int(pgid), "signals": [], "escalated": False, "group_empty": False}
+    for name in ("SIGTERM", "SIGKILL"):
+        cleanup["escalated"] = name == "SIGKILL"
+        try:
+            os.killpg(int(pgid), getattr(signal, name))
+            cleanup["signals"].append(name)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            cleanup["error"] = "permission_denied"
+            break
+        if _wait_group_empty(int(pgid), grace_s, proc=proc):
+            cleanup["group_empty"] = True
+            break
+    return cleanup
 
 
 def _sha256(path: Path):
@@ -165,6 +224,8 @@ class JobManager:
         elif not alive:
             out["effective_status"] = STATUS_UNKNOWN
             out["reason"] = out.get("reason") or "supervisor_gone"
+            if st.get("pid"):
+                out["recorded_pid_alive"] = _pid_alive(st.get("pid"))
         else:
             out["effective_status"] = status
         out["terminal"] = out["effective_status"] in TERMINAL
@@ -230,25 +291,33 @@ class JobManager:
                 count_limited = True
                 break
             rows.append(row)
-        fitted = fit_batch(rows, budget=budget, cursor_key="job_id")
-        truncated = fitted["truncated"] or count_limited
-        next_cursor = fitted["next_cursor"]
-        if truncated and next_cursor is None and fitted["items"]:
-            next_cursor = fitted["items"][-1].get("job_id")
-        return {"jobs": fitted["items"], "returned": fitted["returned"],
-                "omitted": fitted["omitted"] if fitted["truncated"] else (None if count_limited else 0),
-                "truncated": truncated, "next_cursor": next_cursor, "budget_bytes": budget}
+        out = fit_batch(rows, budget=budget, cursor_key="job_id", envelope={}, items_key="jobs")
+        if count_limited:
+            out["truncated"] = True
+            if not out["omitted"]:
+                out["omitted"] = None  # the remainder was not read
+            if out["next_cursor"] is None and out["jobs"]:
+                out["next_cursor"] = out["jobs"][-1].get("job_id")
+        while encoded_size(out) > budget and len(out["jobs"]) > 1:  # the real envelope, on the wire
+            out["jobs"].pop()
+            out.update({"returned": len(out["jobs"]), "omitted": (out["omitted"] or 0) + 1,
+                        "truncated": True, "next_cursor": out["jobs"][-1].get("job_id")})
+        return out
 
     def output(self, job_id: str, *, stream: str = "stdout", offset: int = 0,
-               limit: int = BATCH_BUDGET_BYTES, tail: bool = False) -> dict:
-        """Bounded selected retrieval of retained output; the full file stays on disk."""
+               limit: int = BATCH_BUDGET_BYTES, tail: bool = False,
+               budget: int = BATCH_BUDGET_BYTES) -> dict:
+        """Bounded selected retrieval of retained output; the full file stays on disk. ``limit``
+        caps the raw bytes read (<= 64 KiB); ``budget`` (default 4 KB; 0 = only the raw limit
+        applies, for an explicit larger evidence read) caps the serialized RESPONSE, so what
+        reaches the caller is bounded, not merely what was read. Pages are cut on character
+        boundaries and concatenate losslessly."""
         self._require(job_id)
         _req(stream in ("stdout", "stderr", "supervisor"), "invalid_job",
              "stream must be stdout | stderr | supervisor")
         p = self._dir(job_id) / f"{stream}.log"
-        res = read_bounded(p, offset=offset, limit=limit, tail=tail)
-        res.update({"job_id": job_id, "stream": stream})
-        return res
+        return read_bounded(p, offset=offset, limit=limit, tail=tail, budget=budget or None,
+                            envelope={"job_id": job_id, "stream": stream})
 
     # ------------------------------------------------------------------ run (CLI-only)
     def run(self, job_id: str, argv: list, *, cwd=None, deadline_s: float = DEFAULT_DEADLINE_S,
@@ -419,35 +488,92 @@ class JobManager:
             time.sleep(min(JOIN_POLL_S, max(0.0, deadline - time.monotonic())))
 
     # ------------------------------------------------------------------ cancel (CLI-only)
+    def _owned_group(self, st: dict) -> dict:
+        """Current ownership evidence for the recorded child of a job whose supervisor is gone: the
+        pid must be alive, still lead the process group this wrapper created for it, and carry the
+        same start time recorded at launch. Bare recorded numbers are never enough on their own."""
+        pid, pgid, recorded = st.get("pid"), st.get("pgid"), st.get("pid_start")
+        ev = {"pid": pid, "pgid": pgid, "recorded_start": recorded, "current_start": None,
+              "alive": False, "owned": False, "why": None}
+        if not pid or not pgid:
+            ev["why"] = "no_process_recorded"
+            return ev
+        if not _pid_alive(pid):
+            ev["why"] = "process_absent"
+            return ev
+        ev["alive"] = True
+        try:
+            if os.getpgid(int(pid)) != int(pgid):
+                ev["why"] = "pgid_mismatch"
+                return ev
+        except OSError:
+            ev["alive"], ev["why"] = False, "process_absent"
+            return ev
+        if not recorded:
+            ev["why"] = "no_start_time_recorded"
+            return ev
+        ev["current_start"] = _proc_start(pid)
+        if ev["current_start"] != recorded:
+            ev["why"] = "start_time_mismatch"
+            return ev
+        ev["owned"] = True
+        return ev
+
+    def _finalize(self, job_id: str, st: dict, update: dict) -> dict:
+        """Record a terminal outcome for a job whose supervisor can no longer do so (under the job
+        lock; a record that became terminal meanwhile is never overwritten)."""
+        with self.store.lock(self._lock_name(job_id)):
+            cur = self.read_status(job_id) or dict(st)
+            if cur.get("status") in TERMINAL:
+                return cur
+            cur.update(update)
+            cur["ended_at"] = cur.get("ended_at") or utcnow()
+            cur["state_version"] = int(cur.get("state_version", 0)) + 1
+            self._write_status(job_id, cur)
+            return cur
+
     def cancel(self, job_id: str, *, reason: str = "cancel_requested") -> dict:
-        """Ask the owning supervisor to terminate ITS child. If the supervisor is gone but the
-        recorded process group (created by this wrapper) still exists, signal that group."""
+        """Ask the owning supervisor to terminate ITS child (``requested`` = recorded for the
+        supervisor to act on; join to see the outcome). When the supervisor is gone, recover with
+        identity-checked, bounded cleanup of the process group this wrapper created and report the
+        real outcome: ``cancelled`` is True only once that group is confirmed empty."""
         req, st = self._require(job_id)
         eff = self._effective(req, st)
-        if eff["terminal"]:
-            return {"job_id": job_id, "cancelled": False, "status": eff["effective_status"],
-                    "reason": "already_terminal"}
+        stored = st.get("status")
+        if stored in TERMINAL:
+            return {"job_id": job_id, "cancelled": False, "status": stored, "reason": "already_terminal"}
         self.store.write(self._rel(job_id, "cancel.json"), {"requested_at": utcnow(), "reason": reason,
                                                             "by_pid": os.getpid()})
         if eff["supervisor_alive"]:
-            return {"job_id": job_id, "cancelled": True, "status": eff["effective_status"],
-                    "reason": "cancel_requested_via_supervisor"}
-        pgid = st.get("pgid")
-        pid = st.get("pid")
-        if pid and pgid and _pid_alive(pid):
-            try:
-                if os.getpgid(int(pid)) == int(pgid):
-                    os.killpg(int(pgid), signal.SIGTERM)
-            except OSError:
-                pass
-        with self.store.lock(self._lock_name(job_id)):
-            st = self.read_status(job_id) or st
-            if st.get("status") not in TERMINAL:
-                st.update({"status": STATUS_CANCELLED, "reason": "cancelled_after_supervisor_gone",
-                           "ended_at": utcnow(), "state_version": int(st.get("state_version", 0)) + 1})
-                self._write_status(job_id, st)
-        return {"job_id": job_id, "cancelled": True, "status": STATUS_CANCELLED,
-                "reason": "cancelled_after_supervisor_gone"}
+            return {"job_id": job_id, "cancelled": False, "requested": True,
+                    "status": eff["effective_status"], "reason": "cancel_requested_via_supervisor"}
+        if not st.get("supervisor_pid"):
+            return {"job_id": job_id, "cancelled": False, "requested": True,
+                    "status": eff["effective_status"],
+                    "reason": "cancel_recorded_before_supervisor_start"}
+        ev = self._owned_group(st)
+        out = {"job_id": job_id, "ownership": ev}
+        if ev["owned"]:
+            cleanup = _terminate_group(int(st["pgid"]))
+            if cleanup["group_empty"]:
+                rec = self._finalize(job_id, st, {"status": STATUS_CANCELLED,
+                                                  "reason": "cancelled_after_supervisor_gone",
+                                                  "cleanup": cleanup})
+                out.update({"cancelled": rec.get("status") == STATUS_CANCELLED, "status": rec.get("status"),
+                            "reason": rec.get("reason"), "cleanup": cleanup})
+            else:
+                out.update({"cancelled": False, "status": STATUS_UNKNOWN,
+                            "reason": "owned_group_not_confirmed_dead", "cleanup": cleanup})
+            return out
+        if ev["why"] in ("process_absent", "pgid_mismatch", "start_time_mismatch", "no_process_recorded"):
+            # the owned process is gone (a mismatch means the pid now belongs to something else)
+            rec = self._finalize(job_id, st, {"status": STATUS_UNKNOWN,
+                                              "reason": f"supervisor_gone_child_absent:{ev['why']}"})
+            out.update({"cancelled": False, "status": rec.get("status"), "reason": rec.get("reason")})
+            return out
+        out.update({"cancelled": False, "status": STATUS_UNKNOWN,
+                    "reason": f"ownership_unverifiable:{ev['why']}"})
+        return out
 
 
 def _shrink(record: dict, budget: int) -> dict:
@@ -483,6 +609,10 @@ def _supervise(job_id: str) -> int:
             bump({"status": STATUS_REFUSED, "reason": "execution_gate_at_launch:" + str(gate.get("reason")),
                   "gate_at_launch": gate, "ended_at": utcnow()})
             return 3
+        if store.exists(jm._rel(job_id, "cancel.json")):
+            bump({"status": STATUS_CANCELLED, "reason": "cancelled_before_launch",
+                  "gate_at_launch": gate, "ended_at": utcnow()})
+            return 0
         d = jm._dir(job_id)
         env = dict(os.environ)
         env["MYCELIUM_JOB_ID"] = job_id
@@ -506,10 +636,10 @@ def _supervise(job_id: str) -> int:
         finally:
             out_f.close()
             err_f.close()
-        bump({"status": STATUS_RUNNING, "pid": proc.pid, "pgid": proc.pid, "started_at": _iso(started),
-              "gate_at_launch": gate, "reason": None})
+        bump({"status": STATUS_RUNNING, "pid": proc.pid, "pgid": proc.pid, "pid_start": _proc_start(proc.pid),
+              "started_at": _iso(started), "gate_at_launch": gate, "reason": None})
         deadline = started + float(req["deadline_s"])
-        outcome, reason, sig = None, None, None
+        outcome, reason, cleanup = None, None, None
         last_exec_check = 0.0
         while True:
             try:
@@ -521,11 +651,11 @@ def _supervise(job_id: str) -> int:
             now = _now_s()
             if now >= deadline:
                 outcome, reason = STATUS_TIMED_OUT, f"deadline_{req['deadline_s']}s_exceeded"
-                sig = _terminate(proc)
+                cleanup = _terminate_group(proc.pid, proc=proc)
                 break
             if store.exists(jm._rel(job_id, "cancel.json")):
                 outcome, reason = STATUS_CANCELLED, "cancel_requested"
-                sig = _terminate(proc)
+                cleanup = _terminate_group(proc.pid, proc=proc)
                 break
             if req.get("on_stop") == "cancel" and req.get("task_id") and now - last_exec_check >= 2.0:
                 last_exec_check = now
@@ -533,14 +663,16 @@ def _supervise(job_id: str) -> int:
                 if stops_wait(ex_view):
                     outcome = STATUS_STOPPED
                     reason = "task_expired" if ex_view.get("expired") else "task_" + str(ex_view.get("status"))
-                    sig = _terminate(proc)
+                    cleanup = _terminate_group(proc.pid, proc=proc)
                     break
         ended = _now_s()
         rc = proc.returncode
         exit_code = rc if (rc is not None and rc >= 0) else None
-        if rc is not None and rc < 0:
-            sig = -rc
-        bump({"status": outcome, "exit_code": exit_code, "signal": sig, "reason": reason,
+        sig = -rc if (rc is not None and rc < 0) else None
+        if cleanup is None:  # exited on its own: still report whether it left anything in its group
+            cleanup = {"pgid": proc.pid, "signals": [], "escalated": False,
+                       "group_empty": not _group_alive(proc.pid)}
+        bump({"status": outcome, "exit_code": exit_code, "signal": sig, "reason": reason, "cleanup": cleanup,
               "ended_at": _iso(ended), "elapsed_s": round(ended - started, 3),
               "stdout_bytes": _size(d / "stdout.log"), "stderr_bytes": _size(d / "stderr.log"),
               "stdout_sha256": _sha256(d / "stdout.log"), "stderr_sha256": _sha256(d / "stderr.log")})
@@ -552,26 +684,6 @@ def _supervise(job_id: str) -> int:
         except Exception:
             pass
         raise
-
-
-def _terminate(proc: subprocess.Popen):
-    """SIGTERM the child's own process group (created by this wrapper), then SIGKILL after a grace
-    period. Returns the signal that ended it, or None if it exited on its own meanwhile."""
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return None
-    try:
-        proc.wait(timeout=GRACE_S)
-        return signal.SIGTERM if proc.returncode is not None and proc.returncode < 0 else None
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return None
-    proc.wait(timeout=GRACE_S)
-    return signal.SIGKILL
 
 
 def main(argv=None) -> int:

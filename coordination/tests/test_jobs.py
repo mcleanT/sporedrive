@@ -56,6 +56,18 @@ def _wait_terminal(jm, job_id, timeout=15):
     return jm.join(job_id, timeout_s=timeout)
 
 
+def _wait_until(cond, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while not cond() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return cond()
+
+
+def _wait_running(jm, job_id, timeout=10.0):
+    assert _wait_until(lambda: (jm.read_status(job_id) or {}).get("pid") is not None, timeout)
+    return jm.read_status(job_id)
+
+
 # ---------------------------------------------------------------- the actual CLI path
 def test_cli_run_process_persisted_output_and_bounded_retrieval(tmp_path):
     r = _cli(tmp_path, "job-run", "j1", "--deadline", "20", "--join", "20", "--label", "smoke",
@@ -285,8 +297,9 @@ def test_join_stops_on_paused_execution_and_on_stop_policy_is_honored(tmp_path):
     assert st["status"] == "stopped" and st["reason"] in ("task_paused", "task_draining")
     assert st["signal"] == signal.SIGTERM
     assert jm.read_status("keep")["status"] == "running"
-    c = jm.cancel("keep")
-    assert c["cancelled"] is True and c["reason"] == "cancel_requested_via_supervisor"
+    c = jm.cancel("keep")  # recorded for the supervisor: requested, not yet confirmed
+    assert c["cancelled"] is False and c["requested"] is True
+    assert c["reason"] == "cancel_requested_via_supervisor"
     fin = jm.join("keep", timeout_s=10)  # stop_waiting is set, but a terminal job still reports
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline and jm.read_status("keep")["status"] != "cancelled":
@@ -334,8 +347,11 @@ def test_supervisor_gone_reads_as_unknown_without_rewriting(tmp_path):
     assert (tmp_path / "jobs" / "ghost" / "status.json").read_bytes() == before
     j = jm.join("ghost", timeout_s=5)
     assert j["terminal"] is True and j["effective_status"] == "unknown"
-    c = jm.cancel("ghost")
-    assert c["cancelled"] is False and c["reason"] == "already_terminal"
+    c = jm.cancel("ghost")  # nothing owned is alive: recorded as unknown, never claimed cancelled
+    assert c["cancelled"] is False and c["reason"] == "supervisor_gone_child_absent:process_absent"
+    assert c["ownership"]["owned"] is False and c["ownership"]["why"] == "process_absent"
+    assert jm.read_status("ghost")["status"] == "unknown"
+    assert jm.cancel("ghost")["reason"] == "already_terminal"
 
 
 # ---------------------------------------------------------------- compact evidence (criterion 3)
@@ -410,3 +426,112 @@ def test_mcp_surface_exposes_read_only_routes_and_no_launch():
         ann = getattr(by_name[n], "annotations", None)
         assert ann is not None and ann.readOnlyHint is True
     assert not any(n in by_name for n in ("job_run", "job_cancel", "job_launch", "sched_submit"))
+
+
+# ---------------------------------------------------------------- R3: complete owned-process cleanup
+def test_cancel_recovers_owned_work_after_the_supervisor_is_lost(tmp_path):
+    jm = _jm(tmp_path)
+    jm.run("orphan", [sys.executable, "-c", "import time; time.sleep(60)"], cwd=str(tmp_path),
+           deadline_s=60)
+    st = _wait_running(jm, "orphan")
+    sup, child = st["supervisor_pid"], st["pid"]
+    assert st["pid_start"] and st["pgid"] == child
+    os.kill(sup, signal.SIGKILL)  # lose ONLY this fixture's supervisor; its child keeps running
+    try:
+        os.waitpid(sup, 0)
+    except ChildProcessError:
+        pass
+    assert _wait_until(lambda: not jobs._pid_alive(sup))
+    assert jobs._pid_alive(child)
+    view = jm.status("orphan")
+    assert view["effective_status"] == "unknown" and view["recorded_pid_alive"] is True
+    c = jm.cancel("orphan")
+    assert c["ownership"]["owned"] is True and c["ownership"]["current_start"] == st["pid_start"]
+    assert c["cleanup"]["group_empty"] is True and c["cleanup"]["signals"][0] == "SIGTERM"
+    assert c["cancelled"] is True and c["status"] == "cancelled"
+    assert _wait_until(lambda: not jobs._pid_alive(child))
+    st = jm.read_status("orphan")
+    assert st["status"] == "cancelled" and st["reason"] == "cancelled_after_supervisor_gone"
+    assert st["cleanup"]["group_empty"] is True
+    assert jm.cancel("orphan")["reason"] == "already_terminal"
+
+
+def test_deadline_cleanup_escalates_to_kill_a_term_resistant_descendant(tmp_path):
+    marker = tmp_path / "grandchild.pid"
+    child = ("import os, signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+             f"open({str(marker)!r}, 'w').write(str(os.getpid())); time.sleep(60)")
+    parent = f"import subprocess, sys; subprocess.run([sys.executable, '-c', {child!r}])"
+    jm = _jm(tmp_path)
+    rec = jm.run("stubborn", [sys.executable, "-c", parent], cwd=str(tmp_path), deadline_s=1,
+                 join_s=25)
+    assert rec["status"] == "timed_out" and rec["terminal"] is True
+    cl = rec["cleanup"]
+    assert cl["escalated"] is True and cl["signals"] == ["SIGTERM", "SIGKILL"]
+    assert cl["group_empty"] is True
+    gpid = int(marker.read_text())
+    assert _wait_until(lambda: not jobs._pid_alive(gpid))
+
+
+# ---------------------------------------------------------------- R4: bounded on the wire, lossless pages
+def test_non_ascii_output_is_bounded_on_the_wire_and_pages_losslessly(tmp_path):
+    jm = _jm(tmp_path)
+    rec = jm.run("cjk", [sys.executable, "-c",
+                         "import sys; sys.stdout.buffer.write(('\u754c' * 2000).encode('utf-8'))"],
+                 cwd=str(tmp_path), deadline_s=20, join_s=15, tail_bytes=600)
+    assert rec["status"] == "exited" and views.encoded_size(rec) <= views.BATCH_BUDGET_BYTES
+    r = _cli(tmp_path, "job-output", "cjk")  # the real CLI emission at the default budget
+    assert r.returncode == 0 and len(r.stdout.encode()) <= views.BATCH_BUDGET_BYTES
+    page = json.loads(r.stdout)
+    assert page["lossy"] is False and page["truncated"] is True and page["next_offset"] % 3 == 0
+    got, offset, pages = "", 0, 0
+    while offset is not None:
+        r = _cli(tmp_path, "job-output", "cjk", "--offset", str(offset))
+        assert len(r.stdout.encode()) <= views.BATCH_BUDGET_BYTES
+        chunk = json.loads(r.stdout)
+        assert chunk["lossy"] is False
+        got += chunk["text"]
+        offset = chunk["next_offset"]
+        pages += 1
+    assert got == "\u754c" * 2000 and "\ufffd" not in got and pages > 1
+    whole = jm.output("cjk", limit=65536, budget=0)  # an explicit larger evidence read stays available
+    assert whole["text"] == "\u754c" * 2000 and whole["truncated"] is False and whole["lossy"] is False
+    odd = jm.output("cjk", offset=1, limit=30)  # a mid-character offset is reported, never hidden
+    assert odd["lossy"] is True
+    tail = jm.output("cjk", limit=4, tail=True)
+    assert tail["text"] == "\u754c" and tail["returned"] == 3 and tail["lossy"] is False
+
+
+def test_list_and_status_are_bounded_on_the_wire_with_escaped_metadata(tmp_path):
+    jm = _jm(tmp_path)
+    for i in range(30):
+        jid = f"j{i:03d}"
+        jm.store.write(f"jobs/{jid}/request.json", {"job_id": jid, "argv": ["/bin/true"], "cwd": "/",
+                                                    "deadline_s": 5, "request_hash": "x",
+                                                    "label": "\u6807\u7b7e" * 40})
+        jm.store.write(f"jobs/{jid}/status.json", {"job_id": jid, "status": "exited", "exit_code": 0,
+                                                   "state_version": 2, "supervisor_pid": 2_000_000_000,
+                                                   "ended_at": "2026-09-11T00:00:00Z"})
+    seen, cursor, pages = [], None, 0
+    while True:
+        r = _cli(tmp_path, "job-list", "--limit", "30", *(["--cursor", cursor] if cursor else []))
+        assert r.returncode == 0 and len(r.stdout.encode()) <= views.BATCH_BUDGET_BYTES
+        out = json.loads(r.stdout)
+        seen += [j["job_id"] for j in out["jobs"]]
+        pages += 1
+        if not out["truncated"]:
+            break
+        assert out["next_cursor"] == out["jobs"][-1]["job_id"]
+        cursor = out["next_cursor"]
+    assert pages > 1 and seen == [f"j{i:03d}" for i in range(29, -1, -1)]
+    jm.store.write("jobs/meta/request.json", {"job_id": "meta", "argv": ["/bin/false"], "cwd": "/",
+                                              "deadline_s": 5, "request_hash": "x"})
+    jm.store.write("jobs/meta/status.json", {"job_id": "meta", "status": "exited", "exit_code": 127,
+                                             "state_version": 2, "supervisor_pid": 2_000_000_000,
+                                             "reason": "launch_failed: " + "\u00fc" * 3000,
+                                             "stdout_sha256": "a" * 64})
+    r = _cli(tmp_path, "job-status", "meta")
+    assert r.returncode == 0 and len(r.stdout.encode()) <= views.BATCH_BUDGET_BYTES
+    out = json.loads(r.stdout)
+    assert out["truncated"] is True and out["reason_truncated"] is True
+    assert out["reason"].startswith("launch_failed: ") and "over_budget" not in out
+    assert out["stdout_sha256"] == "a" * 64 and out["exit_code"] == 127

@@ -90,6 +90,28 @@ def test_explicit_offset_instant_is_honored_verbatim():
     assert p["source"]["interpreted_as"] == "absolute_instant_with_offset"
 
 
+@pytest.mark.parametrize("at", ["2026-12-01 09:00:00+0200", "2026-12-01T09:00:00+02:00",
+                                "2026-12-01 09:00+0200", "2026-12-01T09:00:00.5+0200"])
+@pytest.mark.parametrize("tz", [None, "UTC", "America/New_York", "UTC-05:00"])
+def test_explicit_offset_wins_in_every_spelling_and_display_zone(at, tz):
+    p = s.plan(at=at, tz=tz, now=NOW)
+    assert p["intended_utc"] == "2026-12-01T07:00:00Z"
+    assert p["source"]["interpreted_as"] == "absolute_instant_with_offset"
+    assert p["source"]["offset"] == "UTC+02:00"
+    assert p["eastern"]["display"] == "2026-12-01 02:00:00 EST (UTC-05:00)"
+
+
+def test_naive_wall_time_still_resolves_in_the_zone_and_gaps_stay_refused():
+    assert s.plan(at="2026-12-01 09:00:00", now=NOW)["intended_utc"] == "2026-12-01T14:00:00Z"
+    assert s.plan(at="2026-12-01 09:00:00", tz="UTC", now=NOW)["intended_utc"] == "2026-12-01T09:00:00Z"
+    with pytest.raises(ScheduleError) as ei:
+        s.plan(at="2026-03-08 02:30:00", now=NOW)
+    assert ei.value.code == "nonexistent_local_time"
+    with pytest.raises(ScheduleError) as ei:
+        s.plan(at="2026-12-01 09:00:00+25:00", now=NOW)
+    assert ei.value.code == "invalid_time"
+
+
 def test_fixed_utc_minus_5_is_separate_and_labelled():
     p = s.plan(at="2026-07-15 09:00", tz="UTC-05:00", now=NOW)
     assert p["intended_utc"] == "2026-07-15T14:00:00Z"  # NOT the 13:00Z an Eastern plan gives
@@ -207,13 +229,64 @@ def test_read_automation_record_is_read_only_and_reports_absence(tmp_path):
     v = s.verify(intended_utc=INTENDED, persisted=r["record"])
     assert v["verdict"] == "match" and v["difference_s"] == 7.0
     missing = s.read_automation_record(name="nope", db_path=str(db))
-    assert missing == {"db": str(db), "found": False, "record": None, "matches": 0, "error": None}
+    assert missing == {"db": str(db), "found": False, "record": None, "matches": 0, "error": None,
+                       "lookup": {"by": "name", "name": "nope"}}
     absent = s.read_automation_record(name="x", db_path=str(tmp_path / "none.db"))
     assert absent["error"] == "automation_store_not_found" and not absent["found"]
     assert db.read_bytes() == before
     with pytest.raises(ScheduleError) as ei:
         s.read_automation_record(db_path=str(db))
     assert ei.value.code == "missing_target"
+
+
+def test_immediate_route_submission_has_no_dtstart_and_explicit_date_time_count():
+    # the canary's own case: 20 minutes out, created at 04:13:14Z
+    p = s.plan(elapsed="20m", now="2026-09-11T04:13:14Z")
+    imm, anc = p["scheduler"]["immediate"], p["scheduler"]["anchored"]
+    assert "DTSTART" not in imm["rrule"] and imm["route"] == "immediate_create"
+    assert imm["rrule"] == "FREQ=DAILY;BYHOUR=4;BYMINUTE=33;COUNT=1" and imm["shape"] == "daily_count_1"
+    assert imm["within_24h"] is True and imm["expected_first_utc"] == "2026-09-11T04:33:00Z"
+    assert imm["seconds_dropped"] == 14
+    assert anc["rrule"] == "DTSTART:20260911T043314Z\nRRULE:FREQ=DAILY;COUNT=1" == p["scheduler"]["rrule_utc"]
+    assert anc["route"] == "suggested_create"
+    # a persisted next_run_at carrying the creation second still verifies (difference reported)
+    v = s.verify(intended_utc=p["intended_utc"], next_run_at="2026-09-11T04:33:44Z", active=True)
+    assert v["verdict"] == "match" and v["difference_s"] == 30.0
+    # more than 24 h out: a daily rule would fire on the wrong day, so the dated shape is emitted
+    far = s.plan(at="2026-12-01 09:00:00", now=NOW)["scheduler"]["immediate"]
+    assert far["shape"] == "yearly_dated_count_1" and far["within_24h"] is False
+    assert far["rrule"] == "FREQ=YEARLY;BYMONTH=12;BYMONTHDAY=1;BYHOUR=14;BYMINUTE=0;COUNT=1"
+    assert "DTSTART" not in far["rrule"] and far["expected_first_utc"] == "2026-12-01T14:00:00Z"
+    edge = s.plan(elapsed="23h59m", now="2026-09-11T04:13:14Z")["scheduler"]["immediate"]
+    assert edge["within_24h"] is True and edge["rrule"].startswith("FREQ=DAILY;BYHOUR=4;BYMINUTE=12;")
+
+
+def test_automation_lookup_keeps_id_and_name_distinct_and_reports_ambiguity(tmp_path):
+    db = tmp_path / "codex-dev.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE automations (id TEXT PRIMARY KEY, name TEXT, status TEXT, rrule TEXT,"
+                " prompt TEXT, next_run_at INTEGER, last_run_at INTEGER, updated_at INTEGER)")
+    con.executemany("INSERT INTO automations VALUES (?,?,?,?,?,?,?,?)", [
+        ("target", "first", "ACTIVE", "FREQ=DAILY", "p", 1000, None, 1),
+        ("other", "target", "ACTIVE", "FREQ=DAILY", "p", 2000, None, 2),
+        ("dup", "first", "PAUSED", "FREQ=DAILY", "p", None, None, 3)])
+    con.commit()
+    con.close()
+    before = db.read_bytes()
+    by_id = s.read_automation_record(automation_id="target", db_path=str(db))
+    assert by_id["found"] and by_id["matches"] == 1 and by_id["record"]["id"] == "target"
+    assert by_id["lookup"] == {"by": "id", "id": "target"}
+    by_name = s.read_automation_record(name="target", db_path=str(db))
+    assert by_name["found"] and by_name["record"]["id"] == "other" and by_name["lookup"]["by"] == "name"
+    amb = s.read_automation_record(name="first", db_path=str(db))
+    assert amb["found"] is False and amb["record"] is None and amb["matches"] == 2
+    assert amb["error"] == "ambiguous_name" and {c["id"] for c in amb["candidates"]} == {"target", "dup"}
+    assert all("prompt" not in c for c in amb["candidates"])
+    both = s.read_automation_record(automation_id="target", name="first", db_path=str(db))
+    assert both["found"] and both["record"]["id"] == "target" and both["lookup"]["by"] == "id_and_name"
+    wrong = s.read_automation_record(automation_id="target", name="wrong", db_path=str(db))
+    assert wrong["found"] is False and wrong["matches"] == 0 and wrong["error"] is None
+    assert db.read_bytes() == before
 
 
 # ---------------------------------------------------------------- the actual CLI

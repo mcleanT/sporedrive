@@ -16,6 +16,7 @@ from . import schedule
 from .jobs import DEFAULT_DEADLINE_S, DEFAULT_TAIL_BYTES, JOIN_MAX_S, ON_STOP_POLICIES, JobManager
 from .model import ProtocolError
 from .store import CoordStore, StoreError
+from .views import BATCH_BUDGET_BYTES
 
 
 def _emit(obj) -> None:
@@ -512,6 +513,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--offset", type=int, default=0)
     p.add_argument("--limit", type=int, default=4096)
     p.add_argument("--tail", action="store_true", help="read the last --limit bytes")
+    p.add_argument("--budget", type=int, default=BATCH_BUDGET_BYTES, help=f"max bytes of this whole response as emitted (default {BATCH_BUDGET_BYTES}; 0 = only --limit applies, an explicit larger evidence read)")
 
     p = sub.add_parser("job-cancel", help="terminate this wrapper's own child for one job")
     p.add_argument("job_id")
@@ -965,6 +967,7 @@ def run(argv: list[str] | None = None) -> int:
                     offset=args.offset,
                     limit=args.limit,
                     tail=args.tail,
+                    budget=args.budget,
                 )
             )
         elif op == "job-cancel":

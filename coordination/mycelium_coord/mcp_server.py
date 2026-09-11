@@ -1388,22 +1388,29 @@ async def job_output(
     offset: int = 0,
     limit: int = 4096,
     tail: bool = False,
+    budget: int = 4096,
 ) -> dict:
     """Bounded retrieval of a job's retained stdout / stderr / supervisor log by offset+limit
-    (tail=True reads the last `limit` bytes). Carries bytes_total, next_offset and a truthful
-    truncated flag so the complete evidence remains reachable in further bounded reads.
+    (tail=True reads the last `limit` bytes). The RESPONSE itself is bounded by `budget` bytes as
+    serialized (escaping and envelope included), pages are cut on character boundaries so they
+    concatenate losslessly, and `lossy` says when bytes were not valid UTF-8. Carries bytes_total,
+    next_offset and a truthful truncated flag so the complete evidence remains reachable in further
+    bounded reads.
 
     Args:
         job_id: Job id.
         stream: stdout | stderr | supervisor.
         offset: Byte offset to start from.
-        limit: Max bytes to return (<= 65536).
+        limit: Max raw bytes to read (<= 65536).
         tail: Read the last `limit` bytes instead.
+        budget: Max bytes of the whole serialized response (default 4096; 0 = only `limit` applies,
+            an explicit larger evidence read).
     """
     return await asyncio.to_thread(
         lambda: _wrap(
             "job_output",
-            lambda: _jm().output(job_id, stream=stream, offset=offset, limit=limit, tail=tail),
+            lambda: _jm().output(job_id, stream=stream, offset=offset, limit=limit, tail=tail,
+                                 budget=budget),
         )
     )
 

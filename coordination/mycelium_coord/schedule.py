@@ -54,6 +54,34 @@ def _from_epoch(value: float) -> datetime:
     return datetime.fromtimestamp(value, tz=timezone.utc)
 
 
+_FRACTION_RE = re.compile(r"\.(\d+)(?=[+-]\d{2}:?\d{2}$|$)")
+_COMPACT_OFFSET_RE = re.compile(r"([+-]\d{2})(\d{2})$")
+
+
+def _normalise_iso(text: str) -> str:
+    """Bring the ISO spellings this host's oldest interpreter (3.9) does not accept into the one it
+    does: ``Z`` -> ``+00:00``, a compact ``+0200`` offset -> ``+02:00``, fractions padded/trimmed to
+    six digits, one date/time space -> ``T``. Nothing about the instant changes."""
+    t = str(text).strip()
+    if t.endswith(("Z", "z")):
+        t = t[:-1] + "+00:00"
+    t = _FRACTION_RE.sub(lambda m: "." + (m.group(1) + "000000")[:6], t)
+    if "T" not in t and " " in t:
+        t = t.replace(" ", "T", 1)
+    if len(t) > 10:
+        t = _COMPACT_OFFSET_RE.sub(r"\1:\2", t)
+    return t
+
+
+def _fromiso(text: str, *, what: str, original=None) -> datetime:
+    """``datetime.fromisoformat`` over the normalised text: aware or naive exactly as written."""
+    try:
+        return datetime.fromisoformat(_normalise_iso(text))
+    except ValueError as e:
+        shown = original if original is not None else text
+        raise ScheduleError("invalid_time", "", f"{what} {shown!r}: {e}") from None
+
+
 def parse_iso(value, *, what: str = "timestamp") -> datetime:
     """Parse an ISO-8601 timestamp (a trailing ``Z`` is accepted on Python 3.9) or an epoch number.
     A tz-naive string is refused: the caller must say which clock it meant."""
@@ -67,15 +95,7 @@ def parse_iso(value, *, what: str = "timestamp") -> datetime:
         if re.fullmatch(r"\d{9,}(?:\.\d+)?", text):
             dt = _from_epoch(float(text))
         else:
-            if text.endswith(("Z", "z")):
-                text = text[:-1] + "+00:00"
-            # python < 3.11 accepts only 3- or 6-digit fractions: pad/trim to 6
-            text = re.sub(r"\.(\d+)(?=[+-]\d{2}:?\d{2}$|$)",
-                          lambda m: "." + (m.group(1) + "000000")[:6], text)
-            try:
-                dt = datetime.fromisoformat(text.replace(" ", "T", 1) if "T" not in text else text)
-            except ValueError as e:
-                raise ScheduleError("invalid_time", "", f"{what} {value!r}: {e}") from None
+            dt = _fromiso(text, what=what, original=value)
     _req(dt.tzinfo is not None and dt.utcoffset() is not None, "invalid_time",
          f"{what} {value!r} has no UTC offset; supply one or use the local-time planner")
     return dt.astimezone(timezone.utc)
@@ -172,20 +192,15 @@ def _resolve_local(naive: datetime, tzinfo, label: str, fixed: bool, ambiguous: 
     return first
 
 
-def _parse_wall(text: str) -> datetime | None:
-    """A tz-naive ``YYYY-MM-DD HH:MM[:SS]`` (or ``T``) wall time; None if the text carries an
-    offset/``Z`` and should be parsed as an absolute instant instead."""
+def _parse_at(text) -> datetime:
+    """Parse ``at`` as written: an aware datetime when the value carries its own offset / ``Z`` (or
+    is an epoch number), a naive wall time otherwise. Awareness comes from the parsed value itself,
+    never from a suffix guess, so ``2026-12-01 09:00:00+0200`` is the explicit instant it says."""
     t = str(text).strip()
-    if re.search(r"(Z|z|[+-]\d{2}:?\d{2})$", t) and "T" in t:
-        return None
-    if re.search(r"(Z|z)$", t):
-        return None
-    if re.search(r"[+-]\d{2}:\d{2}$", t) and len(t) > 10:
-        return None
-    try:
-        return datetime.fromisoformat(t.replace(" ", "T", 1))
-    except ValueError as e:
-        raise ScheduleError("invalid_time", "", f"local time {text!r}: {e}") from None
+    _req(bool(t), "invalid_time", "at is empty")
+    if re.fullmatch(r"\d{9,}(?:\.\d+)?", t):
+        return _from_epoch(float(t))
+    return _fromiso(t, what="at", original=text)
 
 
 # ---------------------------------------------------------------------------- planning
@@ -206,12 +221,14 @@ def plan(*, at=None, elapsed=None, tz=None, now=None, ambiguous: str = "reject",
         intended = now_utc + timedelta(seconds=secs)
         source = {"elapsed": elapsed, "elapsed_s": secs}
     else:
-        naive = _parse_wall(at)
-        if naive is None:
-            intended = parse_iso(at, what="at")
-            source = {"at": str(at), "interpreted_as": "absolute_instant_with_offset"}
+        parsed = _parse_at(at)
+        if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+            intended = parsed.astimezone(timezone.utc)
+            source = {"at": str(at), "interpreted_as": "absolute_instant_with_offset",
+                      "offset": _offset_label(parsed),
+                      "note": "the explicit offset is honored; tz only selects the display zone"}
         else:
-            local = _resolve_local(naive, tzinfo, label, fixed, ambiguous)
+            local = _resolve_local(parsed, tzinfo, label, fixed, ambiguous)
             intended = local.astimezone(timezone.utc)
             source = {"at": str(at), "interpreted_as": f"wall_time_in_{label}",
                       "ambiguity_policy": ambiguous}
@@ -235,28 +252,75 @@ def plan(*, at=None, elapsed=None, tz=None, now=None, ambiguous: str = "reject",
         "requested_zone": requested,
         "display": eastern["display"] if label == DEFAULT_TZ else
         f"{requested['display']} = {eastern['display']}",
-        "scheduler": scheduler_submission(intended, eastern, fixed_label=label if fixed else None),
+        "scheduler": scheduler_submission(intended, eastern, fixed_label=label if fixed else None,
+                                          now_utc=now_utc),
     }
     return out
 
 
-def scheduler_submission(intended_utc: datetime, eastern: dict, *, fixed_label=None) -> dict:
+def scheduler_submission(intended_utc: datetime, eastern: dict, *, fixed_label=None,
+                         now_utc: datetime | None = None) -> dict:
     """What a UTC-only scheduler needs for a ONE-SHOT at the intended instant. The helper never
     submits; the caller passes these values to the official host automation tool and then verifies
-    the persisted ``next_run_at`` with :func:`verify`."""
+    the persisted ``next_run_at`` with :func:`verify`.
+
+    Two submission forms are emitted because scheduler interfaces differ:
+
+    * ``immediate`` — for the host app's ordinary immediate create route, which REJECTS ``DTSTART``.
+      A DTSTART-free rule whose date/time/COUNT parts are explicit, evaluated by that scheduler in
+      UTC: ``FREQ=DAILY;BYHOUR;BYMINUTE;COUNT=1`` when the instant is within the next 24 h (the
+      shape the app is known to accept), otherwise a dated ``FREQ=YEARLY;BYMONTH;BYMONTHDAY;...``
+      rule. It schedules to the MINUTE (seconds are not part of the shape), so the read-back
+      ``next_run_at`` may differ from the intent by under a minute; ``verify`` reports the exact
+      difference and the default tolerance covers it.
+    * ``anchored`` — the RFC form with ``DTSTART`` for interfaces that accept anchored semantics
+      (the app's ``suggested_create`` mode). ``rrule_utc`` keeps carrying this form.
+
+    Neither form is a verification: only the persisted ``next_run_at`` read back through
+    :func:`verify` backs a success claim."""
     u = intended_utc.astimezone(timezone.utc)
+    ref = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
     note = ("one-shot at the intended UTC instant; a recurring Eastern wall-clock rule cannot be "
             "expressed as a single fixed-UTC recurrence across DST changes — re-plan each "
             "occurrence, or re-submit the UTC hour at each transition")
     if fixed_label:
         note = (f"planned on the fixed {fixed_label} clock as explicitly requested; this is not "
                 f"Eastern local time when daylight saving is in effect. " + note)
+    within_24h = timedelta(0) <= (u - ref) < timedelta(hours=24)
+    minute = u.replace(second=0, microsecond=0)
+    if within_24h:
+        shape = "daily_count_1"
+        rule = f"FREQ=DAILY;BYHOUR={u.hour};BYMINUTE={u.minute};COUNT=1"
+        shape_note = "the shape the app's immediate route is known to evaluate (BYHOUR/BYMINUTE in UTC)"
+    else:
+        shape = "yearly_dated_count_1"
+        rule = (f"FREQ=YEARLY;BYMONTH={u.month};BYMONTHDAY={u.day};BYHOUR={u.hour};"
+                f"BYMINUTE={u.minute};COUNT=1")
+        shape_note = ("dated shape for an instant more than 24 h out; its acceptance by the immediate "
+                      "route is not established by inspection — read back next_run_at, or use the "
+                      "anchored form")
+    anchored = f"DTSTART:{u.strftime('%Y%m%dT%H%M%SZ')}\nRRULE:FREQ=DAILY;COUNT=1"
     return {
         "kind": "one_shot",
         "utc": {"date": u.strftime("%Y-%m-%d"), "time": u.strftime("%H:%M:%S"),
                 "iso": u.isoformat().replace("+00:00", "Z")},
         "cron_utc": f"{u.minute} {u.hour} {u.day} {u.month} *",
-        "rrule_utc": f"DTSTART:{u.strftime('%Y%m%dT%H%M%SZ')}\nRRULE:FREQ=DAILY;COUNT=1",
+        "immediate": {
+            "route": "immediate_create",
+            "rrule": rule,
+            "shape": shape,
+            "within_24h": within_24h,
+            "expected_first_utc": minute.isoformat().replace("+00:00", "Z"),
+            "seconds_dropped": u.second,
+            "note": "no DTSTART (the immediate route rejects it); schedules to the minute in UTC; "
+                    + shape_note + "; confirm with sched-verify against the persisted next_run_at",
+        },
+        "anchored": {
+            "route": "suggested_create",
+            "rrule": anchored,
+            "note": "anchored RFC form with DTSTART; rejected by the immediate create route",
+        },
+        "rrule_utc": anchored,
         "eastern_display": eastern["display"],
         "note": note,
     }
@@ -375,16 +439,27 @@ DEFAULT_AUTOMATION_DB = "~/.codex/sqlite/codex-dev.db"
 
 def read_automation_record(*, name=None, automation_id=None, db_path=None) -> dict:
     """READ-ONLY lookup of one persisted automation row in the host app's SQLite store (opened with
-    ``mode=ro``; nothing is ever written). Returns ``{"found": bool, "record": row|None, "db": path,
-    "matches": n}`` — an absent row or an unreadable store is reported as such, never as a
-    schedule verdict. ``next_run_at`` in that store is epoch milliseconds; a PAUSED row carries
-    ``next_run_at = NULL`` by design."""
+    ``mode=ro``; nothing is ever written). An explicit ``automation_id`` selects that id ONLY; a
+    ``name`` selects by name only, and several rows sharing it are reported as ``ambiguous_name``
+    with bounded candidates rather than one being picked. Returns ``{"found": bool, "record":
+    row|None, "db": path, "matches": n, "lookup": {...}, "error": ...}`` — an absent row or an
+    unreadable store is reported as such, never as a schedule verdict. ``next_run_at`` in that store
+    is epoch milliseconds; a PAUSED row carries ``next_run_at = NULL`` by design."""
     import os
     import sqlite3
     _req(name is not None or automation_id is not None, "missing_target",
          "give name= or automation_id=")
+    if automation_id is not None and name is not None:
+        where, params = "id = ? AND name = ?", (str(automation_id), str(name))
+        lookup = {"by": "id_and_name", "id": str(automation_id), "name": str(name)}
+    elif automation_id is not None:
+        where, params = "id = ?", (str(automation_id),)
+        lookup = {"by": "id", "id": str(automation_id)}
+    else:
+        where, params = "name = ?", (str(name),)
+        lookup = {"by": "name", "name": str(name)}
     path = os.path.expanduser(db_path or DEFAULT_AUTOMATION_DB)
-    out = {"db": path, "found": False, "record": None, "matches": 0, "error": None}
+    out = {"db": path, "found": False, "record": None, "matches": 0, "lookup": lookup, "error": None}
     if not os.path.isfile(path):
         out["error"] = "automation_store_not_found"
         return out
@@ -392,8 +467,7 @@ def read_automation_record(*, name=None, automation_id=None, db_path=None) -> di
         con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
         try:
             con.row_factory = sqlite3.Row
-            key = str(automation_id if automation_id is not None else name)
-            rows = con.execute("SELECT * FROM automations WHERE id = ? OR name = ?", (key, key)).fetchall()
+            rows = con.execute(f"SELECT * FROM automations WHERE {where}", params).fetchall()
         finally:
             con.close()
     except sqlite3.Error as e:
@@ -403,8 +477,10 @@ def read_automation_record(*, name=None, automation_id=None, db_path=None) -> di
     if not rows:
         return out
     if len(rows) > 1:
-        rows = sorted(rows, key=lambda r: (r["updated_at"] if "updated_at" in r.keys() else 0) or 0,
-                      reverse=True)
+        out["error"] = "ambiguous_name" if lookup["by"] == "name" else "ambiguous_match"
+        out["candidates"] = [{k: r[k] for k in ("id", "name", "status", "updated_at") if k in r.keys()}
+                             for r in rows[:10]]
+        return out
     row = {k: rows[0][k] for k in rows[0].keys() if k not in ("prompt",)}
     if isinstance(row.get("status"), str):
         row["status"] = row["status"].lower()
