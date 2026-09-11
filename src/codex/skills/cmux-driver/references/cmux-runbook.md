@@ -11,9 +11,39 @@ that this CLI does not have) — trust `cmux --help` of the installed binary ove
 
 Set `CMUX_QUIET=1` to silence alias notices (`list-workspaces` is an alias of `workspace list`).
 
-## 1. Access mode and process origin (the current blocker from the Codex host)
+## 0. Open a fresh Claude session with clauded (verified)
 
-`cmux capabilities` reports `"access_mode": "cmuxOnly"`. Setting: `automation.socketControlMode`
+The owner uses `clauded` to launch new Claude sessions. It is a zsh alias in `~/.zshrc` for
+`claude --dangerously-skip-permissions`, not a standalone executable. Invoke it through an
+interactive zsh so the alias loads. Direct cmux CLI access from Codex succeeded with the existing
+`password` access mode; Computer Use and changes to socket permissions were unnecessary.
+
+When a new session is requested, choose the authorized project directory and use:
+
+```bash
+/Applications/cmux.app/Contents/Resources/bin/cmux current-window --json
+/Applications/cmux.app/Contents/Resources/bin/cmux new-workspace \
+  --window <WINDOW_UUID> --name '<TITLE>' --cwd '<ABSOLUTE_PROJECT_PATH>' \
+  --command '/bin/zsh -lic clauded' --focus true --json
+```
+
+Creation may return only `OK workspace:N`, even with `--json`. Resolve the returned ref using
+`identify --workspace <REF> --id-format both --json` and
+`list-pane-surfaces --workspace <WORKSPACE_UUID> --id-format both --json`. Keep UUIDs for subsequent
+operations; JSON output without `--id-format both` may omit them. Read the exact new surface with
+`read-screen --workspace <WORKSPACE_UUID> --surface <SURFACE_UUID> --lines 18` to verify startup.
+An owned, trusted checkout may show a folder-trust dialog first. A Claude prompt and status footer
+establish readiness; the workspace creation acknowledgment alone does not.
+
+Verified end to end in the SporeDrive release checkout: alias launch, folder-trust confirmation,
+then an idle Claude prompt with bypass permissions enabled. Model and effort follow Claude's
+configuration. Opening a session does not itself assign work or resume a paused coordination task.
+
+## 1. Historical access-mode restriction (2026-09-08; superseded on this host)
+
+The original `cmux capabilities` probe reported `"access_mode": "cmuxOnly"`; the newer successful
+launch above reports `password`. Treat the following as historical diagnostics, not a current
+blocker. Setting: `automation.socketControlMode`
 in `~/.config/cmux/cmux.json` (Settings > Automation). Enum on this build:
 `off, cmuxOnly (default), automation, password, allowAll, openAccess, fullOpenAccess, notifications, full`.
 `automation.socketPassword` holds the password for `password` mode; CLI auth order is
@@ -34,15 +64,15 @@ So the two symptoms seen from Codex are two different layers: **EPERM** = the Co
 the unix-socket connect; **broken pipe** (escalated) = the connect succeeded and cmux closed the
 connection because the Codex process is not descended from the cmux app. Neither is a CLI bug.
 
-**Supported paths from a non-cmux process, in order of preference (none enabled yet; owner decision):**
+**Paths considered during the original restriction (password access now works on this host):**
 
 1. Run the controller's shell *inside* a cmux terminal (a surface whose process tree descends from
    the app). This is what makes the CLI work for Claude Code sessions launched by cmux. Not
    available to the Codex desktop app's own shell.
 2. Owner switches `automation.socketControlMode` to `password` in cmux Settings and provides the
    password to the controller through `CMUX_SOCKET_PASSWORD` (never on the command line, never in
-   a repo). Whether `password` mode also keeps the ancestry check is **unverified** on this build;
-   test with `cmux capabilities` from a launchd-spawned probe after enabling.
+   a repo). The later launch in §0 verifies access from the Codex desktop shell with the existing
+   password configuration; do not change access settings merely to launch a session.
 3. `automation` mode — semantics **unknown** (not documented on the web docs page); test before use.
 4. `allowAll` / `openAccess` / `fullOpenAccess` — any local process; **do not use** on a shared
    machine and not what the owner asked for.
@@ -159,7 +189,7 @@ Facts:
 
 ## 6. Not verified here (do before relying on it)
 
-- `password`/`automation` socket modes and whether they bypass the ancestry check.
+- `automation` socket mode; password access from Codex is now verified in §0.
 - Behavior with the Mac locked, on network disconnect, or across a cmux update.
 - Permission dialogs inside Claude's prompt (the bridge classifies them as `modal` and refuses
   input; the dialog itself was not exercised).

@@ -89,6 +89,49 @@ mycelium-coord checkpoint-publish TASK --revision N --by PARTICIPANT --checkpoin
 `--to` is a participant id, a role, or `all`. `--artifact` values are JSON objects (repeat the flag
 per artifact); a bare path string is not verifiable evidence.
 
+### Owned local jobs, Eastern scheduling and output budgets (efficiency v2)
+
+```
+mycelium-coord job-run  JOB_ID [--task TASK --action-id RES --dispatch-identity ID] [--deadline S] \
+                        [--on-stop keep|cancel] [--join S<=50] [--label "…"] -- CMD [ARGS…]   # CLI only
+mycelium-coord job-join JOB_ID [--timeout S<=50] [--after-version N] [--tail BYTES]        # in-tool wait
+mycelium-coord job-status JOB_ID | job-list [--task T] [--status S] [--limit N] [--cursor C]
+mycelium-coord job-output JOB_ID [--stream stdout|stderr|supervisor] [--offset N] [--limit N] [--tail]
+mycelium-coord job-cancel JOB_ID
+mycelium-coord sched-plan   (--at "YYYY-MM-DD HH:MM" | --in 90m) [--tz America/New_York|UTC-05:00] [--now ISO]
+mycelium-coord sched-verify --intended-utc ISO (--persisted-json FILE|- | --next-run-at ISO --active BOOL)
+```
+
+MCP (both hosts) exposes only the read-only routes: `job_status`, `job_join`, `job_list`, `job_output`,
+`sched_plan`, `sched_verify`. There is no MCP launch route: a job is started by the owned CLI from the
+host-authorized shell so its processes inherit that shell's permissions. A managed job runs under one
+open work reservation (re-checked immediately before the actual launch), keeps an immutable request
+record (identity, argv, cwd, deadline, reservation) and complete stdout/stderr on disk under the state
+root; a replayed `job-run` with the same id and content never launches twice, and a different content
+under an existing id is refused (`job_identity_conflict`). Refused, failed and unknown attempts stay
+listed. The wrapper terminates only its own child, under the job's declared deadline / cancel /
+`--on-stop` policy.
+
+Join SOP: a synchronous or batched read needs NO join and NO host wait. For a running job, issue one
+`job-join` (or `--join` on the run) per permitted interval; it waits inside the tool for at most 50 s
+and returns `changed`, `timed_out`, `stop_waiting` (task deadline, paused/closed/expired/completed
+execution) plus status/exit metadata — never a bare "still running" to interpret. Do not wrap it in
+clock calls or sleep loops; a stored message still does not wake an idle host, and a local wrapper
+cannot promise zero wake-ups for an indefinitely long desktop operation.
+
+Owned outputs select fields before serialization and normally fit a combined 4 KB batch budget
+(`truncated: true` with `next_cursor` / `next_offset` when cut; inline tails are trimmed before any
+reference is dropped). Full evidence stays on disk and is retrievable with `job-output --offset/--limit`.
+This caps only this package's outputs, never a host-native shell or file tool's output; `--full` /
+`compact=false` and `read-message` remain the full-record escape hatches.
+
+Scheduling: `sched-plan` is pure — it emits the intended UTC instant, the Eastern rendering and one-shot
+submission data (America/New_York by default; fixed `UTC-05:00` only when explicitly requested; gap and
+unresolved overlap wall times are refused). Create/update/pause the automation with the host's official
+automation tool, then `sched-verify` the ACTUAL persisted `next_run_at`/status before any success claim:
+`match` is the only pass, `cannot_evaluate` is neither pass nor fail, and `mismatch` on an active record
+means `requires_native_pause` through that same official tool (the helper never writes the app store).
+
 ### Discovery (bounded, read-only)
 
 Find work you do not already hold an id for, then join it with an ordinary `attach` — discovery

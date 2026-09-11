@@ -94,6 +94,17 @@ narrative unless `CODEX_ASK_INCLUDE_LASTSESSION=1` is explicitly set. Full logs 
 changes reduce supplied context and unnecessary reads; they do not automatically shrink an already
 running conversation, change its model effort, or establish a measured percentage saving.
 
+**Efficiency v2 (scheduling, owned local jobs, compact evidence).** The coordination package now ships
+three small owned helpers, exposed as CLI subcommands and read-only MCP tools: `sched-plan` /
+`sched-verify` (a deterministic Eastern-time planner that emits the intended UTC instant plus one-shot
+submission data, and a read-only verifier that compares the *persisted* `next_run_at`/status with the
+intent — `match`, `mismatch` or `cannot_evaluate`; it never writes the scheduler's store), `job-run` /
+`job-join` / `job-status` / `job-list` / `job-output` / `job-cancel` (local work launched by the CLI from
+the host-authorized shell under one managed reservation, with an immutable request record, complete
+output on disk, and an in-tool join of at most 50 s that stops on the task deadline or a paused/closed
+execution — no MCP launch route), and a combined 4 KB batch budget for owned outputs with truthful
+`truncated` flags and offset/cursor retrieval of the full evidence. See `coordination/skill/SKILL.md`.
+
 ## Bounded execution
 
 A supervised workflow is only meaningful if "supervised" is something the code enforces. A managed

@@ -1,6 +1,6 @@
 ---
 name: cmux-driver
-description: Operate or supervise an existing Claude Code session running in cmux — bind the exact window/workspace/surface/session identity, relay one faithful task brief, observe progress through bounded text reads and the event stream, manage safe compaction near the 30–40% context boundary, and close with a receipt. Use for explicit requests to drive, operate, supervise, monitor, or babysit a Claude Code session. Do not use for ordinary code review, direct repository implementation, generic desktop or terminal interaction, or browser automation.
+description: Launch, operate, or supervise Claude Code sessions in cmux — bind the exact window/workspace/surface/session identity, relay one faithful task brief, observe progress through bounded text reads and the event stream, manage safe compaction near the 30–40% context boundary, and close with a receipt. Use for explicit requests to open Claude sessions in cmux (including clauded), drive, operate, supervise, monitor, or babysit a Claude Code session. Do not use for ordinary code review, direct repository implementation, generic desktop or terminal interaction, or browser automation.
 metadata:
   contract_version: codex-claude-workflow 1.2.0
   source: ~/tools/codex-claude-workflow/src/codex/skills/cmux-driver
@@ -30,7 +30,7 @@ Claude context compaction is due at about 30% USED, at the next drained checkpoi
 
 ## Load details only for the operation being performed
 
-- First transport access, or a changed capability: [cmux runbook](references/cmux-runbook.md). Historical socket restrictions are dated evidence; use current authenticated capability.
+- Opening a new session with `clauded`, first transport access, or a changed capability: [cmux runbook](references/cmux-runbook.md). Use its verified CLI launch recipe; historical socket restrictions are dated evidence.
 - Binding, sending, compaction or uncertain recovery: [driver protocol](references/driver-protocol.md) and the relevant section of [bridge MCP](references/bridge-mcp.md). Do not load every reference for a status read.
 - First substantive coordination message: [Mycelium coordination](references/mycelium-coordination.md). Use compact resume/inbox and selected full message reads; message content_hash hashes its envelope, not an artifact file.
 - Writing a handoff/checkpoint: [checkpoint packet](references/checkpoint-packet.md). Preserve substantive requirements and limits; keep raw history out.

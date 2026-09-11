@@ -12,6 +12,8 @@ import sys
 
 from .coord import Coordinator
 from .execution import ExecutionManager
+from . import schedule
+from .jobs import DEFAULT_DEADLINE_S, DEFAULT_TAIL_BYTES, JOIN_MAX_S, ON_STOP_POLICIES, JobManager
 from .model import ProtocolError
 from .store import CoordStore, StoreError
 
@@ -50,6 +52,19 @@ def _load_json_arg(value: str | None):
     if value == "-":
         return json.load(sys.stdin)
     return json.loads(value)
+
+
+def _load_json_source(value: str | None):
+    """'-' = stdin, a JSON literal, or a file path holding JSON (a persisted automation record)."""
+    if value is None:
+        return None
+    if value == "-":
+        return json.load(sys.stdin)
+    vs = value.strip()
+    if vs[:1] in ("{", "["):
+        return json.loads(vs)
+    with open(value) as f:
+        return json.load(f)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -446,14 +461,84 @@ def build_parser() -> argparse.ArgumentParser:
         "--expected-version", type=int, default=None, dest="expected_state_version"
     )
 
+    # ------------------------------------------------------------ efficiency v2: scheduling + owned jobs
+    p = sub.add_parser("sched-plan", help="plan one intended instant (America/New_York by default); never submits")
+    p.add_argument("--at", default=None, help="local wall time 'YYYY-MM-DD HH:MM[:SS]' in --tz, or an ISO instant with its own offset")
+    p.add_argument("--in", dest="elapsed", default=None, help="elapsed delay from now, e.g. 90m, 1h30m, 45s, 2d")
+    p.add_argument("--tz", default=None, help="America/New_York (default) | UTC-05:00 (fixed, only when explicitly wanted) | UTC | IANA zone")
+    p.add_argument("--now", default=None, help="reference instant (ISO/epoch) for a reproducible plan; default real now")
+    p.add_argument("--ambiguous", default="reject", choices=list(schedule.AMBIGUOUS_POLICIES), help="fall-back overlap policy")
+    p.add_argument("--allow-past", action="store_true", dest="allow_past")
+
+    p = sub.add_parser("sched-verify", help="read-only: compare a persisted next_run_at/active flag with the intended instant")
+    p.add_argument("--intended-utc", required=True, dest="intended_utc")
+    p.add_argument("--persisted-json", default=None, dest="persisted_json", help="file path, '-' (stdin) or JSON literal of the persisted automation record")
+    p.add_argument("--next-run-at", default=None, dest="next_run_at")
+    p.add_argument("--active", default=None, help="true/false or a status word (active/paused)")
+    p.add_argument("--tolerance", type=float, default=schedule.DEFAULT_TOLERANCE_S, help="seconds")
+
+    p = sub.add_parser("job-run", help="start an owned local job by CLI (never over MCP): -- <command> [args]")
+    p.add_argument("job_id")
+    p.add_argument("--cwd", default=None)
+    p.add_argument("--deadline", type=float, default=DEFAULT_DEADLINE_S, dest="deadline_s", help="wall-clock seconds before the wrapper terminates its own child")
+    p.add_argument("--task", default=None, dest="task_id", help="managed task id (with --action-id)")
+    p.add_argument("--action-id", default=None, dest="action_id", help="open work reservation the job runs under")
+    p.add_argument("--dispatch-identity", default=None, dest="dispatch_identity", help="the dispatch the reservation is bound to")
+    p.add_argument("--on-stop", default="keep", choices=list(ON_STOP_POLICIES), dest="on_stop", help="what the wrapper does to its child when the execution stops")
+    p.add_argument("--label", default=None)
+    p.add_argument("--join", type=float, default=0.0, dest="join_s", help=f"also join inside this call for up to N s (max {JOIN_MAX_S:.0f})")
+    p.add_argument("--tail", type=int, default=DEFAULT_TAIL_BYTES, dest="tail_bytes")
+    p.add_argument("argv", nargs="*", default=[], help="everything after -- is the command and its arguments")
+
+    p = sub.add_parser("job-join", help=f"wait inside the tool (<= {JOIN_MAX_S:.0f}s) for change/terminal/stop; deterministic metadata")
+    p.add_argument("job_id")
+    p.add_argument("--timeout", type=float, default=JOIN_MAX_S, dest="timeout_s")
+    p.add_argument("--after-version", type=int, default=None, dest="after_version")
+    p.add_argument("--tail", type=int, default=DEFAULT_TAIL_BYTES, dest="tail_bytes")
+
+    p = sub.add_parser("job-status", help="compact status of one owned job")
+    p.add_argument("job_id")
+    p.add_argument("--tail", type=int, default=0, dest="tail_bytes")
+
+    p = sub.add_parser("job-list", help="metadata-only listing within the combined byte budget")
+    p.add_argument("--task", default=None, dest="task_id")
+    p.add_argument("--status", default=None)
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--cursor", default=None)
+
+    p = sub.add_parser("job-output", help="bounded retrieval of retained stdout/stderr/supervisor output")
+    p.add_argument("job_id")
+    p.add_argument("--stream", default="stdout", choices=["stdout", "stderr", "supervisor"])
+    p.add_argument("--offset", type=int, default=0)
+    p.add_argument("--limit", type=int, default=4096)
+    p.add_argument("--tail", action="store_true", help="read the last --limit bytes")
+
+    p = sub.add_parser("job-cancel", help="terminate this wrapper's own child for one job")
+    p.add_argument("job_id")
+    p.add_argument("--reason", default="cancel_requested")
+
     return ap
 
 
+def _split_command(argv: list[str] | None):
+    """For ``job-run``, everything after the first ``--`` is the command verbatim (argparse must
+    never reinterpret the job's own flags). Returns (argv_for_argparse, command_or_None)."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "job-run" in argv and "--" in argv and argv.index("job-run") < argv.index("--"):
+        i = argv.index("--")
+        return argv[:i], argv[i + 1:]
+    return argv, None
+
+
 def run(argv: list[str] | None = None) -> int:
+    argv, command = _split_command(argv)
     args = build_parser().parse_args(argv)
+    if command is not None:
+        args.argv = command
     store = CoordStore(args.root)
     co = Coordinator(store)
     em = ExecutionManager(store)
+    jm = JobManager(store)
     op = args.op
     try:
         if op == "create-task":
@@ -822,6 +907,68 @@ def run(argv: list[str] | None = None) -> int:
                     expected_state_version=args.expected_state_version,
                 )
             )
+        elif op == "sched-plan":
+            _emit(
+                schedule.plan(
+                    at=args.at,
+                    elapsed=args.elapsed,
+                    tz=args.tz,
+                    now=args.now,
+                    ambiguous=args.ambiguous,
+                    allow_past=args.allow_past,
+                )
+            )
+        elif op == "sched-verify":
+            res = schedule.verify(
+                intended_utc=args.intended_utc,
+                persisted=_load_json_source(args.persisted_json),
+                next_run_at=args.next_run_at,
+                active=args.active,
+                tolerance_s=args.tolerance,
+            )
+            _emit(res)
+            return 0 if res.get("ok") else 3
+        elif op == "job-run":
+            res = jm.run(
+                args.job_id,
+                list(args.argv),
+                cwd=args.cwd,
+                deadline_s=args.deadline_s,
+                task_id=args.task_id,
+                action_id=args.action_id,
+                dispatch_identity=args.dispatch_identity,
+                on_stop=args.on_stop,
+                label=args.label,
+                join_s=args.join_s,
+                tail_bytes=args.tail_bytes,
+            )
+            _emit(res)
+            return 0 if res.get("effective_status") != "refused" else 3
+        elif op == "job-join":
+            _emit(
+                jm.join(
+                    args.job_id,
+                    timeout_s=args.timeout_s,
+                    after_version=args.after_version,
+                    tail_bytes=args.tail_bytes,
+                )
+            )
+        elif op == "job-status":
+            _emit(jm.status(args.job_id, tail_bytes=args.tail_bytes))
+        elif op == "job-list":
+            _emit(jm.list(task_id=args.task_id, status=args.status, limit=args.limit, cursor=args.cursor))
+        elif op == "job-output":
+            _emit(
+                jm.output(
+                    args.job_id,
+                    stream=args.stream,
+                    offset=args.offset,
+                    limit=args.limit,
+                    tail=args.tail,
+                )
+            )
+        elif op == "job-cancel":
+            _emit(jm.cancel(args.job_id, reason=args.reason))
         else:  # pragma: no cover
             _emit({"error": "unknown_op", "op": op})
             return 2

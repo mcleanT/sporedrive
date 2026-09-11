@@ -16,8 +16,10 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
+from . import schedule
 from .coord import Coordinator
 from .execution import ExecutionManager
+from .jobs import DEFAULT_TAIL_BYTES, JOIN_MAX_S, JobManager
 from .model import ProtocolError
 from .store import CoordStore, StoreError
 
@@ -48,6 +50,11 @@ def _co() -> Coordinator:
 @lru_cache(maxsize=1)
 def _em() -> ExecutionManager:
     return ExecutionManager(CoordStore(os.environ.get("MYCELIUM_COORD_DIR") or None))
+
+
+@lru_cache(maxsize=1)
+def _jm() -> JobManager:
+    return JobManager(CoordStore(os.environ.get("MYCELIUM_COORD_DIR") or None))
 
 
 def _fail(name: str, e: Exception) -> ToolError:
@@ -1235,6 +1242,168 @@ async def execution_reconcile_shutdown(
                 detail=detail,
                 expected_state_version=expected_state_version,
             ),
+        )
+    )
+
+
+# ---------------------------------------------------------------- efficiency v2: read-only routes
+@mcp.tool(title="Sched Plan", annotations=_READ)
+async def sched_plan(
+    at: str | None = None,
+    elapsed: str | None = None,
+    tz: str | None = None,
+    now: str | None = None,
+    ambiguous: str = "reject",
+    allow_past: bool = False,
+) -> dict:
+    """Deterministic scheduling plan: ONE intended instant from an absolute local wall time or an
+    elapsed delay, in America/New_York by default (EST/EDT handled), emitting the intended UTC
+    instant, the Eastern display and one-shot scheduler submission data. Pure and read-only: it never
+    creates, updates or pauses an automation — use the host's official automation tool, then confirm
+    the persisted next_run_at with sched_verify. A fixed UTC-05:00 clock is honored only when
+    explicitly requested (tz="UTC-05:00"). Refuses nonexistent (spring-forward) and unresolved
+    ambiguous (fall-back) local times with a distinct error code.
+
+    Args:
+        at: Local wall time 'YYYY-MM-DD HH:MM[:SS]' in tz, or an ISO instant with its own offset.
+        elapsed: Delay from now such as 90m, 1h30m, 45s, 2d (give at OR elapsed).
+        tz: America/New_York (default), UTC-05:00 (fixed), UTC, or an IANA zone.
+        now: Reference instant (ISO/epoch) for a reproducible plan; default real now.
+        ambiguous: reject (default) | earlier | later for a fall-back overlap.
+        allow_past: Permit an instant before now (default refuses with past_instant).
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap(
+            "sched_plan",
+            lambda: schedule.plan(at=at, elapsed=elapsed, tz=tz, now=now, ambiguous=ambiguous,
+                                  allow_past=allow_past),
+        )
+    )
+
+
+@mcp.tool(title="Sched Verify", annotations=_READ)
+async def sched_verify(
+    intended_utc: str,
+    persisted: dict | None = None,
+    next_run_at: str | None = None,
+    active: str | None = None,
+    tolerance_s: float = schedule.DEFAULT_TOLERANCE_S,
+) -> dict:
+    """Read-only verification of a persisted schedule against the intended instant: pass the record
+    the host automation tool returned (persisted) or the bare next_run_at/active values. Verdict is
+    match | mismatch | cannot_evaluate — an absent or unparseable record is never a pass or a fail.
+    Only match backs a success claim; requires_native_pause=True means an ACTIVE automation sits at
+    the wrong instant and must be paused/deleted through the official tool. Both UTC and Eastern
+    renderings are returned.
+
+    Args:
+        intended_utc: The planned instant (sched_plan.intended_utc).
+        persisted: The persisted automation record (any shape carrying next_run_at and a status).
+        next_run_at: Persisted next_run_at when not passing a record.
+        active: Persisted active flag / status word when not passing a record.
+        tolerance_s: Allowed difference in seconds (default 60).
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap(
+            "sched_verify",
+            lambda: schedule.verify(intended_utc=intended_utc, persisted=persisted,
+                                    next_run_at=next_run_at, active=active,
+                                    tolerance_s=tolerance_s),
+        )
+    )
+
+
+@mcp.tool(title="Job Status", annotations=_READ)
+async def job_status(job_id: str, tail_bytes: int = 0) -> dict:
+    """Compact status of one owned local job (started by the owned CLI `job-run`; there is no MCP
+    launch route). Field-selected, fits the 4 KB budget, references retained output by path;
+    a job whose supervisor vanished reads as effective_status=unknown without rewriting the record.
+
+    Args:
+        job_id: Job id.
+        tail_bytes: Inline tail of stdout/stderr to include (0 = references only).
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap("job_status", lambda: _jm().status(job_id, tail_bytes=tail_bytes))
+    )
+
+
+@mcp.tool(title="Job Join", annotations=_READ)
+async def job_join(
+    job_id: str,
+    timeout_s: float = JOIN_MAX_S,
+    after_version: int | None = None,
+    tail_bytes: int = DEFAULT_TAIL_BYTES,
+) -> dict:
+    """Wait INSIDE the tool (at most 50 s) for the job to finish or its status to change past
+    after_version, stopping early at the task deadline or a paused/closed/expired/completed
+    execution (stop_waiting=True). Returns deterministic changed / timed_out / stop_waiting / status /
+    exit metadata with bounded tails; the full output stays on disk (job_output). One join per
+    permitted interval is the whole protocol: do not add host wait/sleep loops around it, and do not
+    join at all for synchronous or batched reads.
+
+    Args:
+        job_id: Job id.
+        timeout_s: In-tool wait, clamped to 0..50 seconds.
+        after_version: Last seen state_version; a newer version returns changed=True immediately.
+        tail_bytes: Inline tail of stdout/stderr once terminal.
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap(
+            "job_join",
+            lambda: _jm().join(job_id, timeout_s=timeout_s, after_version=after_version,
+                               tail_bytes=tail_bytes),
+        )
+    )
+
+
+@mcp.tool(title="Job List", annotations=_READ)
+async def job_list(
+    task_id: str | None = None,
+    status: str | None = None,
+    limit: int = 20,
+    cursor: str | None = None,
+) -> dict:
+    """Metadata-only listing of owned jobs, newest first, bounded by count AND by the combined 4 KB
+    batch budget; truncated=True with next_cursor when either bound cut the list.
+
+    Args:
+        task_id: Only jobs under this managed task.
+        status: Only jobs with this effective status.
+        limit: Max rows (default 20).
+        cursor: Continue below this job id (from next_cursor).
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap(
+            "job_list",
+            lambda: _jm().list(task_id=task_id, status=status, limit=limit, cursor=cursor),
+        )
+    )
+
+
+@mcp.tool(title="Job Output", annotations=_READ)
+async def job_output(
+    job_id: str,
+    stream: str = "stdout",
+    offset: int = 0,
+    limit: int = 4096,
+    tail: bool = False,
+) -> dict:
+    """Bounded retrieval of a job's retained stdout / stderr / supervisor log by offset+limit
+    (tail=True reads the last `limit` bytes). Carries bytes_total, next_offset and a truthful
+    truncated flag so the complete evidence remains reachable in further bounded reads.
+
+    Args:
+        job_id: Job id.
+        stream: stdout | stderr | supervisor.
+        offset: Byte offset to start from.
+        limit: Max bytes to return (<= 65536).
+        tail: Read the last `limit` bytes instead.
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap(
+            "job_output",
+            lambda: _jm().output(job_id, stream=stream, offset=offset, limit=limit, tail=tail),
         )
     )
 

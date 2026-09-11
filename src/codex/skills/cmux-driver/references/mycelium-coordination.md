@@ -129,6 +129,24 @@ context on every tool call:
   busy refusal stays pending until the executor's next turn. This is the same acceptance evidence as
   `references/bridge-mcp.md`; delivery/acknowledged/completed stay distinct.
 
+## Owned jobs, schedule verification and output budgets (efficiency v2)
+
+- The executor starts local work with the coordination CLI `job-run` (managed: `--task --action-id
+  --dispatch-identity` naming the open work reservation of the current brief; re-checked at launch).
+  Read progress with the read-only MCP tools `job_status` / `job_list` / `job_output` or one
+  `job_join` (≤50 s in-tool wait; `stop_waiting` on task deadline, pause or closure). One join per
+  permitted interval; no clock or sleep loops around it; no join for synchronous reads. There is no
+  MCP launch route by design.
+- Scheduler canary: plan with `sched_plan` (Eastern by default; output carries `intended_utc` and
+  one-shot UTC submission data), create the automation with the official `automation_update` tool,
+  then `sched_verify` the persisted row (`~/.codex/sqlite/codex-dev.db`, `next_run_at` in epoch ms,
+  read-only) or the tool's returned record. Only `match` is success; `cannot_evaluate` (no
+  `next_run_at`, e.g. a PAUSED row) is not a verdict; `mismatch` on an ACTIVE row means pause/delete
+  through `automation_update` before anything else.
+- Owned job/list/status/verify outputs fit a combined 4 KB batch budget with truthful `truncated`
+  flags and cursors/offsets; full stdout/stderr stay on disk under the coordination state root.
+  Host-native `functions.exec` output is not capped by this package.
+
 ## Authority and safe fallback
 
 The sole-executor rule and every ratified gate stand unchanged; Mycelium is talk + state. If the

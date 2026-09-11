@@ -49,6 +49,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import hashlib
 import json
+import re
 import os
 
 from .model import ProtocolError
@@ -158,6 +159,13 @@ def _load_policy(path=None) -> dict:
 def _parse_ts(value) -> datetime:
     """Parse an ISO-8601 timestamp, defaulting a naive value to UTC. Raises ValueError/TypeError on
     anything unparseable — the single place expiry strings are interpreted."""
+    if isinstance(value, str):
+        # Python < 3.11 rejects the 'Z' designator and fractions other than 3/6 digits; such an
+        # expiry must not read as "unparseable" (which fails closed as expired) on a 3.9 host.
+        if value.endswith(("Z", "z")):
+            value = value[:-1] + "+00:00"
+        value = re.sub(r"\.(\d+)(?=[+-]\d{2}:?\d{2}$|$)",
+                       lambda m: "." + (m.group(1) + "000000")[:6], value)
     dt = datetime.fromisoformat(value)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)

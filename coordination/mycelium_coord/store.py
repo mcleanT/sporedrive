@@ -29,7 +29,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-MANAGED_SUBDIRS = ("tasks", "locks", "sessions")
+MANAGED_SUBDIRS = ("tasks", "locks", "sessions", "jobs")
 
 # Filesystem-safe id charset shared with the bridge's request_id (so a message_id can BE a bridge
 # request_id, D4). 1..120 chars. Rejects path traversal / separators outright.
