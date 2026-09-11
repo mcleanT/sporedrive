@@ -8,6 +8,12 @@ Maintained source: `~/tools/sporedrive/src/codex/AGENTS.md`; install with `scrip
 - Drive/supervise an existing Claude session: use `cmux-driver`; Claude is the sole writer in that worktree. Bind exact native identity and reuse the owner's authorization.
 - Implement only when the owner asks Codex to change files, in a checkout no Claude session owns. Do not use another agent to bypass filesystem permissions.
 
+## Owner scheduling timezone
+
+Use **America/New_York (Eastern time)** for all schedules and user-facing dates/times by default: EST in winter, EDT in summer. Interpret the owner's casual “EST” as local Eastern time unless they explicitly specify fixed UTC−5. This preference persists across sessions; only an explicit owner instruction changes it.
+
+For “in N hours/minutes,” compute the intended instant from the current time. Translate it into the scheduler's actual timezone; never assume a raw recurrence rule uses local time. After creating or changing a schedule, read its persisted next-run timestamp, convert it back to America/New_York, and verify the intended date/time before confirming. Report the Eastern date/time and offset when ambiguity matters. A successful scheduling tool call alone is not verification. Recurring local-clock schedules must preserve Eastern time across daylight-saving changes; a fixed UTC recurrence does not provide that guarantee.
+
 ## Default operating approach
 
 Optimize in this order: unnecessary model wakeups, carried history, oversized/repeated evidence reads, post-completion work, routine reasoning effort. The owner's 40/30/15/10/5 estimates establish priorities, not promised savings.

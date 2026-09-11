@@ -3,6 +3,12 @@
 <!-- Maintained source: ~/tools/codex-claude-workflow/src/claude/CLAUDE.md (contract 1.1.0, 2026-09-08).
      Edit the source and run scripts/wfctl.py install; do not hand-edit the installed copy. -->
 
+## Owner scheduling timezone
+
+Use **America/New_York (Eastern time)** for all schedules and user-facing dates/times by default: EST in winter, EDT in summer. Interpret the owner's casual “EST” as local Eastern time unless they explicitly specify fixed UTC−5. This preference persists across sessions; only an explicit owner instruction changes it.
+
+For “in N hours/minutes,” compute the intended instant from the current time. Translate it into the scheduler's actual timezone; never assume a raw recurrence rule uses local time. After creating or changing a schedule, read its persisted next-run timestamp, convert it back to America/New_York, and verify the intended date/time before confirming. Report the Eastern date/time and offset when ambiguity matters. A successful scheduling tool call alone is not verification. Recurring local-clock schedules must preserve Eastern time across daylight-saving changes; a fixed UTC recurrence does not provide that guarantee.
+
 ## Default operating mode: fewer calls, less carried context
 
 Prioritize unnecessary polling, carried history, evidence size, terminal stopping, then effort. The owner's40/30/15/10/5 shares are estimates for prioritization, not measured savings guarantees.
