@@ -51,6 +51,10 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]  # codex-claude-workflow
 CANONICAL = REPO / "coordination"  # single canonical coordination source
 CANONICAL_BRIDGE = REPO / "bridge"  # single canonical bridge source
+# Version-controlled core-hook overlay (request-reduction v1): files here replace the same
+# relative path from the SOURCE working tree (never patched in place, never a cache edit) and are
+# verified against this repo, with the replaced source hash recorded for provenance.
+CANONICAL_OVERLAY = REPO / "core-overlay"
 DEFAULT_SOURCE = Path.home() / "tools" / "mycelium-lifecycle-wfi"
 DEFAULT_TARGET = Path.home() / "tools" / "mycelium-integration-wfi"
 
@@ -301,11 +305,19 @@ def closure(root: Path) -> dict:
     return dict(sorted(files.items()))
 
 
-def _cross_origin(stage: Path, source: Path) -> tuple[dict, dict, list[str]]:
-    """Verify retained files == SOURCE and coordination/bridge/skill == CANONICAL. Returns
-    (retained_map, canonical_map, problems)."""
+def _overlay_files(overlay) -> set:
+    if overlay is None or not Path(overlay).is_dir():
+        return set()
+    return set(_rel_files(Path(overlay)))
+
+
+def _cross_origin(stage: Path, source: Path, overlay=None) -> tuple[dict, dict, list[str], dict]:
+    """Verify retained files == SOURCE, coordination/bridge/skill == CANONICAL and overlay files ==
+    the repo-owned overlay (recording the source hash each one replaced). Returns
+    (retained_map, canonical_map, problems, overlay_map)."""
     problems = []
-    retained, canonical = {}, {}
+    retained, canonical, overlaid = {}, {}, {}
+    overlay_rels = _overlay_files(overlay)
     canon_prefixes = ("coordination/", "bridge/", "skills/coordinate/")
     for rel in _rel_files(stage):
         if rel in _GENERATED:
@@ -329,6 +341,15 @@ def _cross_origin(stage: Path, source: Path) -> tuple[dict, dict, list[str]]:
                 problems.append(f"coordination/bridge file != canonical: {rel}")
         elif rel in _MODIFIED_FROM_SOURCE:
             continue  # intentionally rewritten
+        elif rel in overlay_rels:
+            origin = Path(overlay) / rel
+            src_origin = source / rel
+            overlaid[rel] = {
+                "sha256": digest,
+                "replaced_source_sha256": _sha256(src_origin) if src_origin.is_file() else None,
+            }
+            if _sha256(origin) != digest:
+                problems.append(f"overlay file != repo overlay: {rel}")
         else:
             origin = source / rel
             if origin.is_file():
@@ -341,7 +362,7 @@ def _cross_origin(stage: Path, source: Path) -> tuple[dict, dict, list[str]]:
     for rel in _CRITICAL_RETAINED:
         if not (stage / rel).is_file():
             problems.append(f"critical retained file missing: {rel}")
-    return retained, canonical, problems
+    return retained, canonical, problems, overlaid
 
 
 def _validate_manifests(stage: Path) -> list[str]:
@@ -387,12 +408,14 @@ def _validate_bridge_import(stage: Path) -> list[str]:
 
 
 # ------------------------------------------------------------------ build + swap
-def _stage(source: Path, target: Path, build_id: str) -> tuple[Path, dict]:
+def _stage(source: Path, target: Path, build_id: str, overlay=None) -> tuple[Path, dict]:
     parent = target.parent
     parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=".stage.export.", dir=str(parent)))
 
     _copy_tree(source, stage)  # 1. full source (Mycelium identity)
+    if overlay is not None and Path(overlay).is_dir():
+        _copy_tree(Path(overlay), stage)  # 1b. version-controlled core-hook overlay (repo-owned)
     _copy_tree(CANONICAL, stage / "coordination")  # 2. coordination overlay
     _copy_tree(CANONICAL_BRIDGE, stage / "bridge")  # 3. bridge overlay (import path)
     (stage / "skills" / "coordinate").mkdir(parents=True, exist_ok=True)
@@ -435,7 +458,7 @@ def _swap(stage: Path, target: Path) -> None:
 
 
 def export(
-    source: Path, target: Path, force: bool, keep_stage: bool, build_id: str
+    source: Path, target: Path, force: bool, keep_stage: bool, build_id: str, overlay=None
 ) -> dict:
     for req in (
         CANONICAL,
@@ -448,10 +471,10 @@ def export(
             sys.exit(f"required input missing: {req}")
     _guard_target(source, target, force)
 
-    stage, manifests = _stage(source, target, build_id)
+    stage, manifests = _stage(source, target, build_id, overlay)
 
     problems = _validate_manifests(stage)
-    retained, canonical, xo = _cross_origin(stage, source)
+    retained, canonical, xo, overlaid = _cross_origin(stage, source, overlay)
     problems += xo
     problems += _validate_bridge_import(stage)
     if problems:
@@ -474,6 +497,8 @@ def export(
         },
         "retained_from_source": retained,
         "coordination_from_canonical": canonical,
+        "overlay_from_canonical": overlaid,
+        "overlay_dir": str(overlay) if overlay is not None else None,
         "closure": closure(stage),
     }
     _write_json(stage / "EXPORT_MANIFEST.json", manifest)
@@ -482,7 +507,7 @@ def export(
 
 
 # ------------------------------------------------------------------ verify (standalone)
-def verify(target: Path, source: Path) -> tuple[bool, list[str]]:
+def verify(target: Path, source: Path, overlay=None) -> tuple[bool, list[str]]:
     mpath = target / "EXPORT_MANIFEST.json"
     if not mpath.is_file():
         return False, [f"no EXPORT_MANIFEST.json in {target}"]
@@ -506,6 +531,14 @@ def verify(target: Path, source: Path) -> tuple[bool, list[str]]:
         o = source / rel
         if not o.is_file() or _sha256(o) != digest:
             problems.append(f"retained != source: {rel}")
+    ov = overlay if overlay is not None else (Path(rec["overlay_dir"]) if rec.get("overlay_dir") else None)
+    for rel, meta in rec.get("overlay_from_canonical", {}).items():
+        o = Path(ov) / rel if ov is not None else None
+        if o is None or not o.is_file() or _sha256(o) != meta.get("sha256"):
+            problems.append(f"overlay != repo overlay: {rel}")
+        s_o = source / rel
+        if s_o.is_file() and meta.get("replaced_source_sha256") not in (None, _sha256(s_o)):
+            problems.append(f"overlay replaced-source hash drifted (source changed since export): {rel}")
     for rel, digest in rec.get("coordination_from_canonical", {}).items():
         if rel.startswith("coordination/"):
             o = CANONICAL / rel[len("coordination/") :]
@@ -581,7 +614,18 @@ def main() -> int:
         default=BUILD_ID,
         help="semver build identifier appended to the plugin version (default: %(default)s)",
     )
+    ap.add_argument(
+        "--overlay",
+        type=Path,
+        default=CANONICAL_OVERLAY,
+        help="repo-owned core-hook overlay dir whose files replace the same relative source paths "
+        "(default: %(default)s; pass --no-overlay to export the source hooks unchanged)",
+    )
+    ap.add_argument("--no-overlay", action="store_true", help="export without the core-hook overlay")
     args = ap.parse_args()
+    overlay = None if args.no_overlay else args.overlay
+    if overlay is not None and not overlay.is_dir():
+        sys.exit(f"overlay dir missing: {overlay}")
     if not re.fullmatch(r"[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*", args.build_id):
         sys.exit(
             f"invalid --build-id {args.build_id!r}: expected dot-separated "
@@ -589,14 +633,14 @@ def main() -> int:
         )
 
     if args.verify_only:
-        ok, problems = verify(args.target, args.source)
+        ok, problems = verify(args.target, args.source, overlay)
         print(json.dumps({"verified": ok, "problems": problems}, indent=2))
         return 0 if ok else 1
 
     manifest = export(
-        args.source, args.target, args.force, args.keep_stage, args.build_id
+        args.source, args.target, args.force, args.keep_stage, args.build_id, overlay
     )
-    ok, problems = verify(args.target, args.source)
+    ok, problems = verify(args.target, args.source, overlay)
     print(
         json.dumps(
             {
@@ -606,6 +650,7 @@ def main() -> int:
                 "coordination_from_canonical": len(
                     manifest["coordination_from_canonical"]
                 ),
+                "overlay_from_canonical": sorted(manifest["overlay_from_canonical"]),
                 "manifest_versions": manifest["manifest_versions"],
                 "canonical_source": manifest["canonical_source"],
                 "source_candidate": manifest["source_candidate"],

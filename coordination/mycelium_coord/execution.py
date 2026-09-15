@@ -227,6 +227,175 @@ class ExecutionManager:
         rec = self.read_execution(task_id)
         return None if rec is None else self._summary(rec)
 
+    # ------------------------------------------------------------------ combined receipt (read-only)
+    def receipt(self, task_id: str, *, after_version=None, checks_limit: int = 8, budget=None):
+        """ONE bounded operation receipt: status/phase, usage vs limits, coverage, acceptance state
+        (accepted criteria with evidence path + sha256, pending criteria), the latest settled check
+        results (newest first, at most ``checks_limit``), the completion pointer, ``stop``/``terminal``
+        flags and a ``state_version`` cursor. When ``after_version`` equals the current
+        ``state_version`` the telemetry is suppressed (``changed`` False, ``suppressed`` True, only
+        identity + cursor) so unchanged state never reaches a model turn. Never mutates and never
+        interprets an artifact — pointers are read with :meth:`evidence`."""
+        from .views import BATCH_BUDGET_BYTES, fit_batch, stops_wait
+
+        budget = int(budget) if budget else BATCH_BUDGET_BYTES
+        rec = self.read_execution(task_id)
+        if rec is None:
+            return None
+        version = int(rec.get("state_version", 0))
+        changed = after_version is None or version > int(after_version)
+        head = {
+            "receipt": "execution",
+            "task_id": rec["task_id"],
+            "execution_id": rec["execution_id"],
+            "state_version": version,
+            "changed": changed,
+        }
+        if not changed:
+            head["suppressed"] = True
+            return head
+        summary = self._summary(rec)
+        manifest = rec.get("acceptance_manifest") or {}
+        accepted = {}
+        for cid, ev in (rec.get("accepted_evidence") or {}).items():
+            accepted[cid] = {
+                "evidence_ref": ev.get("evidence_ref"),
+                "evidence_sha256": ev.get("evidence_sha256"),
+                "accepted_at": ev.get("accepted_at"),
+                "accepted_by": ev.get("accepted_by"),
+            }
+        pending = sorted(c for c, spec in manifest.items() if not (spec or {}).get("accepted"))
+        completion = rec.get("completion") or None
+        head.update(
+            {
+                "status": rec["status"],
+                "phase": rec["phase"],
+                "terminal": rec["status"] == STATUS_COMPLETED,
+                "stop": stops_wait(summary),
+                "usage": summary["usage"],
+                "limits": summary["limits"],
+                "coverage": summary["coverage"],
+                "expired": summary["expired"],
+                "expires_at": summary["expires_at"],
+                "open_reservations": summary["open_reservations"],
+                "open_blockers": [
+                    b.get("blocker_id") or b.get("id") for b in summary["blockers"]
+                ],
+                "shutdown_pending": summary["shutdown_pending"],
+                "acceptance": {
+                    "freeze": rec.get("acceptance_freeze"),
+                    "accepted": accepted,
+                    "pending": pending,
+                    "invalidations": len(rec.get("acceptance_invalidations") or []),
+                },
+                "completion": (
+                    {k: completion.get(k) for k in ("completion_ref", "accepted_by", "at")}
+                    if completion
+                    else None
+                ),
+                "last_action": rec.get("last_action"),
+            }
+        )
+        reservations = (rec.get("usage") or {}).get("reservations") or {}
+        settled = [
+            (i, aid, r)
+            for i, (aid, r) in enumerate(reservations.items())
+            if r.get("status") in ("settled", "invalidated")
+        ]
+        # newest first; the insertion index breaks same-millisecond ties truthfully
+        settled.sort(
+            key=lambda p: (p[2].get("settled_at") or p[2].get("reserved_at") or "", p[0]),
+            reverse=True,
+        )
+        checks = [
+            {
+                "action_id": r.get("action_id") or aid,
+                "kind": r.get("kind"),
+                "status": r.get("status"),
+                "outcome": r.get("outcome"),
+                "criterion_ref": r.get("criterion_ref"),
+                "evidence_ref": r.get("evidence_ref") or r.get("response_ref"),
+                "settled_at": r.get("settled_at"),
+            }
+            for (_i, aid, r) in settled[: max(0, int(checks_limit))]
+        ]
+        head["checks_total"] = len(settled)
+        return fit_batch(
+            checks, budget=budget, cursor_key="action_id", envelope=head, items_key="checks"
+        )
+
+    def evidence(
+        self,
+        task_id: str,
+        *,
+        criterion_id=None,
+        action_id=None,
+        completion: bool = False,
+        offset: int = 0,
+        limit=None,
+        tail: bool = False,
+        budget=None,
+    ) -> dict:
+        """Bounded offset/limit retrieval of ONE artifact already recorded in the execution record
+        (an accepted criterion's evidence, a settled reservation's evidence/response ref, or the
+        completion ref) — never an arbitrary path. Carries ``bytes_total``, ``next_offset``, a
+        truthful ``truncated`` flag, the sha256 of the WHOLE file on disk, the recorded digest and
+        ``sha256_match`` (None when no digest was recorded). Read-only; ``budget`` 0/None means only
+        ``limit`` applies."""
+        from .views import BATCH_BUDGET_BYTES, read_bounded
+
+        limit = int(limit) if limit is not None else BATCH_BUDGET_BYTES
+        budget = BATCH_BUDGET_BYTES if budget is None else int(budget)
+        rec = self._require(task_id)  # bounded read stays available on a legacy policy
+        chosen = [x for x in (criterion_id, action_id, completion) if x]
+        if len(chosen) != 1:
+            raise ProtocolError(
+                "invalid_evidence_selector",
+                task_id,
+                "exactly one of criterion_id, action_id or completion is required",
+            )
+        if criterion_id:
+            ev = (rec.get("accepted_evidence") or {}).get(criterion_id)
+            if ev is None:
+                raise ProtocolError(
+                    "unknown_criterion", criterion_id, "no accepted evidence for that criterion"
+                )
+            ref, recorded = ev.get("evidence_ref"), ev.get("evidence_sha256")
+            env = {"criterion_id": criterion_id}
+        elif action_id:
+            res = ((rec.get("usage") or {}).get("reservations") or {}).get(action_id)
+            if res is None:
+                raise ProtocolError(
+                    "unknown_reservation", action_id, "no reservation with that action_id"
+                )
+            ref, recorded = (res.get("evidence_ref") or res.get("response_ref")), None
+            env = {"action_id": action_id}
+        else:
+            comp = rec.get("completion") or {}
+            ref, recorded = comp.get("completion_ref"), None
+            env = {"completion": True}
+        env.update(
+            {
+                "task_id": rec.get("task_id", task_id),
+                "state_version": rec.get("state_version"),
+                "evidence_ref": ref,
+                "recorded_sha256": recorded,
+            }
+        )
+        if not ref:
+            raise ProtocolError(
+                "missing_evidence", task_id, "no artifact reference recorded for that selector"
+            )
+        computed = _sha256_file(Path(str(ref)))
+        env["sha256"] = computed
+        env["sha256_match"] = (
+            None if recorded is None or computed is None else computed == recorded
+        )
+        env["local"] = computed is not None
+        return read_bounded(
+            ref, offset=offset, limit=limit, tail=tail, budget=(budget or None), envelope=env,
+        )
+
     # ------------------------------------------------------------------ dispatchability (read-only)
     def _dispatchable(
         self,
@@ -532,6 +701,12 @@ class ExecutionManager:
             },
             "expires_at": limits.get("expires_at"),
             "expired": self._expired(rec),
+            "authorization": {
+                "opened": rec.get("authorization_ref"),
+                "scope_amendments": len(rec.get("scope_amendments") or []),
+                "last_recovery": (rec.get("scope_amendments") or [None])[-1],
+                "paused_by": (rec.get("pause") or {}).get("authorization_ref"),
+            },
             "blockers": [
                 b for b in rec.get("blockers", []) if b.get("status") == "open"
             ],
@@ -677,6 +852,7 @@ class ExecutionManager:
                 "blockers": [],
                 "backlog": [],
                 "limit_changes": [],
+                "scope_amendments": [],
                 "last_action": None,
                 "pause": None,
                 "closure": None,
@@ -1687,9 +1863,39 @@ class ExecutionManager:
             self._audit(task_id, "pause", {"draining": bool(open_res)})
             return {"execution": self._summary(rec)}
 
+    def _record_amendment(self, rec, *, via, authorization_ref, note=None, fields=None) -> dict:
+        """Append-only owner-authorized recovery ledger (request-reduction v1, item 6). Records the
+        authorization that reopened/extended the execution so a later fresh read supersedes any
+        older STOP snapshot without a second owner confirmation. Never touches usage,
+        acceptance_manifest, accepted_evidence or acceptance_freeze: frozen history is not
+        reinterpreted and past usage is not reset."""
+        entry = {
+            "at": utcnow(),
+            "via": via,
+            "authorization_ref": authorization_ref,
+            "note": (str(note)[:500] if note else None),
+            "fields": sorted(fields or []),
+            "state_version_before": rec.get("state_version"),
+            "status_before": rec.get("status"),
+        }
+        rec.setdefault("scope_amendments", []).append(entry)
+        rec["last_action"] = {
+            "id": via,
+            "kind": "authorized_recovery",
+            "outcome": "applied",
+            "evidence_ref": authorization_ref,
+        }
+        return entry
+
     def unpause(
-        self, task_id: str, *, authorization_ref: str, expected_state_version=None
+        self, task_id: str, *, authorization_ref: str, expected_state_version=None,
+        scope_amendment=None,
     ) -> dict:
+        """Owner-authorized unpause. The recorded ``authorization_ref`` IS the owner approval; an
+        agent that sees it in a fresh read does not ask again. Refused on an expired execution
+        (extend ``expires_at`` through ``change_limits`` first) and never reports ``active`` while
+        the work-dispatch allowance is already spent (status becomes ``exhausted`` truthfully).
+        Past usage and frozen acceptance are untouched."""
         if not authorization_ref:
             raise ProtocolError(
                 "missing_authorization",
@@ -1701,10 +1907,22 @@ class ExecutionManager:
             self._check_version(rec, expected_state_version)
             if rec["status"] not in (STATUS_PAUSED, STATUS_DRAINING):
                 raise ProtocolError("not_paused", task_id, "execution is not paused")
-            rec["status"] = STATUS_ACTIVE
+            if self._expired(rec):
+                raise ProtocolError(
+                    "execution_expired",
+                    task_id,
+                    "expired execution stays stopped; extend expires_at via change_limits "
+                    "(with an authorization_ref) before unpausing",
+                )
+            wd = rec["limits"].get("work_dispatches")
+            spent = wd is not None and int(rec["usage"].get("work_dispatches", 0)) >= int(wd)
+            rec["status"] = STATUS_EXHAUSTED if spent else STATUS_ACTIVE
             rec["pause"] = None
+            self._record_amendment(rec, via="unpause", authorization_ref=authorization_ref,
+                                   note=scope_amendment)
             rec = self._write(task_id, rec)
-            self._audit(task_id, "unpause", {"authorization_ref": authorization_ref})
+            self._audit(task_id, "unpause", {"authorization_ref": authorization_ref,
+                                             "scope_amendment": bool(scope_amendment)})
             return {"execution": self._summary(rec)}
 
     def change_limits(
@@ -1714,6 +1932,7 @@ class ExecutionManager:
         authorization_ref: str,
         changes: dict,
         expected_state_version=None,
+        scope_amendment=None,
     ) -> dict:
         if not authorization_ref:
             raise ProtocolError(
@@ -1753,22 +1972,19 @@ class ExecutionManager:
                     "changes": applied,
                 }
             )
+            self._record_amendment(rec, via="change_limits", authorization_ref=authorization_ref,
+                                   note=scope_amendment, fields=applied.keys())
             # an authorized raise can lift an exhausted state; PAST USAGE IS UNCHANGED.
             if rec["status"] == STATUS_EXHAUSTED:
                 wd = limits.get("work_dispatches")
                 if wd is None or rec["usage"].get("work_dispatches", 0) < int(wd):
                     rec["status"] = STATUS_ACTIVE
-            rec["last_action"] = {
-                "id": "change_limits",
-                "kind": "limit_change",
-                "outcome": "applied",
-                "evidence_ref": authorization_ref,
-            }
             rec = self._write(task_id, rec)
             self._audit(
                 task_id,
                 "change_limits",
-                {"authorization_ref": authorization_ref, "fields": sorted(applied)},
+                {"authorization_ref": authorization_ref, "fields": sorted(applied),
+                 "scope_amendment": bool(scope_amendment)},
             )
             return {"execution": self._summary(rec), "applied": applied}
 

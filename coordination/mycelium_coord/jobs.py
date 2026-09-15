@@ -389,7 +389,7 @@ class JobManager:
                 receipt["replayed"] = False
                 receipt["launched"] = True
         if join_s and float(join_s) > 0:
-            joined = self.join(job_id, timeout_s=join_s, tail_bytes=tail_bytes)
+            joined = self.join(job_id, timeout_s=join_s, tail_bytes=tail_bytes, route="cli")
             joined["replayed"] = receipt["replayed"]
             joined["launched"] = receipt["launched"]
             return joined
@@ -431,13 +431,20 @@ class JobManager:
 
     # ------------------------------------------------------------------ join (bounded, in-tool)
     def join(self, job_id: str, *, timeout_s: float = JOIN_MAX_S, after_version=None,
-             tail_bytes: int = DEFAULT_TAIL_BYTES, budget: int = BATCH_BUDGET_BYTES) -> dict:
+             tail_bytes: int = DEFAULT_TAIL_BYTES, budget: int = BATCH_BUDGET_BYTES,
+             route: str = "cli", host_yield_s=None) -> dict:
         """Wait inside the tool (≤ :data:`JOIN_MAX_S` s) until the job is terminal, its status
         record changes past ``after_version``, the managed execution stops (paused/closed/expired/
         completed → ``stop_waiting``), the task deadline passes, or the timeout elapses. Never a
-        bare "still running": ``changed`` is False only with ``timed_out`` or ``stop_waiting``."""
+        bare "still running": ``changed`` is False only with ``timed_out`` or ``stop_waiting``.
+        ``route`` selects the wait-budget adapter (:mod:`waitpath`): a direct MCP call is capped
+        below the host tool yield (25 s by default); ``wait_path`` in the result reports the
+        timeout actually applied and, for the CLI route, the outer shell allowance to use."""
+        from .waitpath import plan_wait
+
         req, _ = self._require(job_id)
-        timeout_s = max(0.0, min(float(timeout_s), JOIN_MAX_S))
+        wait_path = plan_wait(route, timeout_s, host_yield_s=host_yield_s, hard_max_s=JOIN_MAX_S)
+        timeout_s = wait_path["applied_s"]
         deadline = time.monotonic() + timeout_s
         task_id = req.get("task_id")
         exec_deadline_reason = None
@@ -475,6 +482,7 @@ class JobManager:
                                      "task_" + str(ex_view.get("status"))) if stop else None),
                     "waited_s": round(timeout_s - max(0.0, deadline - time.monotonic()), 3),
                     "join_max_s": JOIN_MAX_S,
+                    "wait_path": wait_path,
                     "execution": ex_view,
                     "command": req.get("argv", [None])[0],
                     "outputs": self._outputs(job_id, tail_bytes=tail_bytes if eff["terminal"] else 0),

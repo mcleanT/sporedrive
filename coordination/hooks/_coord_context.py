@@ -26,9 +26,21 @@ def main() -> int:
     if execution:
         lines.append(f"Current execution: {execution.get('status')}"
                      f" (version {execution.get('state_version')}; expired={execution.get('expired')}).")
+        rec = (execution.get("authorization") or {}).get("last_recovery")
+        if rec:
+            lines.append(f"Owner-authorized recovery already recorded: {rec.get('via')} at {rec.get('at')} "
+                         f"(auth {rec.get('authorization_ref')}). Do not ask for that approval again; "
+                         "this fresh read supersedes any older STOP snapshot.")
     if stopped:
-        lines.append("STOP: task is paused, expired, exhausted or closed. Do not resume old checkpoint work, "
-                     "poll, compact or create a successor task. Only bounded reconciliation is permitted.")
+        if execution.get("expired"):
+            lines.append("STOP: execution expired. New work is refused; only bounded reconciliation. "
+                         "Only the owner can extend expires_at via exec-change-limits with an authorization ref.")
+        else:
+            lines.append(f"STOP: execution {execution.get('status') or 'stopped'}. Do not resume old checkpoint "
+                         "work, poll, compact or create a successor task. Only bounded reconciliation is "
+                         "permitted. If the owner has ALREADY approved continuing, the supported path is "
+                         "exec-change-limits / exec-unpause with that instruction as --authorization, then a "
+                         "fresh exec-status; never grant yourself authority or reset past usage.")
     if ck and not stopped:
         lines.append(f"Current checkpoint rev {ck.get('revision')} (auth {ck.get('authorization_ref')}).")
         nxt = body.get("next_action") or body.get("next")

@@ -1104,17 +1104,23 @@ class Coordinator:
         poll_s: float = 0.5,
         limit: int = 10,
         compact: bool = False,
+        route: str = "cli",
+        host_yield_s=None,
     ) -> dict:
         """Bounded wait for NEW addressed messages after a cursor. Truthful: a filesystem poll with a
         finite timeout, NOT a host wake-up. Returns as soon as any qualifying message exists or the
-        timeout elapses (timed_out True, empty list). Never blocks unbounded."""
+        timeout elapses (timed_out True, empty list). Never blocks unbounded. ``route`` selects the
+        wait-budget adapter (:mod:`waitpath`): a direct MCP call is capped below the host's tool
+        yield; the result's ``wait_path`` states the timeout actually applied."""
         from .execution import ExecutionManager
         from .views import execution_view, stops_wait
+        from .waitpath import plan_wait
 
         # A bad participant must not turn into a successful terminal-state observation.
         self._participant(task_id, participant_id)
         manager = ExecutionManager(self.store)
-        timeout_s = max(0.0, min(float(timeout_s), 600.0))
+        wait_path = plan_wait(route, timeout_s, host_yield_s=host_yield_s, hard_max_s=600.0)
+        timeout_s = wait_path["applied_s"]
         poll_s = max(0.05, min(float(poll_s), 5.0))
         deadline = time.monotonic() + timeout_s
         while True:
@@ -1123,13 +1129,14 @@ class Coordinator:
                 return {"messages": [], "next_after_seq": int(after_seq), "returned": 0,
                         "truncated": False, "timed_out": False, "stop_waiting": True,
                         "reason": "task_expired" if status.get("expired") else "task_" + status["status"],
-                        "execution": status}
+                        "execution": status, "wait_path": wait_path}
             res = self.inbox(task_id, participant_id, after_seq=after_seq, kinds=kinds,
                              limit=limit, compact=compact)
             if res["messages"]:
                 res["timed_out"] = False
                 res["execution"] = status
                 res["stop_waiting"] = False
+                res["wait_path"] = wait_path
                 return res
             if time.monotonic() >= deadline:
                 return {
@@ -1141,6 +1148,7 @@ class Coordinator:
                     "unchanged": True,
                     "stop_waiting": False,
                     "execution": status,
+                    "wait_path": wait_path,
                 }
             time.sleep(min(poll_s, max(0.0, deadline - time.monotonic())))
 

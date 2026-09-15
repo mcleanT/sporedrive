@@ -151,6 +151,31 @@ context on every tool call:
   flags and cursors/offsets; full stdout/stderr stay on disk under the coordination state root.
   Host-native `functions.exec` output is not capped by this package.
 
+## Owner-authorized recovery, routine workers, one wait path (request reduction v1)
+
+- A paused / exhausted / expired execution is reopened ONLY through the owner-linked path, in this
+  order: `exec-change-limits TASK --authorization <owner instruction ref> --scope-amendment "…"
+  --changes '{"expires_at": "...", "work_dispatches": N, ...}'` (when expired or the allowance is
+  spent), then `exec-unpause TASK --authorization <same ref>`. Both record an append-only
+  `scope_amendments` entry and never reset usage or frozen acceptance. `unpause` refuses an expired
+  execution (`execution_expired`) and reports `exhausted`, not `active`, when the allowance is spent.
+- After the change, ONE fresh `exec-status` / `resume` is the current truth: it shows
+  `execution.authorization.last_recovery` and supersedes any earlier STOP snapshot or startup notice.
+  Do not ask the owner to confirm again and do not compose authority from summaries. The supervisor
+  writes only the amendment brief; historical frozen criteria are not reinterpreted.
+- Routine work (bounded extraction, summarization, formatting, candidate preparation) goes to
+  `worker-run WORKER_ID --prompt FILE --task T --action-id RES --dispatch-identity ID --join 50`
+  (profile `routine` = `gpt-5.6-luna` at `low`, compact fresh context, no delegation/housekeeping)
+  followed by `worker-result WORKER_ID` (deterministic validation; one `escalation.json` on failure,
+  never an automatic Astra retry). Deterministic waits, hashes, timestamps and test execution use no
+  model. Global model defaults are never changed by this path.
+- Waits: direct MCP `coord_wait` / `job_join` apply a 25 s in-tool cap (host yield ~30 s); a 50 s
+  wait runs `mycelium-coord wait|job-join --timeout 50` through `functions.exec` with a 60 s outer
+  allowance. Check a pair with `wait-plan --route cli --timeout 50 --outer 60`. Results carry
+  `wait_path`. A stored message never wakes an idle host.
+- Between steps read ONE `exec-receipt TASK --after-version N`; `suppressed=true` means nothing
+  changed and no model turn is needed. When it reports `terminal`, deliver the receipt and stop.
+
 ## Authority and safe fallback
 
 The sole-executor rule and every ratified gate stand unchanged; Mycelium is talk + state. If the

@@ -105,6 +105,53 @@ output on disk, and an in-tool join of at most 50 s that stops on the task deadl
 execution — no MCP launch route), and a combined 4 KB batch budget for owned outputs with truthful
 `truncated` flags and offset/cursor retrieval of the full evidence. See `coordination/skill/SKILL.md`.
 
+**Request reduction v1 (explicit routine routing, one wait path, accounted housekeeping).** Six
+runtime fixes, all deterministic and none changing a global model default:
+
+- **Routine workers.** `worker-run` / `worker-result` (CLI only, managed like `job-run`) launch ONE
+  bounded codex worker with an explicitly selected profile — `routine` = `gpt-5.6-luna` at `low` — from
+  a compact fresh prompt file (<= 16 KiB, never a transcript), with delegation and hook-driven
+  housekeeping disabled and `MYCELIUM_ROUTINE_WORKER` / `MYCELIUM_NO_DELEGATE` /
+  `MYCELIUM_NO_HOUSEKEEPING` set. The request record stores the requested model/effort; `result.json`
+  stores the model actually reported by the banner (or `null`, never fabricated), output sha256 and a
+  deterministic validation. A failed or invalid result writes ONE `escalation.json` and is never
+  re-run with another model. Waiting, hashing, timestamps, retries and test execution use no model.
+  The owner's primary Astra model/effort and Claude ownership are untouched.
+- **One wait path.** `mycelium_coord/waitpath.py` is the single wait-budget adapter. A direct MCP
+  `coord_wait` / `job_join` is capped at 25 s (host tool-call yield ~30 s minus a 5 s margin, or
+  `host_yield_s - 5` when declared); a 50 s wait belongs on the CLI route inside a shell call given a
+  60 s outer allowance. Every wait/join result carries `wait_path` (route, requested, applied,
+  clamped, outer allowance) and `wait-plan` / `wait_plan` check a pair before use. No stored message
+  wakes an idle host; there is no recurring model monitor.
+- **Housekeeping attempt accounting.** The core health hook (shipped from the version-controlled
+  `core-overlay/`, exported by `scripts/export_coordination.py --overlay`) no longer dispatches the
+  knowledge audit / transfer worker from a stale success timestamp alone: a durable, atomic ledger
+  (`housekeeping_ledger.py`; in-flight / completed / failed / exhausted, attempt ids, bounded retries,
+  cooldown, one exhaustion notice) deduplicates startup/resume/compact re-runs and records failures.
+  Success timestamps are preserved; candidate extraction never promotes scientific knowledge by itself.
+- **Lifecycle lock contention.** A busy Stop lock emits exactly ONE actionable block (with the evidence
+  sentinel path) per unresolved condition; a repeat Stop under the same live owner is silent so the
+  host stops and the next SessionStart/Stop reconciles once the lock is free. Dead owners are
+  reclaimed, live owners are never force-unlocked, lineage is never discarded, failed finalization is
+  never marked successful.
+- **Combined receipts and the terminal rule.** `exec-receipt TASK [--after-version N]`
+  (`execution_receipt`) is the one bounded read between steps: status/usage/coverage, acceptance
+  pointers (path + sha256), latest settled checks, completion pointer, `stop`/`terminal`, and a
+  `state_version` cursor; an unchanged version returns `changed=false, suppressed=true` so unchanged
+  telemetry never re-enters a model turn. `exec-evidence` pages a recorded artifact with truthful
+  `truncated`/`next_offset`. Complete the required work, deliver the receipt, then stop — no follow-on
+  cleanup, audit, compaction or monitor. **Boundary:** these caps bound only this package's outputs;
+  they do not cap arbitrary host tools or the total model context.
+- **Owner-authorized recovery.** Owner approval recorded through `exec-change-limits` /
+  `exec-unpause` (`execution_change_limits` / `execution_unpause`, each requiring `--authorization`,
+  optional `--scope-amendment`) is sufficient: a fresh `exec-status` / `execution_read` / `resume`
+  showing `authorization.last_recovery` supersedes any older STOP snapshot and no second confirmation
+  is requested. The path never resets past usage, never rewrites frozen acceptance or accepted
+  evidence, and records an append-only `scope_amendments` entry. `unpause` is refused on an expired
+  execution (`execution_expired`; extend `expires_at` first) and reports `exhausted`, not `active`, when
+  the allowance is already spent. An agent never grants itself this authority; unauthorized or expired
+  work stays STOP.
+
 ## Bounded execution
 
 A supervised workflow is only meaningful if "supervised" is something the code enforces. A managed

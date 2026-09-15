@@ -19,6 +19,7 @@ Operate the exact authorized Claude session; Claude alone writes its worktree. R
 - After compaction restore scope, identities, checkpoint/cursors, decisive evidence, unknown attempts and remaining allowance once. Do not reread the full collaboration history or regenerate the plan.
 - Use deterministic code for routine observation and routing; use supported low effort for a necessary routine model decision. Substantial reviews use their explicit bounded settings. Do not claim a hard desktop reasoning cap.
 - One scoped review and one verification, not a verifier per finding. Stop once required work and authorized release are complete. A pause/exhausted allowance means one short retained-state receipt, no further compaction or bookkeeping turn.
+- When the owner approves continuing, apply it once through `execution_change_limits` / `execution_unpause` with the owner instruction as `authorization_ref` (plus `scope_amendment`), then re-read execution state; that fresh read supersedes the earlier STOP and no second confirmation is requested. Never compose authority yourself; expired or unauthorized work stays stopped. Route bounded extraction/summarization/formatting to a routine worker (`worker-run`, profile `routine` = gpt-5.6-luna at low); deterministic waits, hashes, timestamps and test runs use no model. Direct MCP waits are capped at 25 s; a 50 s wait runs on the CLI route with a 60 s outer shell allowance. Read one `exec-receipt --after-version N` between steps and stop when it reports `terminal`.
 
 ## Essential invariants
 

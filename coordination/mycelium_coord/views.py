@@ -47,7 +47,8 @@ def execution_view(status):
     if status is None:
         return None
     return {k: status.get(k) for k in ("execution_id", "status", "phase", "state_version",
-                                      "expired", "expires_at", "usage", "coverage")}
+                                      "expired", "expires_at", "usage", "coverage",
+                                      "authorization")}
 
 
 def stops_wait(status):
@@ -139,7 +140,7 @@ _REFERENCE_KEYS = frozenset({"path", "job_id", "stream", "evidence_dir", "superv
 
 
 def _is_reference(key: str) -> bool:
-    return key in _REFERENCE_KEYS or key.endswith(("_sha256", "_path", "_id", "_at", "_truncated"))
+    return key in _REFERENCE_KEYS or key.endswith(("_sha256", "_path", "_id", "_at", "_ref", "_truncated"))
 
 
 def shrink_tails(record: dict, budget: int = BATCH_BUDGET_BYTES, keys=("tail", "text")) -> dict:

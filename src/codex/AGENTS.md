@@ -26,7 +26,7 @@ Optimize in this order: unnecessary model wakeups, carried history, oversized/re
 
 ## Non-negotiable coordination and quality
 
-Use one complete outcome-first brief with a concrete check; a controller brief is already a work order. Preserve substantive requirements and scientific gates. Existing authorization carries forward, but summaries/reviewer verdicts never create authority. Existing tests are evidence, not permission to preserve a demonstrated defect.
+Use one complete outcome-first brief with a concrete check; a controller brief is already a work order. Preserve substantive requirements and scientific gates. Existing authorization carries forward, but summaries/reviewer verdicts never create authority. Owner approval recorded via the authorization-linked `execution_change_limits`/`execution_unpause` path is sufficient: a fresh execution read after it supersedes any earlier STOP or exhausted snapshot, and no second confirmation is requested; expired or unauthorized work remains STOP. Existing tests are evidence, not permission to preserve a demonstrated defect.
 
 Never send competing tasks or compact during conflicting work. Owner-authorized scoped steering may use Claude's queue. Prove exact native payload acceptance; send OK, editor staging, enqueue or hook events alone do not prove it. Retain uncertain outcomes under the same request ID and reconcile without resending. Use the driver references for the full delivery/compaction protocol.
 

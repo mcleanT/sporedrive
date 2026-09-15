@@ -102,8 +102,9 @@ mycelium-coord sched-plan   (--at "YYYY-MM-DD HH:MM" | --in 90m) [--tz America/N
 mycelium-coord sched-verify --intended-utc ISO (--persisted-json FILE|- | --next-run-at ISO --active BOOL)
 ```
 
-MCP (both hosts) exposes only the read-only routes: `job_status`, `job_join`, `job_list`, `job_output`,
-`sched_plan`, `sched_verify`. There is no MCP launch route: a job is started by the owned CLI from the
+MCP (both hosts) exposes only the read-only routes: `job_status`, `job_join` (25 s cap on this
+route), `job_list`, `job_output`, `wait_plan`, `execution_receipt`, `execution_evidence`, `sched_plan`,
+`sched_verify`. There is no MCP launch route: a job is started by the owned CLI from the
 host-authorized shell so its processes inherit that shell's permissions. A managed job runs under one
 open work reservation (re-checked immediately before the actual launch), keeps an immutable request
 record (identity, argv, cwd, deadline, reservation) and complete stdout/stderr on disk under the state
@@ -139,6 +140,52 @@ app's ordinary immediate create route (it rejects DTSTART and schedules to the m
 automation tool, then `sched-verify` the ACTUAL persisted `next_run_at`/status before any success claim:
 `match` is the only pass, `cannot_evaluate` is neither pass nor fail, and `mismatch` on an active record
 means `requires_native_pause` through that same official tool (the helper never writes the app store).
+
+### Request reduction v1: routine workers, one wait path, receipts, recovery
+
+```
+mycelium-coord worker-run  WORKER_ID --prompt FILE [--profile routine] [--expect json|text] [--require-key K]… \
+                           --task T --action-id RES --dispatch-identity ID [--deadline S] [--join S<=50]   # CLI only
+mycelium-coord worker-result WORKER_ID          # deterministic validation + provenance; ONE escalation.json, never a retry
+mycelium-coord wait-plan   --route mcp|cli --timeout S [--outer S] [--host-yield S]   # pure wait-budget check
+mycelium-coord exec-receipt  TASK [--after-version N] [--checks N] [--budget B]      # one combined bounded receipt
+mycelium-coord exec-evidence TASK (--criterion ID | --action-id ID | --completion) [--offset N] [--limit N] [--tail]
+mycelium-coord exec-unpause / exec-change-limits TASK --authorization REF [--scope-amendment "…"] …
+```
+
+- **Routine model routing.** Profile `routine` selects `gpt-5.6-luna` at `low` explicitly per
+  invocation (global defaults and the owner's primary Astra model are never written). The worker
+  starts from the bounded prompt file plus a fixed preamble only: no transcript, `--ephemeral`, fresh
+  workdir, `multi_agent` and `hooks` disabled, `MYCELIUM_NO_DELEGATE` / `MYCELIUM_NO_HOUSEKEEPING`
+  set. Use it for bounded extraction, summarization, formatting and candidate preparation.
+  Deterministic operations (waiting, hashes, timestamps, retries, test execution, known status
+  decisions) use no model at all. `worker-result` validates the required output deterministically
+  (file exists, JSON parses, required keys, sha256 recorded) and records `model_requested` /
+  `effort_requested` / `model_resolved` (banner, else `null`). An unresolved failure is escalated
+  ONCE (`escalation.json`, evidence paths, same remaining allowance) — never re-run with Astra.
+- **One wait path.** `coord_wait` / `job_join` over MCP are capped at 25 s (`MCP_SAFE_WAIT_S`,
+  host yield ~30 s − 5 s; pass `host_yield_s` only if you configured a longer yield). A 50 s wait is a
+  CLI wait: `mycelium-coord wait|job-join --timeout 50` inside a shell call given a 60 s outer
+  allowance. Every result carries `wait_path` {route, requested_s, applied_s, clamped, reason,
+  outer_allowance_s}. Retry/event logic stays in the tool; no clocks, no one-second polling, no
+  acknowledgment ping-pong. A stored message never wakes an idle host; there is no recurring monitor.
+- **Receipts and the terminal rule.** Between steps read ONE `exec-receipt TASK --after-version N`
+  (`execution_receipt`): unchanged state returns `changed=false, suppressed=true` with only identity
+  and cursor. Retrieve a recorded artifact with `exec-evidence` (truthful `truncated` /
+  `next_offset`). Complete the required work, deliver the receipt, stop. These caps bound only this
+  package's outputs, never a host-native tool or the total model context.
+- **Owner-authorized recovery.** Paused/exhausted is recoverable only by the owner through
+  `exec-change-limits` / `exec-unpause` with `--authorization` (and optional `--scope-amendment`,
+  recorded append-only under `scope_amendments`). A recorded recovery shown under
+  `execution.authorization.last_recovery` in a fresh `resume` / `exec-status` is sufficient approval:
+  do not ask for confirmation again; the fresh read supersedes any earlier STOP notice or snapshot.
+  Usage counters and frozen acceptance are never reset. An expired execution stays stopped until the
+  owner extends `expires_at` (`unpause` refuses with `execution_expired`); unauthorized work stays STOP.
+- **Housekeeping and Stop-lock (core overlay).** The health hook dispatches the knowledge audit /
+  transfer worker only when `housekeeping_ledger.py decide` reserves an attempt (one in-flight
+  attempt, timed-out attempts recorded as failures, bounded retries, cooldown, one exhaustion notice);
+  workers report `complete` / `fail` with their attempt id. A busy Stop lock blocks ONCE with an
+  evidence sentinel; the repeat is silent and the next SessionStart/Stop reconciles.
 
 ### Discovery (bounded, read-only)
 
