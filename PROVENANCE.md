@@ -100,3 +100,12 @@ synchronous CLI wait (that CLI form is Claude Code's Bash `timeout: 60000`). `wa
 generated pragma) were corrected under the same open repair reservation and exported as build
 `coord.request-reduction.20260915.r3` (offline verification only; no new model or native smoke calls,
 so the r2 native evidence stands as MCP-only probe evidence and proves no core-hook trust step).
+The exact-contract verification (`request-reduction-r5-exact-contract-1`, reproducer
+`r5-module-probe.json`: `SyntaxError: Illegal return statement`) found the r3 script still wrong:
+`functions.exec` evaluates an async JS MODULE whose MCP tools live on `tools`
+(`tools.mcp__mycelium_coord__coord_wait` / `job_join`) and whose result is emitted by `text(...)`, and
+Claude's Bash tool takes `{command, timeout}`. `waitpath.exec_script` now generates that exact
+three-line source, the regression parses it with `node --input-type=module --check` and executes it as
+a module against a stub exposing only those two tools and `text` (one call with the declared
+arguments, one emitted result; the reproducer's shape is confirmed rejected), SOPs carry the exact
+template, and build `coord.request-reduction.20260915.r4` was exported (offline only, no model calls).

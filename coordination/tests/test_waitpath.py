@@ -5,6 +5,8 @@ Run: python3 -m pytest coordination/tests/test_waitpath.py -q
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -82,8 +84,8 @@ def test_r5_preferred_pattern_costs_one_request_per_50s_and_fallback_two():
     assert waitpath.model_requests(50, 50) == 1 and waitpath.model_requests(50, 25) == 2
     assert waitpath.model_requests(300, 50) == 6 and waitpath.model_requests(300, 25) == 12
     mcp = waitpath.preferred_pattern("mcp", job_id="j1")
-    assert mcp["call"]["inner"] == {"tool": "job_join",
-                                    "args": {"job_id": "j1", "timeout_s": 50.0, "host_yield_s": 60.0}}
+    assert mcp["call"]["inner"] == {"tool": "job_join", "method": "tools.mcp__mycelium_coord__job_join",
+                                    "args": {"job_id": "j1", "timeout_s": 50, "host_yield_s": 60}}
     assert mcp["plan"]["applied_s"] == 50.0 and mcp["plan"]["clamped"] is False
     assert mcp["model_requests_per_50s"] == 1 and mcp["fallback_model_requests_per_50s"] == 2
     fallback = waitpath.plan_wait("mcp", 50)  # default 30 s yield -> 25 s cap
@@ -91,47 +93,103 @@ def test_r5_preferred_pattern_costs_one_request_per_50s_and_fallback_two():
     assert fallback["preferred"] is False and mcp["plan"]["preferred"] is True
 
 
+NODE = shutil.which("node")
+
+STUB_RUNNER = """
+import { readFileSync } from "node:fs";
+const calls = [], emitted = [];
+const stub = (name) => async (args) => { calls.push({ name, args }); return { structuredContent: { ok: true, from: name } }; };
+globalThis.tools = { mcp__mycelium_coord__coord_wait: stub("mcp__mycelium_coord__coord_wait"),
+                     mcp__mycelium_coord__job_join: stub("mcp__mycelium_coord__job_join") };
+globalThis.text = (v) => { emitted.push(v); };
+await import(process.argv[2]);
+process.stdout.write(JSON.stringify({ calls, emitted }));
+"""
+
+
+def _node_module(script: str, tmp_path):
+    """No-provider validation from the exact host contract: parse the generated source with Node's
+    MODULE parser, then execute it as a module against a stub exposing ONLY the two exact tools and
+    `text`. Returns the recorded calls and emitted results."""
+    src = tmp_path / "generated.mjs"
+    src.write_text(script)
+    chk = subprocess.run([NODE, "--input-type=module", "--check"], input=script, text=True,
+                         capture_output=True, timeout=30)
+    assert chk.returncode == 0, chk.stderr
+    runner = tmp_path / "runner.mjs"
+    runner.write_text(STUB_RUNNER)
+    run = subprocess.run([NODE, str(runner), str(src)], text=True, capture_output=True, timeout=30)
+    assert run.returncode == 0, run.stderr
+    return json.loads(run.stdout)
+
+
 def test_r5_mcp_pattern_declares_the_real_exec_pragma_and_the_pragma_covers_the_inner_wait():
     """R5 (verification repair): the Codex outer allowance is the FIRST-LINE
-    `// @exec: {"yield_time_ms": ...}` pragma of a functions.exec script, not a timeout_ms
-    argument. The test EXERCISES the generated shape: it parses the pragma the call declares,
-    feeds that yield back through check_wait/plan_wait, and models the host completing the call."""
-    mcp = waitpath.preferred_pattern("mcp", task_id="t1", participant_id="cl", after_seq=7)
+    `// @exec: {"yield_time_ms":60000}` pragma of a functions.exec MODULE, not a timeout_ms
+    argument. The test parses the pragma the call declares, feeds that yield back through
+    check_wait/plan_wait, and models the host completing the call."""
+    mcp = waitpath.preferred_pattern("mcp", task_id="TASK", participant_id="PARTICIPANT", after_seq=0)
     call = mcp["call"]
     assert call["tool"] == "functions.exec" and "timeout_ms" not in call
     script = call["script"]
-    first, body = script.split("\n", 1)
-    assert first == call["pragma"] == '// @exec: {"yield_time_ms": 60000}'
+    assert script == (
+        '// @exec: {"yield_time_ms":60000}\n'
+        'const receipt = await tools.mcp__mycelium_coord__coord_wait('
+        '{task_id:"TASK",participant_id:"PARTICIPANT",after_seq:0,timeout_s:50,host_yield_s:60});\n'
+        'text(receipt.structuredContent ?? receipt);')
+    assert script.split("\n", 1)[0] == call["pragma"] and "return" not in script and "mycelium_coord." not in script
     parsed = waitpath.parse_exec_pragma(script)
     assert parsed["yield_time_ms"] == 60000 and parsed["yield_s"] == 60.0
     assert waitpath.declared_outer_s(call) == 60.0
-    # the inner MCP call inside the script is the real tool with host_yield_s equal to the pragma
     inner = call["inner"]
-    assert inner["tool"] == "coord_wait" and inner["args"]["timeout_s"] == 50.0
+    assert inner["tool"] == "coord_wait" and inner["method"] == "tools.mcp__mycelium_coord__coord_wait"
+    assert inner["args"] == {"task_id": "TASK", "participant_id": "PARTICIPANT", "after_seq": 0,
+                             "timeout_s": 50, "host_yield_s": 60}
     assert inner["args"]["host_yield_s"] == parsed["yield_s"]
-    assert body == "return await mycelium_coord.coord_wait(%s);" % json.dumps(inner["args"], sort_keys=True)
-    assert json.loads(body[body.index("(") + 1:body.rindex(")")]) == inner["args"]
     # exercise it: the declared yield keeps the 50 s inner wait uncapped and within the safe cap
     chk = waitpath.check_wait("mcp", inner["args"]["timeout_s"], host_yield_s=parsed["yield_s"])
     assert chk["ok"] is True and chk["plan"]["applied_s"] == 50.0 and chk["plan"]["clamped"] is False
     assert _host_completes(parsed["yield_s"], inner["args"]["timeout_s"])
-    # and the same inner wait under the default 30 s yield is truthfully clamped to 25 s
     dflt = waitpath.check_wait("mcp", 50.0)
     assert dflt["ok"] is False and dflt["plan"]["applied_s"] == 25.0 and dflt["plan"]["reason"] == "mcp_host_yield"
     assert not _host_completes(waitpath.MCP_HOST_YIELD_S, 50.0)
-    # a malformed or missing pragma is refused, never read as a 60 s allowance
     for bad in ("return 1;", "// @exec: {}\nreturn 1;", '// @exec: {"yield_time_ms": 0}\nx',
                 'x\n// @exec: {"yield_time_ms": 60000}'):
         with pytest.raises(ValueError):
             waitpath.parse_exec_pragma(bad)
-    assert waitpath.exec_pragma(60, max_output_tokens=2000) == '// @exec: {"max_output_tokens": 2000, "yield_time_ms": 60000}'
+    assert waitpath.exec_pragma(60, max_output_tokens=2000) == '// @exec: {"max_output_tokens":2000,"yield_time_ms":60000}'
+    job = waitpath.preferred_pattern("mcp", job_id="JOB")["call"]["script"].split("\n")
+    assert job[1] == 'const receipt = await tools.mcp__mycelium_coord__job_join({job_id:"JOB",timeout_s:50,host_yield_s:60});'
+
+
+@pytest.mark.skipif(not NODE, reason="node not installed")
+@pytest.mark.parametrize("kw,method,args", [
+    (dict(task_id="TASK", participant_id="PARTICIPANT", after_seq=0), "mcp__mycelium_coord__coord_wait",
+     {"task_id": "TASK", "participant_id": "PARTICIPANT", "after_seq": 0, "timeout_s": 50, "host_yield_s": 60}),
+    (dict(job_id="JOB"), "mcp__mycelium_coord__job_join", {"job_id": "JOB", "timeout_s": 50, "host_yield_s": 60}),
+])
+def test_r5_generated_script_parses_as_a_node_module_and_calls_the_exact_tool_once(tmp_path, kw, method, args):
+    """The retained reproducer (r5-module-probe.json) was `SyntaxError: Illegal return statement`
+    from Node's module parser plus a nonexistent `mycelium_coord` global. The generated source must
+    pass `node --input-type=module --check` and, run as a module against a stub that exposes ONLY
+    the two exact tools and `text`, make exactly one call with the declared arguments and emit
+    exactly one result."""
+    script = waitpath.preferred_pattern("mcp", **kw)["call"]["script"]
+    rec = _node_module(script, tmp_path)
+    assert rec["calls"] == [{"name": method, "args": args}]
+    assert rec["emitted"] == [{"ok": True, "from": method}]
+    # and the reproducer's broken shape really is rejected by the same parser
+    broken = '// @exec: {"yield_time_ms": 60000}\nreturn await mycelium_coord.coord_wait({});'
+    chk = subprocess.run([NODE, "--input-type=module", "--check"], input=broken, text=True, capture_output=True)
+    assert chk.returncode != 0 and "Illegal return statement" in chk.stderr
 
 
 def test_r5_cli_pattern_is_the_claude_bash_timeout_and_codex_exec_command_cannot_do_50s():
     cli = waitpath.preferred_pattern("cli", task_id="t1", participant_id="cl", after_seq=7)
     call = cli["call"]
-    assert call["tool"] == "Bash" and call["host"] == "claude" and "timeout_ms" not in call
-    assert call["cmd"] == "mycelium-coord wait t1 cl --after 7 --timeout 50"
+    assert call["tool"] == "Bash" and call["host"] == "claude" and "timeout_ms" not in call and "cmd" not in call
+    # the documented native Bash tool-use shape is {command, timeout}
+    assert call["command"] == "mycelium-coord wait t1 cl --after 7 --timeout 50"
     assert call["timeout"] == 60000 and waitpath.declared_outer_s(call) == 60.0
     chk = waitpath.check_wait("cli", 50.0, waitpath.declared_outer_s(call))
     assert chk["ok"] is True and chk["plan"]["outer_allowance_s"] == 60.0

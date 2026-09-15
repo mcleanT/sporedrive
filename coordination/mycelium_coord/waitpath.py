@@ -34,14 +34,16 @@ ROUTES = ("mcp", "cli")
 # 50 s of waiting: a 50 s inner wait under an explicit 60 s outer allowance. The outer allowance is
 # a HOST pragma, verified against the host's own documentation rather than invented:
 #
-# * Codex code mode: a direct MCP call runs inside the ``functions.exec`` JavaScript tool, whose
-#   outer allowance is the FIRST-LINE pragma ``// @exec: {"yield_time_ms": 60000}`` (there is no
-#   ``timeout_ms`` argument). ``host_yield_s=60`` declares that yield to the tool so the inner wait
+# * Codex code mode: ``functions.exec`` evaluates its source as an asynchronous JavaScript MODULE
+#   (no top-level ``return``; ``text(value)`` emits the result; MCP tools are methods of the
+#   ``tools`` namespace, e.g. ``tools.mcp__mycelium_coord__coord_wait``). Its outer allowance is
+#   the FIRST-LINE pragma ``// @exec: {"yield_time_ms":60000}`` (there is no ``timeout_ms``
+#   argument). ``host_yield_s=60`` declares that yield to the tool so the inner wait
 #   is not capped at the 25 s fallback. Codex's plain shell tool ``exec_command`` has an initial
 #   ``yield_time_ms`` maximum of 30000, so a synchronous 50 s CLI wait can NEVER complete in one
 #   Codex call — on Codex the single-request pattern is the MCP route under the exec pragma.
-# * Claude Code: the CLI route's outer allowance is the Bash tool's ``timeout`` parameter in
-#   milliseconds (60000 covers a 50 s inner ``--timeout 50``).
+# * Claude Code: the CLI route is the Bash tool ``{command: "mycelium-coord wait ... --timeout 50",
+#   timeout: 60000}`` — the ``timeout`` parameter (milliseconds) is the outer allowance.
 #
 # The 25 s fallback is only for a host whose yield cannot be raised; two 25 s waits cost two model
 # requests per 50 s, the same count as the broken 50 s wait plus its follow-up, so the fallback is
@@ -51,14 +53,16 @@ PREFERRED_OUTER_S = 60.0
 EXEC_PRAGMA_PREFIX = "// @exec: "
 EXEC_PRAGMA_KEY = "yield_time_ms"
 CODEX_EXEC_COMMAND_MAX_YIELD_MS = 30000  # documented initial yield cap of Codex `exec_command`
-MCP_BINDING = "mycelium_coord"  # JS binding name of the mycelium-coord server inside functions.exec
+MCP_NAMESPACE = "tools"  # functions.exec evaluates an async JS MODULE; MCP tools live on `tools`
+MCP_TOOL_NAMES = {"coord_wait": "mcp__mycelium_coord__coord_wait", "job_join": "mcp__mycelium_coord__job_join"}
+EXEC_EMIT = "text"  # `text(value)` emits the module's result (a module has no top-level return)
 
 
 def exec_pragma(outer_s: float, **extra) -> str:
     """The literal first line of a Codex ``functions.exec`` script declaring its outer yield."""
     body = {EXEC_PRAGMA_KEY: int(round(float(outer_s) * 1000))}
     body.update(extra)
-    return EXEC_PRAGMA_PREFIX + json.dumps(body, sort_keys=True)
+    return EXEC_PRAGMA_PREFIX + json.dumps(body, sort_keys=True, separators=(",", ":"))
 
 
 def parse_exec_pragma(script: str) -> dict:
@@ -74,6 +78,30 @@ def parse_exec_pragma(script: str) -> dict:
     if not isinstance(yield_ms, (int, float)) or yield_ms <= 0:
         raise ValueError("%s must be a positive number of milliseconds" % EXEC_PRAGMA_KEY)
     return {"yield_time_ms": int(yield_ms), "yield_s": float(yield_ms) / 1000.0, "pragma": body}
+
+
+def _js_value(v) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    if isinstance(v, (int, float)):
+        return repr(v)
+    return json.dumps(v)
+
+
+def js_object(args: dict) -> str:
+    """Render ``args`` as the compact JS object literal the exact host contract uses
+    (``{task_id:"TASK",after_seq:0,timeout_s:50}`` — insertion order, unquoted keys)."""
+    return "{" + ",".join("%s:%s" % (k, _js_value(v)) for k, v in args.items()) + "}"
+
+
+def exec_script(tool: str, args: dict, outer_s: float = PREFERRED_OUTER_S) -> str:
+    """The exact ``functions.exec`` module source for one bounded MCP wait: pragma line, one awaited
+    ``tools.<mcp tool>`` call with the declared arguments, one emitted result."""
+    method = MCP_TOOL_NAMES[tool]
+    return "%s\nconst receipt = await %s.%s(%s);\n%s(receipt.structuredContent ?? receipt);" % (
+        exec_pragma(outer_s), MCP_NAMESPACE, method, js_object(args), EXEC_EMIT)
 
 
 def declared_outer_s(call: dict) -> Optional[float]:
@@ -114,9 +142,9 @@ def preferred_pattern(route: str, *, task_id: str = "TASK", participant_id: str 
         cmd = ("mycelium-coord job-join %s --timeout %d" % (job_id, int(inner)) if job_id else
                "mycelium-coord wait %s %s --after %d --timeout %d" % (task_id, participant_id, after_seq, int(inner)))
         call = {
-            "tool": "Bash", "host": "claude", "timeout": int(outer * 1000), "cmd": cmd,
-            "note": "Claude Code Bash tool: the `timeout` parameter (milliseconds) IS the 60 s outer "
-                    "allowance; the inner --timeout 50 runs inside it",
+            "tool": "Bash", "host": "claude", "command": cmd, "timeout": int(outer * 1000),
+            "note": "Claude Code Bash tool {command, timeout}: the `timeout` parameter (milliseconds) "
+                    "IS the 60 s outer allowance; the inner --timeout 50 runs inside it",
             "codex": {"tool": "exec_command", "max_yield_time_ms": CODEX_EXEC_COMMAND_MAX_YIELD_MS,
                       "single_call_50s": False,
                       "note": "Codex exec_command's initial yield_time_ms maximum is 30000, so a "
@@ -126,15 +154,15 @@ def preferred_pattern(route: str, *, task_id: str = "TASK", participant_id: str 
     else:
         tool = "job_join" if job_id else "coord_wait"
         args = ({"job_id": job_id} if job_id else
-                {"task_id": task_id, "participant_id": participant_id, "after_seq": after_seq})
-        args.update({"timeout_s": inner, "host_yield_s": outer})
+                {"task_id": task_id, "participant_id": participant_id, "after_seq": int(after_seq)})
+        args.update({"timeout_s": int(inner), "host_yield_s": int(outer)})
         pragma = exec_pragma(outer)
-        script = "%s\nreturn await %s.%s(%s);" % (pragma, MCP_BINDING, tool, json.dumps(args, sort_keys=True))
-        call = {"tool": "functions.exec", "pragma": pragma, "script": script,
-                "inner": {"tool": tool, "args": args},
-                "note": "Codex code mode: the FIRST-LINE @exec pragma yield_time_ms=60000 IS the 60 s "
-                        "outer allowance (there is no timeout_ms argument); host_yield_s=60 declares "
-                        "it to the tool so the inner 50 s wait is not capped at the 25 s fallback"}
+        call = {"tool": "functions.exec", "pragma": pragma, "script": exec_script(tool, args, outer),
+                "inner": {"tool": tool, "method": "%s.%s" % (MCP_NAMESPACE, MCP_TOOL_NAMES[tool]), "args": args},
+                "note": "Codex code mode: an async JS MODULE — the FIRST-LINE @exec pragma "
+                        "yield_time_ms=60000 IS the 60 s outer allowance (no timeout_ms argument); "
+                        "host_yield_s=60 declares it to the tool so the inner 50 s wait is not capped "
+                        "at the 25 s fallback; text(...) emits the result (no top-level return)"}
     plan = plan_wait(route, inner, host_yield_s=outer if route == "mcp" else None)
     return {
         "route": route, "inner_s": inner, "outer_s": outer, "call": call, "plan": plan,

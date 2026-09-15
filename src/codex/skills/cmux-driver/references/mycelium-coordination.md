@@ -169,12 +169,13 @@ context on every tool call:
   followed by `worker-result WORKER_ID` (deterministic validation; one `escalation.json` on failure,
   never an automatic Astra retry). Deterministic waits, hashes, timestamps and test execution use no
   model. Global model defaults are never changed by this path.
-- Waits (preferred, one model request per 50 s): a `functions.exec` script whose FIRST line is the
-  real host pragma `// @exec: {"yield_time_ms": 60000}` followed by the direct MCP call
-  `coord_wait`/`job_join` with `timeout_s=50, host_yield_s=60`. There is no `timeout_ms` argument,
-  and `exec_command`'s initial `yield_time_ms` maximum of 30000 cannot hold a synchronous 50 s
-  `mycelium-coord wait … --timeout 50` in one call — that CLI form is Claude Code's (Bash
-  `timeout: 60000` ms). `wait-plan --route cli --preferred --task T --participant P` prints the exact
+- Waits (preferred, one model request per 50 s): a `functions.exec` async JS MODULE, exactly:
+  `// @exec: {"yield_time_ms":60000}` / `const receipt = await tools.mcp__mycelium_coord__coord_wait({task_id:"TASK",participant_id:"PARTICIPANT",after_seq:0,timeout_s:50,host_yield_s:60});` / `text(receipt.structuredContent ?? receipt);`
+  (job variant `tools.mcp__mycelium_coord__job_join({job_id:"JOB",timeout_s:50,host_yield_s:60})`).
+  No top-level `return`, no `mycelium_coord` global, no `timeout_ms` argument; `exec_command`'s
+  initial `yield_time_ms` maximum of 30000 cannot hold a synchronous 50 s
+  `mycelium-coord wait … --timeout 50` in one call — that CLI form is Claude Code's Bash
+  `{command: …, timeout: 60000}`. `wait-plan --route cli --preferred --task T --participant P` prints the exact
   reusable call once — no planning call per interval. Without a declared yield the MCP route falls
   back to a 25 s cap, which costs two requests per 50 s (same as the broken 50 s wait plus its
   follow-up) and is never reported as a saving. Results carry `wait_path`. A stored message never

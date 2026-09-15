@@ -119,11 +119,12 @@ runtime fixes, all deterministic and none changing a global model default:
   The owner's primary Astra model/effort and Claude ownership are untouched.
 - **One wait path.** `mycelium_coord/waitpath.py` is the single wait-budget adapter. The
   preferred pattern is the one that already worked: a 50 s inner wait under an explicit 60 s outer
-  allowance — on Codex, a `functions.exec` script whose FIRST line is the real host pragma
-  `// @exec: {"yield_time_ms": 60000}` around direct MCP `coord_wait`/`job_join` with
-  `timeout_s=50, host_yield_s=60` (there is no `timeout_ms` argument, and Codex `exec_command`'s
+  allowance — on Codex, a `functions.exec` async JS MODULE of exactly three lines:
+  `// @exec: {"yield_time_ms":60000}` / `const receipt = await tools.mcp__mycelium_coord__coord_wait({task_id:"TASK",participant_id:"PARTICIPANT",after_seq:0,timeout_s:50,host_yield_s:60});` / `text(receipt.structuredContent ?? receipt);`
+  (the `job_join` variant is `tools.mcp__mycelium_coord__job_join({job_id:"JOB",timeout_s:50,host_yield_s:60})`;
+  no top-level `return`, no `mycelium_coord` global, no `timeout_ms` argument; Codex `exec_command`'s
   initial `yield_time_ms` cap of 30000 cannot hold a 50 s synchronous CLI wait); on Claude Code, the
-  Bash tool's `timeout: 60000` (ms) around `mycelium-coord wait … --timeout 50` — one model request
+  Bash tool `{command: "mycelium-coord wait … --timeout 50", timeout: 60000}` — one model request
   per 50 s of waiting. `wait-plan --preferred` / `wait_plan(preferred=true)`
   prints that exact reusable call shape. Without a declared yield the MCP route falls back to a
   truthful 25 s cap (two requests per 50 s: not a saving, only early-yield-safe). Every result
