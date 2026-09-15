@@ -91,3 +91,12 @@ rrule hours) is a separately recorded historical limitation and is unchanged by 
 Repairs R1-R5 of the scoped review landed at `5c2058e` and were exported as build
 `coord.request-reduction.20260915.r2` (same source checkout and overlay; the candidate closure records
 canonical `5c2058e`). Native identity and fresh-session smokes passed against r2 on both hosts.
+The R5 verification (supervisor message `request-reduction-r5-verification-1`) found the generated
+`functions.exec` example invented a `timeout_ms` argument; the real Codex outer allowance is the
+first-line `// @exec: {"yield_time_ms": 60000}` pragma of a code-mode script around the direct MCP
+call (`host_yield_s=60`), and Codex `exec_command`'s 30000 ms initial yield cap cannot hold a 50 s
+synchronous CLI wait (that CLI form is Claude Code's Bash `timeout: 60000`). `waitpath.py`, the
+`wait-plan --preferred` output, the SOPs and the R5 regression (which now parses and exercises the
+generated pragma) were corrected under the same open repair reservation and exported as build
+`coord.request-reduction.20260915.r3` (offline verification only; no new model or native smoke calls,
+so the r2 native evidence stands as MCP-only probe evidence and proves no core-hook trust step).

@@ -164,10 +164,13 @@ mycelium-coord exec-unpause / exec-change-limits TASK --authorization REF [--sco
   `effort_requested` / `model_resolved` (banner, else `null`). An unresolved failure is escalated
   ONCE (`escalation.json`, evidence paths, same remaining allowance) — never re-run with Astra.
 - **One wait path — preferred pattern: 50 s inner under an explicit 60 s outer allowance, ONE model
-  request per 50 s.** CLI (Codex): `functions.exec` with `timeout_ms: 60000` running
-  `mycelium-coord wait TASK P --after N --timeout 50` (or `job-join JOB --timeout 50`). Direct MCP:
-  `coord_wait(..., timeout_s=50, host_yield_s=60)` / `job_join(..., timeout_s=50, host_yield_s=60)`
-  when the host's MCP tool-call yield is at least 60 s. `wait-plan --route cli|mcp --preferred`
+  request per 50 s.** Codex (code mode): a `functions.exec` script whose FIRST line is the real
+  host pragma `// @exec: {"yield_time_ms": 60000}` followed by the direct MCP call
+  `coord_wait(..., timeout_s=50, host_yield_s=60)` / `job_join(..., timeout_s=50, host_yield_s=60)`;
+  there is no `timeout_ms` argument, and Codex `exec_command`'s initial `yield_time_ms` maximum of
+  30000 means a synchronous 50 s CLI wait never completes in one Codex call. Claude Code: the Bash
+  tool's `timeout: 60000` (ms) around `mycelium-coord wait TASK P --after N --timeout 50` (or
+  `job-join JOB --timeout 50`). `wait-plan --route cli|mcp --preferred`
   (`wait_plan(route, preferred=true)`) prints the exact reusable call once; do not plan per interval.
   Without a declared yield the MCP route falls back to a truthful 25 s cap (`MCP_SAFE_WAIT_S`) — that
   fallback costs two requests per 50 s, the same as the broken 50 s wait plus its follow-up, so it is
