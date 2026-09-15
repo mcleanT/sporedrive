@@ -77,3 +77,14 @@ installed Mycelium R3 **package** closure (`36d2b54`, export manifest `80aa927f`
 **workflow-instruction** manifest (`ae0d755`) on the developer's hosts -- those are separate installed
 artifacts. This bundle is the reproducible source/build input: a downstream adopter rebuilds the native
 Mycelium candidate from `mycelium-source/` + `coordination/` via `scripts/export_coordination.py`.
+
+### Request reduction v1 (2026-09-15)
+
+Canonical HEAD `b0dc9b9` (this repository, clean) exported as candidate build
+`coord.request-reduction.20260915` (Claude manifest `0.6.0+coord.request-reduction.20260915`, Codex
+`0.6.0+codex.20260802225518.coord.request-reduction.20260915`) from the preserved dirty source
+checkout `/Users/mst36/tools/mycelium-lifecycle-wfi` @ `12862e5` plus the tracked `core-overlay/`
+(three core hooks and `housekeeping_ledger.py`; `EXPORT_MANIFEST.json` `overlay_from_canonical`
+records each overlay sha256 and the source sha256 it replaced). Previous accepted build:
+`coord.efficiency-v2.20260911` from `78b17c0`. The earlier scheduler canary discrepancy (immediate-route
+rrule hours) is a separately recorded historical limitation and is unchanged by this release.
