@@ -163,12 +163,18 @@ mycelium-coord exec-unpause / exec-change-limits TASK --authorization REF [--sco
   (file exists, JSON parses, required keys, sha256 recorded) and records `model_requested` /
   `effort_requested` / `model_resolved` (banner, else `null`). An unresolved failure is escalated
   ONCE (`escalation.json`, evidence paths, same remaining allowance) — never re-run with Astra.
-- **One wait path.** `coord_wait` / `job_join` over MCP are capped at 25 s (`MCP_SAFE_WAIT_S`,
-  host yield ~30 s − 5 s; pass `host_yield_s` only if you configured a longer yield). A 50 s wait is a
-  CLI wait: `mycelium-coord wait|job-join --timeout 50` inside a shell call given a 60 s outer
-  allowance. Every result carries `wait_path` {route, requested_s, applied_s, clamped, reason,
-  outer_allowance_s}. Retry/event logic stays in the tool; no clocks, no one-second polling, no
-  acknowledgment ping-pong. A stored message never wakes an idle host; there is no recurring monitor.
+- **One wait path — preferred pattern: 50 s inner under an explicit 60 s outer allowance, ONE model
+  request per 50 s.** CLI (Codex): `functions.exec` with `timeout_ms: 60000` running
+  `mycelium-coord wait TASK P --after N --timeout 50` (or `job-join JOB --timeout 50`). Direct MCP:
+  `coord_wait(..., timeout_s=50, host_yield_s=60)` / `job_join(..., timeout_s=50, host_yield_s=60)`
+  when the host's MCP tool-call yield is at least 60 s. `wait-plan --route cli|mcp --preferred`
+  (`wait_plan(route, preferred=true)`) prints the exact reusable call once; do not plan per interval.
+  Without a declared yield the MCP route falls back to a truthful 25 s cap (`MCP_SAFE_WAIT_S`) — that
+  fallback costs two requests per 50 s, the same as the broken 50 s wait plus its follow-up, so it is
+  never a request-count saving. Every result carries `wait_path` {route, requested_s, applied_s,
+  clamped, reason, outer_allowance_s, model_requests_per_50s, preferred}. Retry/event logic stays in
+  the tool; no clocks, no one-second polling, no acknowledgment ping-pong. A stored message never
+  wakes an idle host; there is no recurring monitor.
 - **Receipts and the terminal rule.** Between steps read ONE `exec-receipt TASK --after-version N`
   (`execution_receipt`): unchanged state returns `changed=false, suppressed=true` with only identity
   and cursor. Retrieve a recorded artifact with `exec-evidence` (truthful `truncated` /

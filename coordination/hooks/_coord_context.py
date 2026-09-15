@@ -32,15 +32,20 @@ def main() -> int:
                          f"(auth {rec.get('authorization_ref')}). Do not ask for that approval again; "
                          "this fresh read supersedes any older STOP snapshot.")
     if stopped:
-        if execution.get("expired"):
-            lines.append("STOP: execution expired. New work is refused; only bounded reconciliation. "
-                         "Only the owner can extend expires_at via exec-change-limits with an authorization ref.")
-        else:
-            lines.append(f"STOP: execution {execution.get('status') or 'stopped'}. Do not resume old checkpoint "
-                         "work, poll, compact or create a successor task. Only bounded reconciliation is "
-                         "permitted. If the owner has ALREADY approved continuing, the supported path is "
-                         "exec-change-limits / exec-unpause with that instruction as --authorization, then a "
-                         "fresh exec-status; never grant yourself authority or reset past usage.")
+        st = execution.get("status") or "stopped"
+        state = f"expired{' and ' + st if st in ('paused', 'draining', 'exhausted') else ''}" \
+            if execution.get("expired") else st
+        lines.append(f"STOP: execution {state}. New work is refused: do not resume old checkpoint work, "
+                     "poll, compact or create a successor task. Only bounded reconciliation is permitted.")
+        # R4: the one permitted exception is explicit for EVERY stopped state (expired, paused,
+        # draining, exhausted, closed): an already-owner-approved recovery is bounded administrative
+        # reconciliation the agent may perform itself, never a reason to ask the owner again.
+        lines.append("PERMITTED RECOVERY (only when the owner has actually approved continuing): apply that "
+                     "approval once through the authorization-linked path — exec-change-limits with the owner "
+                     "instruction as --authorization (extend expires_at and/or raise the spent allowance) and, "
+                     "if paused, exec-unpause with the same reference — then read fresh exec-status/resume before "
+                     "any work; the fresh read supersedes this notice. An agent-authored reference never "
+                     "creates authority, past usage is never reset, and unauthorized work stays STOP.")
     if ck and not stopped:
         lines.append(f"Current checkpoint rev {ck.get('revision')} (auth {ck.get('authorization_ref')}).")
         nxt = body.get("next_action") or body.get("next")

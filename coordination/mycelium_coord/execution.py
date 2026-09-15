@@ -243,18 +243,28 @@ class ExecutionManager:
         if rec is None:
             return None
         version = int(rec.get("state_version", 0))
-        changed = after_version is None or version > int(after_version)
+        version_changed = after_version is None or version > int(after_version)
+        # R1: the effective stop state is computed BEFORE any suppression. Expiry is a function of
+        # the clock, not of the stored version, so a deadline transition must never hide behind an
+        # unchanged cursor: a stopped/expired/terminal receipt is always exposed in full.
+        summary = self._summary(rec)
+        expired = bool(summary.get("expired"))
+        stop = stops_wait(summary)
+        terminal = rec["status"] == STATUS_COMPLETED
+        changed = version_changed or stop or expired or terminal
         head = {
             "receipt": "execution",
             "task_id": rec["task_id"],
             "execution_id": rec["execution_id"],
             "state_version": version,
             "changed": changed,
+            "stop": stop,
+            "expired": expired,
+            "terminal": terminal,
         }
         if not changed:
             head["suppressed"] = True
             return head
-        summary = self._summary(rec)
         manifest = rec.get("acceptance_manifest") or {}
         accepted = {}
         for cid, ev in (rec.get("accepted_evidence") or {}).items():
@@ -270,8 +280,7 @@ class ExecutionManager:
             {
                 "status": rec["status"],
                 "phase": rec["phase"],
-                "terminal": rec["status"] == STATUS_COMPLETED,
-                "stop": stops_wait(summary),
+                "version_changed": version_changed,
                 "usage": summary["usage"],
                 "limits": summary["limits"],
                 "coverage": summary["coverage"],
@@ -1891,8 +1900,10 @@ class ExecutionManager:
         self, task_id: str, *, authorization_ref: str, expected_state_version=None,
         scope_amendment=None,
     ) -> dict:
-        """Owner-authorized unpause. The recorded ``authorization_ref`` IS the owner approval; an
-        agent that sees it in a fresh read does not ask again. Refused on an expired execution
+        """Owner-authorized unpause. The recorded ``authorization_ref`` RECORDS authority that the
+        real owner instruction established; an agent-authored reference never creates authority.
+        An agent that sees the recorded recovery in a fresh read does not ask the owner again.
+        Refused on an expired execution
         (extend ``expires_at`` through ``change_limits`` first) and never reports ``active`` while
         the work-dispatch allowance is already spent (status becomes ``exhausted`` truthfully).
         Past usage and frozen acceptance are untouched."""

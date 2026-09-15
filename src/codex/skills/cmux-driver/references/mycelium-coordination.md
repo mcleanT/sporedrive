@@ -169,10 +169,14 @@ context on every tool call:
   followed by `worker-result WORKER_ID` (deterministic validation; one `escalation.json` on failure,
   never an automatic Astra retry). Deterministic waits, hashes, timestamps and test execution use no
   model. Global model defaults are never changed by this path.
-- Waits: direct MCP `coord_wait` / `job_join` apply a 25 s in-tool cap (host yield ~30 s); a 50 s
-  wait runs `mycelium-coord wait|job-join --timeout 50` through `functions.exec` with a 60 s outer
-  allowance. Check a pair with `wait-plan --route cli --timeout 50 --outer 60`. Results carry
-  `wait_path`. A stored message never wakes an idle host.
+- Waits (preferred, one model request per 50 s): `functions.exec` with `timeout_ms: 60000` running
+  `mycelium-coord wait TASK P --after N --timeout 50` (or `job-join JOB --timeout 50`); on direct
+  MCP, `coord_wait`/`job_join` with `timeout_s=50, host_yield_s=60` when the host's tool-call yield
+  is at least 60 s. `wait-plan --route cli --preferred --task T --participant P` prints the exact
+  reusable call once — no planning call per interval. Without a declared yield the MCP route falls
+  back to a 25 s cap, which costs two requests per 50 s (same as the broken 50 s wait plus its
+  follow-up) and is never reported as a saving. Results carry `wait_path`. A stored message never
+  wakes an idle host.
 - Between steps read ONE `exec-receipt TASK --after-version N`; `suppressed=true` means nothing
   changed and no model turn is needed. When it reports `terminal`, deliver the receipt and stop.
 

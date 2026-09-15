@@ -484,7 +484,11 @@ def build_parser() -> argparse.ArgumentParser:
     # ------------------------------------------------------------ efficiency v2: scheduling + owned jobs
     p = sub.add_parser("wait-plan", help="pure wait-budget check for a route (mcp: in-tool cap below the host yield; cli: required outer allowance); never waits")
     p.add_argument("--route", required=True, choices=list(waitpath.ROUTES))
-    p.add_argument("--timeout", type=float, required=True, dest="timeout_s", help="requested inner wait seconds")
+    p.add_argument("--timeout", type=float, default=None, dest="timeout_s", help="requested inner wait seconds (omit with --preferred)")
+    p.add_argument("--preferred", action="store_true", help="print the reusable preferred 50 s inner / 60 s outer call shape for this route")
+    p.add_argument("--task", default="TASK", dest="task_id")
+    p.add_argument("--participant", default="PARTICIPANT", dest="participant_id")
+    p.add_argument("--job", default=None, dest="job_id")
     p.add_argument("--outer", type=float, default=None, dest="outer_s", help="outer shell allowance you intend to pass (cli)")
     p.add_argument("--host-yield", type=float, default=None, dest="host_yield_s", help="configured host tool-call yield (mcp)")
     p = sub.add_parser("sched-plan", help="plan one intended instant (America/New_York by default); never submits")
@@ -684,8 +688,12 @@ def run(argv: list[str] | None = None) -> int:
             )
         elif op == "wait-plan":
             try:
-                _emit(waitpath.check_wait(args.route, args.timeout_s, args.outer_s,
-                                          host_yield_s=args.host_yield_s))
+                if args.preferred or args.timeout_s is None:
+                    _emit(waitpath.preferred_pattern(args.route, task_id=args.task_id,
+                                                     participant_id=args.participant_id, job_id=args.job_id))
+                else:
+                    _emit(waitpath.check_wait(args.route, args.timeout_s, args.outer_s,
+                                              host_yield_s=args.host_yield_s))
             except ValueError as e:
                 _emit({"ok": False, "error": "invalid_wait_plan", "detail": str(e)})
                 return 2

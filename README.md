@@ -117,12 +117,15 @@ runtime fixes, all deterministic and none changing a global model default:
   deterministic validation. A failed or invalid result writes ONE `escalation.json` and is never
   re-run with another model. Waiting, hashing, timestamps, retries and test execution use no model.
   The owner's primary Astra model/effort and Claude ownership are untouched.
-- **One wait path.** `mycelium_coord/waitpath.py` is the single wait-budget adapter. A direct MCP
-  `coord_wait` / `job_join` is capped at 25 s (host tool-call yield ~30 s minus a 5 s margin, or
-  `host_yield_s - 5` when declared); a 50 s wait belongs on the CLI route inside a shell call given a
-  60 s outer allowance. Every wait/join result carries `wait_path` (route, requested, applied,
-  clamped, outer allowance) and `wait-plan` / `wait_plan` check a pair before use. No stored message
-  wakes an idle host; there is no recurring model monitor.
+- **One wait path.** `mycelium_coord/waitpath.py` is the single wait-budget adapter. The
+  preferred pattern is the one that already worked: a 50 s inner wait under an explicit 60 s outer
+  allowance — `functions.exec` `timeout_ms: 60000` around `mycelium-coord wait … --timeout 50`, or
+  direct MCP `coord_wait`/`job_join` with `timeout_s=50, host_yield_s=60` when the host yield allows
+  it — one model request per 50 s of waiting. `wait-plan --preferred` / `wait_plan(preferred=true)`
+  prints that exact reusable call shape. Without a declared yield the MCP route falls back to a
+  truthful 25 s cap (two requests per 50 s: not a saving, only early-yield-safe). Every result
+  carries `wait_path` including `model_requests_per_50s`. No stored message wakes an idle host;
+  there is no recurring model monitor.
 - **Housekeeping attempt accounting.** The core health hook (shipped from the version-controlled
   `core-overlay/`, exported by `scripts/export_coordination.py --overlay`) no longer dispatches the
   knowledge audit / transfer worker from a stale success timestamp alone: a durable, atomic ledger

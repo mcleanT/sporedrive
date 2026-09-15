@@ -112,9 +112,12 @@ def test_receipt_suppresses_unchanged_after_version_and_reports_change():
             "execution_id": "exec-t1",
             "state_version": r1["state_version"],
             "changed": False,
+            "stop": False,
+            "expired": False,
+            "terminal": False,
             "suppressed": True,
         }
-        assert _size(r2) < 200
+        assert _size(r2) < 240
         # any persisted mutation bumps the cursor -> changed again
         m.reserve("t1", action_id="a1", kind="work_dispatch")
         r3 = m.receipt("t1", after_version=r1["state_version"])
@@ -262,3 +265,22 @@ def test_views_is_reference_protects_ref_suffix():
     out = views.shrink_tails(rec, budget=512, keys=("note",))
     assert out["evidence_ref"] == "x" * 5000
     assert len(out["note"]) < 5000
+
+
+def test_r1_expiry_is_never_hidden_by_an_unchanged_cursor():
+    """R1: time can expire a task without bumping state_version; the receipt must still expose it."""
+    from datetime import datetime, timedelta, timezone
+    import time
+    with _tmp() as d:
+        m = _mgr(d)
+        soon = (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat()
+        _open(m, "t1", expires_at=soon)
+        r1 = m.receipt("t1")
+        assert r1["changed"] is True and r1["expired"] is False and r1["stop"] is False
+        r2 = m.receipt("t1", after_version=r1["state_version"])
+        assert r2["suppressed"] is True and r2["expired"] is False  # compact unchanged ACTIVE receipt kept
+        time.sleep(1.2)
+        r3 = m.receipt("t1", after_version=r1["state_version"])
+        assert r3["state_version"] == r1["state_version"]  # stored version unchanged...
+        assert r3["changed"] is True and "suppressed" not in r3  # ...yet the deadline transition is exposed
+        assert r3["expired"] is True and r3["stop"] is True and r3["version_changed"] is False

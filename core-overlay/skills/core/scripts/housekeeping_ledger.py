@@ -18,12 +18,20 @@ small JSON ledger with one attempt record at a time:
 `decide` answers dispatch/skip deterministically and, when it answers `dispatch`, atomically
 reserves the attempt so a concurrent or later hook run (resume/compact) deduplicates instead of
 dispatching again. An in-flight attempt older than its TTL is recorded as a timed-out FAILURE
-(attempts += 1), never silently reset. After `max_attempts` failures the kind is `exhausted` and
-stays skipped until `cooldown` elapses, and the hook is told to notify exactly once.
+(attempts += 1), never silently reset. After `max_attempts` failures the kind is `exhausted`,
+stays skipped, and the hook is told to notify exactly once.
 
-`complete` / `fail` record the worker's real outcome. Success timestamps supplied by the hook
-(the legacy .last-audit / .last-run files) are honored as evidence of success too, so an older
-worker that only touches those files still counts.
+`complete` / `fail` record the worker's real outcome for the CURRENT attempt only: an outcome that
+names a different (stale) attempt id is retained as evidence under ``stale_outcomes`` and never
+changes the current attempt's lease or state, and a repeated outcome for the same attempt is
+idempotent (charged once). Success timestamps supplied by the hook (the legacy .last-audit /
+.last-run files) are honored as evidence of success too, so an older worker that only touches those
+files still counts.
+
+Exhaustion is terminal for automatic work: after ``max_attempts`` failures the kind stays
+``exhausted`` (skipped, notified once) until an explicit ``rearm`` carrying an owner authorization
+reference, or a real completion. Cooldown only spaces the remaining retries; it never renews the
+attempt budget by itself. Past failure evidence and counts are preserved across a rearm.
 
 Writes are atomic (temp file + os.replace) under an O_EXCL lock with a bounded wait; the helper
 never blocks unbounded and never deletes a ledger. It uses no model and performs no dispatch
@@ -133,12 +141,28 @@ def save(path: str, data: dict) -> None:
 
 def _record_failure(rec: dict, attempt_id: str, reason: str, now: int) -> None:
     rec["attempts"] = int(rec.get("attempts") or 0) + 1
+    rec["total_failures"] = int(rec.get("total_failures") or 0) + 1
     rec["state"] = "failed"
     rec["last_failure_at"] = now
     rec["last_failure_reason"] = reason[:300]
     failures = list(rec.get("failures") or [])
     failures.append({"attempt_id": attempt_id, "at": now, "reason": reason[:300]})
     rec["failures"] = failures[-MAX_FAILURES_KEPT:]
+
+
+def _record_stale(rec: dict, op: str, attempt_id: str, reason: str, now: int) -> dict:
+    """Evidence of an outcome for an attempt that is no longer current: kept, never applied."""
+    stale = list(rec.get("stale_outcomes") or [])
+    entry = {"op": op, "attempt_id": attempt_id, "at": now, "reason": (reason or "")[:300],
+             "current_attempt_id": rec.get("attempt_id"), "current_state": rec.get("state")}
+    stale.append(entry)
+    rec["stale_outcomes"] = stale[-MAX_FAILURES_KEPT:]
+    return entry
+
+
+def _settled(rec: dict, attempt_id: str) -> bool:
+    """True when the current attempt already has a recorded terminal outcome."""
+    return rec.get("attempt_id") == attempt_id and rec.get("state") in ("completed", "failed", "exhausted")
 
 
 def _settle_inflight(rec: dict, now: int, inflight_ttl_s: int) -> None:
@@ -172,18 +196,15 @@ def decide(data: dict, kind: str, *, now: int, external_success_ts: int, interva
         rec["exhausted_at"] = now
         state = "exhausted"
     if state == "exhausted":
-        since = now - int(rec.get("exhausted_at") or rec.get("last_failure_at") or now)
-        if since < cooldown_s:
-            notify = not rec.get("exhausted_notified_at")
-            if notify:
-                rec["exhausted_notified_at"] = now
-            return {"action": "skip", "reason": "exhausted", "attempts": attempts,
-                    "cooldown_remaining_s": cooldown_s - since, "notify": notify,
-                    "last_failure_reason": rec.get("last_failure_reason")}
-        # cooldown elapsed: allow one fresh cycle, keep failure evidence
-        rec["attempts"] = 0
-        rec.pop("exhausted_notified_at", None)
-        attempts = 0
+        # R3: exhaustion stays stopped. Cooldown never renews the attempt budget; only an explicit
+        # authorized `rearm` (or a real completion) reopens automatic dispatch for this kind.
+        notify = not rec.get("exhausted_notified_at")
+        if notify:
+            rec["exhausted_notified_at"] = now
+        return {"action": "skip", "reason": "exhausted", "attempts": attempts,
+                "since_s": now - int(rec.get("exhausted_at") or now), "notify": notify,
+                "last_failure_reason": rec.get("last_failure_reason"),
+                "rearm": "housekeeping_ledger.py rearm KIND --ledger PATH --authorization REF"}
     if state == "failed":
         since = now - int(rec.get("last_failure_at") or 0)
         if since < cooldown_s:
@@ -199,26 +220,65 @@ def decide(data: dict, kind: str, *, now: int, external_success_ts: int, interva
 def complete(data: dict, kind: str, attempt_id: str, *, now: int, success_ts: int) -> dict:
     rec = data["kinds"].setdefault(kind, {"state": None, "attempts": 0, "failures": []})
     if attempt_id and rec.get("attempt_id") and rec.get("attempt_id") != attempt_id:
-        # Stale completion from an older attempt: keep evidence, still a real success.
-        rec["stale_completion"] = {"attempt_id": attempt_id, "at": now}
+        # R3: an outcome for a superseded attempt is evidence only; the current attempt's lease and
+        # state are untouched (a late completion must not clear a newer in-flight attempt).
+        entry = _record_stale(rec, "complete", attempt_id, "", now)
+        return {"state": rec.get("state"), "applied": False, "stale": True,
+                "attempt_id": rec.get("attempt_id"), "stale_outcome": entry}
+    if _settled(rec, attempt_id) and rec.get("state") == "completed":
+        return {"state": "completed", "applied": False, "idempotent": True,
+                "attempt_id": rec.get("attempt_id"), "last_success_at": _iso(rec.get("last_success_at"))}
     rec["state"] = "completed"
     rec["completed_at"] = now
     rec["last_success_at"] = max(int(rec.get("last_success_at") or 0), int(success_ts or now))
     rec["attempts"] = 0
     rec.pop("exhausted_at", None)
     rec.pop("exhausted_notified_at", None)
-    return {"state": "completed", "attempt_id": rec.get("attempt_id"),
+    return {"state": "completed", "applied": True, "attempt_id": rec.get("attempt_id"),
             "last_success_at": _iso(rec["last_success_at"])}
 
 
 def fail(data: dict, kind: str, attempt_id: str, reason: str, *, now: int,
          max_attempts: int) -> dict:
     rec = data["kinds"].setdefault(kind, {"state": None, "attempts": 0, "failures": []})
-    _record_failure(rec, attempt_id or rec.get("attempt_id") or "?", reason or "failed", now)
+    current = rec.get("attempt_id")
+    attempt_id = attempt_id or current or "?"
+    if current and attempt_id != current:
+        # R3: a late/duplicate failure for a superseded attempt is evidence only, charged never.
+        entry = _record_stale(rec, "fail", attempt_id, reason or "failed", now)
+        return {"state": rec.get("state"), "applied": False, "stale": True,
+                "attempts": int(rec.get("attempts") or 0), "stale_outcome": entry}
+    if _settled(rec, attempt_id):
+        # repeated settlement of the same attempt: idempotent, evidence kept, not charged twice
+        entry = _record_stale(rec, "fail", attempt_id, reason or "failed", now)
+        return {"state": rec.get("state"), "applied": False, "idempotent": True,
+                "attempts": int(rec.get("attempts") or 0), "stale_outcome": entry}
+    _record_failure(rec, attempt_id, reason or "failed", now)
     if rec["attempts"] >= max_attempts:
         rec["state"] = "exhausted"
         rec["exhausted_at"] = now
-    return {"state": rec["state"], "attempts": rec["attempts"]}
+    return {"state": rec["state"], "applied": True, "attempts": rec["attempts"]}
+
+
+def rearm(data: dict, kind: str, authorization_ref: str, *, now: int) -> dict:
+    """Owner-authorized rearm of an exhausted kind: the attempt budget reopens for ONE new cycle,
+    failure evidence and total counts are preserved, and the authorization is recorded."""
+    rec = data["kinds"].setdefault(kind, {"state": None, "attempts": 0, "failures": []})
+    if not authorization_ref:
+        return {"state": rec.get("state"), "applied": False, "error": "missing_authorization"}
+    if rec.get("state") != "exhausted":
+        return {"state": rec.get("state"), "applied": False, "reason": "not_exhausted"}
+    rearms = list(rec.get("rearms") or [])
+    rearms.append({"at": now, "authorization_ref": authorization_ref[:300],
+                   "attempts_before": int(rec.get("attempts") or 0),
+                   "total_failures": int(rec.get("total_failures") or 0)})
+    rec["rearms"] = rearms[-MAX_FAILURES_KEPT:]
+    rec["state"] = "failed"  # budget reopened; the next decide may dispatch after cooldown
+    rec["attempts"] = 0
+    rec.pop("exhausted_at", None)
+    rec.pop("exhausted_notified_at", None)
+    rec["last_failure_at"] = 0  # no cooldown gate on the authorized cycle
+    return {"state": rec["state"], "applied": True, "attempts": 0, "total_failures": rec.get("total_failures")}
 
 
 def status(data: dict, kind: str) -> dict:
@@ -232,11 +292,13 @@ def status(data: dict, kind: str) -> dict:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("op", choices=("decide", "complete", "fail", "status"))
+    ap.add_argument("op", choices=("decide", "complete", "fail", "status", "rearm"))
     ap.add_argument("kind")
     ap.add_argument("--ledger", required=True)
     ap.add_argument("--attempt-id", default="")
     ap.add_argument("--reason", default="")
+    ap.add_argument("--authorization", default="", dest="authorization_ref",
+                    help="owner authorization reference (rearm only; never agent-authored)")
     ap.add_argument("--dispatcher", default="")
     ap.add_argument("--last-success-ts", type=int, default=0,
                     help="legacy success marker epoch seconds (0 = none)")
@@ -263,6 +325,8 @@ def main(argv=None) -> int:
             elif a.op == "fail":
                 out = fail(data, a.kind, a.attempt_id, a.reason, now=now,
                            max_attempts=max(1, a.max_attempts))
+            elif a.op == "rearm":
+                out = rearm(data, a.kind, a.authorization_ref, now=now)
             else:
                 out = status(data, a.kind)
             if a.op != "status":

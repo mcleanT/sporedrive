@@ -70,3 +70,38 @@ def test_recovery_never_touches_frozen_acceptance(tmp_path):
     assert not em.unpause.__doc__ is None
     with pytest.raises(ProtocolError):
         em.unpause("t1", authorization_ref="")
+
+
+def test_r4_expired_and_paused_context_names_the_permitted_recovery(tmp_path):
+    """R4: the startup context for an expired AND paused execution must state the permitted
+    owner-authorized recovery explicitly (no confirmation deadlock), while keeping STOP."""
+    import json
+    import subprocess
+    import time
+    hook = Path(__file__).resolve().parents[1] / "hooks" / "_coord_context.py"
+    em = _mgr(tmp_path)
+    soon = (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat()
+    _open(em, "t1", expires_at=soon)
+    em.pause("t1", authorization_ref="owner:pause")
+    time.sleep(1.2)
+    from mycelium_coord.views import execution_view
+    status = execution_view(em.status("t1"))
+    assert status["expired"] is True and status["status"] == "paused"
+    packet = {"task": {"task_id": "t1"}, "execution": status, "stop_waiting": True,
+              "pending_unacked": [], "pending_count": 0}
+    out = subprocess.run([sys.executable, str(hook), "t1", "cl"], input=json.dumps(packet), text=True,
+                         capture_output=True, check=True).stdout
+    ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+    assert "STOP: execution expired and paused" in ctx
+    assert "PERMITTED RECOVERY" in ctx and "exec-change-limits" in ctx and "exec-unpause" in ctx
+    assert "agent-authored reference never creates authority" in ctx
+    # a recorded recovery is surfaced so the agent does not ask again
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    em.change_limits("t1", authorization_ref="owner:extend", changes={"expires_at": future})
+    em.unpause("t1", authorization_ref="owner:extend")
+    status2 = execution_view(em.status("t1"))
+    packet2 = dict(packet, execution=status2, stop_waiting=False)
+    out2 = subprocess.run([sys.executable, str(hook), "t1", "cl"], input=json.dumps(packet2), text=True,
+                          capture_output=True, check=True).stdout
+    ctx2 = json.loads(out2)["hookSpecificOutput"]["additionalContext"]
+    assert "Owner-authorized recovery already recorded: unpause" in ctx2 and "STOP:" not in ctx2

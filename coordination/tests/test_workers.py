@@ -153,3 +153,72 @@ def test_result_before_terminal_and_unknown_worker(tmp_path):
     with pytest.raises(WorkerError) as ei:
         wm.result("nope")
     assert ei.value.code == "worker_not_found"
+
+
+# ---------------------------------------------------------------- R2: the id binds the whole request
+def test_r2_changed_payload_under_existing_id_is_refused_and_identical_replay_reuses(tmp_path):
+    wm, rec, receipt = _run(tmp_path, wid="same")
+    root = tmp_path / "state"
+    codex = tmp_path / "codex"
+    managed = dict(task_id="t1", action_id="impl-1", dispatch_identity="brief-1")
+    before = wm.read_record("same")
+    # identical replay: same job, same record, no relaunch
+    again = wm.run("same", _prompt(tmp_path), profile="routine", require_keys=("answer",), join_s=5,
+                   deadline_s=60, codex_bin=str(codex), **managed)
+    assert again["replayed"] is True and again["request_fingerprint"] == before["request_fingerprint"]
+    assert wm.read_record("same") == before
+    # changed prompt
+    other = tmp_path / "prompt-b.md"
+    other.write_text("Different prompt B.")
+    with pytest.raises(WorkerError) as ei:
+        wm.run("same", other, profile="routine", require_keys=("answer",), codex_bin=str(codex), **managed)
+    assert ei.value.code == "worker_identity_conflict"
+    # changed validation contract / output target with the original prompt
+    with pytest.raises(WorkerError) as ei:
+        wm.run("same", _prompt(tmp_path), profile="routine", require_keys=("different",),
+               codex_bin=str(codex), **managed)
+    assert ei.value.code == "worker_identity_conflict"
+    with pytest.raises(WorkerError) as ei:
+        wm.run("same", _prompt(tmp_path), profile="routine", require_keys=("answer",),
+               output_path=str(tmp_path / "elsewhere.json"), codex_bin=str(codex), **managed)
+    assert ei.value.code == "worker_identity_conflict"
+    assert wm.read_record("same") == before  # stored request untouched by refused calls
+    assert len(list((root / "jobs").iterdir())) == 1  # no second job
+
+
+def test_r2_preexisting_output_is_never_accepted(tmp_path):
+    root = tmp_path / "state"
+    codex, _ = _fake(tmp_path)
+    pre = tmp_path / "pre.json"
+    pre.write_text('{"answer": 42}')
+    wm = WorkerManager(CoordStore(root))
+    with pytest.raises(WorkerError) as ei:
+        wm.run("w9", _prompt(tmp_path), output_path=str(pre), codex_bin=str(codex), **_managed(root))
+    assert ei.value.code == "output_preexists"
+    assert wm.read_record("w9") is None
+
+
+def test_r2_concurrent_first_calls_bind_one_record(tmp_path):
+    import threading
+    root = tmp_path / "state"
+    codex, _ = _fake(tmp_path)
+    managed = _managed(root)
+    wm = WorkerManager(CoordStore(root))
+    prompt = _prompt(tmp_path)  # written once; the threads only read it
+    results, errors = [], []
+
+    def go(i):
+        try:
+            results.append(wm.run("wc", prompt, require_keys=("answer",), join_s=0,
+                                  deadline_s=60, codex_bin=str(codex), **managed))
+        except Exception as e:  # pragma: no cover - surfaced below
+            errors.append(e)
+
+    ts = [threading.Thread(target=go, args=(i,)) for i in range(4)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert not errors, errors
+    fps = {r["request_fingerprint"] for r in results}
+    assert len(fps) == 1
+    assert sum(1 for r in results if r.get("launched")) == 1
+    assert sum(1 for r in results if r.get("replayed")) == 3

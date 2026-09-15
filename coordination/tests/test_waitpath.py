@@ -68,3 +68,22 @@ def test_coord_wait_reports_wait_path_for_both_routes(tmp_path):
     m = co.wait("t1", "cl", timeout_s=50, host_yield_s=5.2, route="mcp")
     assert m["timed_out"] is True and m["wait_path"]["applied_s"] == pytest.approx(0.2)
     assert m["wait_path"]["clamped"] is True and m["wait_path"]["reason"] == "mcp_host_yield"
+
+
+def test_r5_preferred_pattern_costs_one_request_per_50s_and_fallback_two():
+    """R5: the 50 s inner / 60 s outer path is preferred; the 25 s fallback is not a saving."""
+    assert waitpath.model_requests(50, 50) == 1 and waitpath.model_requests(50, 25) == 2
+    assert waitpath.model_requests(300, 50) == 6 and waitpath.model_requests(300, 25) == 12
+    cli = waitpath.preferred_pattern("cli", task_id="t1", participant_id="cl", after_seq=7)
+    assert cli["call"]["tool"] == "functions.exec" and cli["call"]["timeout_ms"] == 60000
+    assert cli["call"]["cmd"] == "mycelium-coord wait t1 cl --after 7 --timeout 50"
+    assert cli["plan"]["applied_s"] == 50.0 and cli["plan"]["outer_allowance_s"] == 60.0
+    assert cli["model_requests_per_50s"] == 1 and cli["fallback_model_requests_per_50s"] == 2
+    mcp = waitpath.preferred_pattern("mcp", job_id="j1")
+    assert mcp["call"]["tool"] == "job_join"
+    assert mcp["call"]["args"] == {"job_id": "j1", "timeout_s": 50.0, "host_yield_s": 60.0}
+    assert mcp["plan"]["applied_s"] == 50.0 and mcp["plan"]["clamped"] is False
+    assert mcp["model_requests_per_50s"] == 1
+    fallback = waitpath.plan_wait("mcp", 50)  # default 30 s yield -> 25 s cap
+    assert fallback["applied_s"] == 25.0 and fallback["model_requests_per_50s"] == 2
+    assert fallback["preferred"] is False and mcp["plan"]["preferred"] is True

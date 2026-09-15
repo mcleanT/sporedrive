@@ -92,17 +92,59 @@ class WorkerManager:
         _req(len(raw.strip()) > 0, "invalid_prompt", "prompt file is empty")
         require_keys = [str(k) for k in (require_keys or ())]
         wdir = self._dir(worker_id)
-        existing = self.read_record(worker_id)
-        if existing is None:
+        prompt_bytes = PREAMBLE.encode("utf-8") + raw
+        out_path = os.path.abspath(str(output_path)) if output_path else str(wdir / "output.json")
+        # R2: the worker id binds the COMPLETE immutable request. The fingerprint covers the prompt
+        # content, profile/binary, output + validation contract and task/action/dispatch identity;
+        # a replay with identical content reuses the same job/result, different content under an
+        # existing id is refused, and the record is created atomically under the store lock so two
+        # concurrent first calls cannot overwrite each other around launch.
+        fingerprint = _sha256_bytes(json.dumps({
+            "prompt_sha256": _sha256_bytes(prompt_bytes), "profile": profile, "model": prof["model"],
+            "effort": prof["effort"], "codex_bin": str(codex_bin), "output_path": out_path,
+            "expect": expect, "require_keys": require_keys, "task_id": task_id,
+            "action_id": action_id, "dispatch_identity": dispatch_identity,
+        }, sort_keys=True).encode("utf-8"))
+        with self.store.lock("worker-" + worker_id):
+            existing = self.read_record(worker_id)
+            if existing is not None:
+                if existing.get("request_fingerprint") != fingerprint:
+                    raise WorkerError(
+                        "worker_identity_conflict", worker_id,
+                        "worker %r already exists with a different request (prompt/profile/output/"
+                        "validation/identity); use a fresh worker id" % worker_id)
+            else:
+                # R2: an explicitly supplied pre-existing output can never be accepted as THIS
+                # worker's output merely because the process exits zero.
+                _req(not os.path.exists(out_path), "output_preexists",
+                     f"output path {out_path!r} already exists; a worker must produce its own output")
+                self._create_record(worker_id, wdir, prompt_bytes, prompt_path, out_path, profile, prof,
+                                    codex_bin, expect, require_keys, task_id, action_id,
+                                    dispatch_identity, fingerprint)
+        rec = self.read_record(worker_id)
+        workdir = Path(rec["workdir"])
+        # launch happens OUTSIDE the metadata critical section (JobManager keeps its own identity)
+        launch = [sys.executable, "-m", "mycelium_coord.workers", "--exec", str(wdir)]
+        receipt = self.jm.run(worker_id, launch, cwd=str(workdir), deadline_s=deadline_s, task_id=task_id,
+                              action_id=action_id, dispatch_identity=dispatch_identity, on_stop="keep",
+                              label=label or f"worker:{profile}", join_s=join_s, tail_bytes=tail_bytes)
+        receipt.update({"worker_id": worker_id, "profile": rec["profile"], "model_requested": rec["model_requested"],
+                        "effort_requested": rec["effort_requested"], "output_path": rec["output_path"],
+                        "request_fingerprint": rec["request_fingerprint"],
+                        "worker_record": str(wdir / "worker.json")})
+        return receipt
+
+    def _create_record(self, worker_id, wdir, prompt_bytes, prompt_path, out_path, profile, prof,
+                       codex_bin, expect, require_keys, task_id, action_id, dispatch_identity,
+                       fingerprint) -> dict:
+        if True:
             wdir.mkdir(parents=True, exist_ok=True)
             os.chmod(wdir, 0o700)
             workdir = wdir / "work"
             workdir.mkdir(exist_ok=True)  # fresh, empty working directory: no transcript, no repo
-            prompt_bytes = PREAMBLE.encode("utf-8") + raw
             prompt_file = wdir / "prompt.txt"
             prompt_file.write_bytes(prompt_bytes)
             os.chmod(prompt_file, 0o600)
-            out_path = os.path.abspath(str(output_path)) if output_path else str(wdir / "output.json")
             argv = [str(codex_bin), "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral"]
             for feat in CODEX_DISABLED_FEATURES:
                 argv += ["--disable", feat]
@@ -117,18 +159,10 @@ class WorkerManager:
                 "output_path": out_path, "expect": expect, "require_keys": require_keys,
                 "workdir": str(workdir), "task_id": task_id, "action_id": action_id,
                 "dispatch_identity": dispatch_identity, "created_at": utcnow(),
+                "request_fingerprint": fingerprint,
             }
             self.store.write(self._rel(worker_id, "worker.json"), rec)
-        else:
-            rec, workdir = existing, Path(existing["workdir"])
-        launch = [sys.executable, "-m", "mycelium_coord.workers", "--exec", str(wdir)]
-        receipt = self.jm.run(worker_id, launch, cwd=str(workdir), deadline_s=deadline_s, task_id=task_id,
-                              action_id=action_id, dispatch_identity=dispatch_identity, on_stop="keep",
-                              label=label or f"worker:{profile}", join_s=join_s, tail_bytes=tail_bytes)
-        receipt.update({"worker_id": worker_id, "profile": rec["profile"], "model_requested": rec["model_requested"],
-                        "effort_requested": rec["effort_requested"], "output_path": rec["output_path"],
-                        "worker_record": str(wdir / "worker.json")})
-        return receipt
+            return rec
 
     # ------------------------------------------------------------------ result (read + validate)
     def _banner(self, jobdir: Path) -> dict:

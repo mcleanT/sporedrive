@@ -40,6 +40,17 @@ d=$(python3 "$LEDGER_PY" decide knowledge-audit --ledger "$L" --now $((T0+7501))
 [ "$(printf '%s' "$d" | jget notify)" = True ] || fail "exhaustion notifies once: $d"
 d=$(python3 "$LEDGER_PY" decide knowledge-audit --ledger "$L" --now $((T0+7502)) --last-success-ts 0)
 [ "$(printf '%s' "$d" | jget notify)" = False ] || fail "second exhausted decide must not notify: $d"
+# R3: exhaustion is terminal for automatic work -- cooldown never renews the budget
+d=$(python3 "$LEDGER_PY" decide knowledge-audit --ledger "$L" --now $((T0+900000)) --last-success-ts 0 --cooldown-minutes 1)
+[ "$(printf '%s' "$d" | jget reason)" = exhausted ] || fail "exhausted must persist past cooldown: $d"
+d=$(python3 "$LEDGER_PY" rearm knowledge-audit --ledger "$L" --now $((T0+900001)))
+[ "$(printf '%s' "$d" | jget applied)" = False ] || fail "rearm without authorization refused: $d"
+d=$(python3 "$LEDGER_PY" rearm knowledge-audit --ledger "$L" --now $((T0+900002)) --authorization owner:brief-x)
+[ "$(printf '%s' "$d" | jget applied)" = True ] || fail "authorized rearm applies: $d"
+[ "$(printf '%s' "$d" | jget total_failures)" = 3 ] || fail "rearm preserves total failure count: $d"
+d=$(python3 "$LEDGER_PY" decide knowledge-audit --ledger "$L" --now $((T0+900003)) --last-success-ts 0)
+[ "$(printf '%s' "$d" | jget action)" = dispatch ] || fail "one authorized cycle dispatches after rearm: $d"
+A3=$(printf '%s' "$d" | jget attempt_id)
 [ "$(python3 "$LEDGER_PY" status knowledge-audit --ledger "$L" | jget record.failures | python3 -c 'import sys,ast; print(len(ast.literal_eval(sys.stdin.read())))')" = 3 ] || fail "failure evidence retained"
 # completion resets attempts and preserves success time; a fresh success skips
 python3 "$LEDGER_PY" complete knowledge-audit --ledger "$L" --attempt-id "$A3" --now $((T0+8000)) >/dev/null
@@ -48,6 +59,24 @@ d=$(python3 "$LEDGER_PY" decide knowledge-audit --ledger "$L" --now $((T0+8001))
 # legacy success marker newer than the ledger is honored
 d=$(python3 "$LEDGER_PY" decide knowledge-audit --ledger "$L" --now $((T0+200000)) --last-success-ts $((T0+199000)))
 [ "$(printf '%s' "$d" | jget reason)" = fresh ] || fail "legacy marker honored: $d"
+# R3: stale outcomes are evidence only; settlement is idempotent
+L2="$TMP/ledger2.json"
+d=$(python3 "$LEDGER_PY" decide knowledge-transfer --ledger "$L2" --now $T0 --last-success-ts 0); A=$(printf '%s' "$d" | jget attempt_id)
+python3 "$LEDGER_PY" fail knowledge-transfer --ledger "$L2" --attempt-id "$A" --reason "died" --now $((T0+10)) >/dev/null
+d=$(python3 "$LEDGER_PY" decide knowledge-transfer --ledger "$L2" --now $((T0+20)) --last-success-ts 0 --cooldown-minutes 0); B=$(printf '%s' "$d" | jget attempt_id)
+[ "$(printf '%s' "$d" | jget action)" = dispatch ] || fail "B dispatches after cooldown: $d"
+d=$(python3 "$LEDGER_PY" fail knowledge-transfer --ledger "$L2" --attempt-id "$A" --reason "late duplicate" --now $((T0+32)))
+[ "$(printf '%s' "$d" | jget stale)" = True ] && [ "$(printf '%s' "$d" | jget attempts)" = 1 ] || fail "late failure for A is stale, not charged: $d"
+d=$(python3 "$LEDGER_PY" decide knowledge-transfer --ledger "$L2" --now $((T0+33)) --last-success-ts 0 --cooldown-minutes 0)
+[ "$(printf '%s' "$d" | jget reason)" = in_flight ] || fail "B must still be in flight after stale A failure: $d"
+d=$(python3 "$LEDGER_PY" complete knowledge-transfer --ledger "$L2" --attempt-id "$A" --now $((T0+34)))
+[ "$(printf '%s' "$d" | jget applied)" = False ] || fail "stale completion must not clear B: $d"
+[ "$(python3 "$LEDGER_PY" status knowledge-transfer --ledger "$L2" | jget record.state)" = in_flight ] || fail "B in_flight preserved"
+python3 "$LEDGER_PY" fail knowledge-transfer --ledger "$L2" --attempt-id "$B" --reason "b died" --now $((T0+40)) >/dev/null
+d=$(python3 "$LEDGER_PY" fail knowledge-transfer --ledger "$L2" --attempt-id "$B" --reason "b died again" --now $((T0+41)))
+[ "$(printf '%s' "$d" | jget idempotent)" = True ] && [ "$(printf '%s' "$d" | jget attempts)" = 2 ] || fail "duplicate B failure idempotent: $d"
+[ "$(python3 "$LEDGER_PY" status knowledge-transfer --ledger "$L2" | jget record.stale_outcomes | python3 -c 'import sys,ast; print(len(ast.literal_eval(sys.stdin.read())))')" = 3 ] || fail "stale evidence retained"
+echo "ok (b3) stale outcomes isolated, settlement idempotent, exhaustion terminal until authorized rearm"
 # corrupt ledger never dispatches twice in a row and is preserved beside a fresh one
 echo '{not json' > "$L"
 d=$(python3 "$LEDGER_PY" decide knowledge-audit --ledger "$L" --now $((T0+300000)) --last-success-ts 0)

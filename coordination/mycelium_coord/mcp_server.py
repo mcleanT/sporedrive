@@ -20,7 +20,7 @@ from . import schedule
 from .coord import Coordinator
 from .execution import ExecutionManager
 from .jobs import DEFAULT_TAIL_BYTES, JOIN_MAX_S, JobManager
-from .waitpath import MCP_SAFE_WAIT_S, plan_wait, check_wait
+from .waitpath import MCP_SAFE_WAIT_S, plan_wait, check_wait, preferred_pattern
 from .model import ProtocolError
 from .store import CoordStore, StoreError
 
@@ -299,20 +299,27 @@ async def coord_wait(
 
 
 @mcp.tool(title="Wait Plan", annotations=_READ)
-async def wait_plan(route: str, timeout_s: float, outer_s: float | None = None,
-                    host_yield_s: float | None = None) -> dict:
-    """Pure, clock-free wait-budget check (the one documented adapter for both routes). route "mcp":
-    reports the in-tool cap (host_yield_s - 5 s, 25 s by default) that coord_wait/job_join apply.
-    route "cli": reports the outer shell allowance required (inner + 10 s, e.g. 60 s for 50 s) and
-    whether a supplied outer_s is enough. `ok` false names the exact problem. No waiting happens.
+async def wait_plan(route: str, timeout_s: float | None = None, outer_s: float | None = None,
+                    host_yield_s: float | None = None, preferred: bool = False) -> dict:
+    """Pure, clock-free wait-budget adapter (the one documented pattern for both routes). With
+    preferred=true (or no timeout_s) it returns the REUSABLE preferred call shape — inner 50 s under
+    an explicit 60 s outer allowance (cli: the shell call's timeout pragma; mcp: host_yield_s=60) —
+    which costs ONE model request per 50 s of waiting; use it directly, not a planning call per
+    interval. With timeout_s it checks a pair: route "mcp" reports the in-tool cap (host_yield_s - 5;
+    25 s fallback under the default 30 s yield), route "cli" the outer allowance required (inner +
+    10 s). The 25 s fallback costs two requests per 50 s and is never a request-count saving. No
+    waiting happens here.
 
     Args:
         route: mcp | cli.
-        timeout_s: Requested inner wait seconds.
+        timeout_s: Requested inner wait seconds (omit for the preferred pattern).
         outer_s: The outer shell allowance you intend to pass (cli route).
         host_yield_s: Configured host tool-call yield, if known (mcp route).
+        preferred: Return the preferred 50/60 pattern instead of checking a pair.
     """
     try:
+        if preferred or timeout_s is None:
+            return preferred_pattern(route)
         return check_wait(route, timeout_s, outer_s, host_yield_s=host_yield_s)
     except ValueError as e:
         raise ToolError("invalid_wait_plan: %s" % e)
@@ -1051,8 +1058,9 @@ async def execution_unpause(
     task_id: str, authorization_ref: str, expected_state_version: int | None = None,
     scope_amendment: str | None = None,
 ) -> dict:
-    """Owner-authorized unpause. The recorded authorization_ref IS the owner approval: an agent that
-    sees `authorization.last_recovery` in a fresh execution_read/execution_status/coord_resume
+    """Owner-authorized unpause. The recorded authorization_ref RECORDS authority that the real
+    owner instruction established (an agent-authored reference never creates authority): an agent
+    that sees `authorization.last_recovery` in a fresh execution_read/execution_status/coord_resume
     continues without asking the owner again, and that fresh read supersedes any older STOP
     snapshot. Refused with execution_expired on an expired execution (extend expires_at via
     execution_change_limits first). Past usage is unchanged (status is `exhausted`, not `active`,
