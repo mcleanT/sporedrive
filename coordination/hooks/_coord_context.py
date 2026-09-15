@@ -33,19 +33,36 @@ def main() -> int:
                          "this fresh read supersedes any older STOP snapshot.")
     if stopped:
         st = execution.get("status") or "stopped"
-        state = f"expired{' and ' + st if st in ('paused', 'draining', 'exhausted') else ''}" \
+        state = f"expired{' and ' + st if st in ('paused', 'draining', 'exhausted', 'closed', 'completed') else ''}" \
             if execution.get("expired") else st
-        lines.append(f"STOP: execution {state}. New work is refused: do not resume old checkpoint work, "
-                     "poll, compact or create a successor task. Only bounded reconciliation is permitted.")
-        # R4: the one permitted exception is explicit for EVERY stopped state (expired, paused,
-        # draining, exhausted, closed): an already-owner-approved recovery is bounded administrative
-        # reconciliation the agent may perform itself, never a reason to ask the owner again.
-        lines.append("PERMITTED RECOVERY (only when the owner has actually approved continuing): apply that "
-                     "approval once through the authorization-linked path — exec-change-limits with the owner "
-                     "instruction as --authorization (extend expires_at and/or raise the spent allowance) and, "
-                     "if paused, exec-unpause with the same reference — then read fresh exec-status/resume before "
-                     "any work; the fresh read supersedes this notice. An agent-authored reference never "
-                     "creates authority, past usage is never reset, and unauthorized work stays STOP.")
+        run = execution.get("run") or 1
+        cref = execution.get("completion_ref")
+        # owner-followup v1: the STOP is scoped to AUTONOMOUS continuation of THIS run — it is not a
+        # statement that the conversation can do nothing. A completion receipt is historical
+        # evidence, never a permanent prohibition on the task.
+        lines.append(f"STOP (autonomous work): run {run} of this execution is {state}"
+                     f"{' (completion receipt ' + str(cref) + ')' if cref else ''}. "
+                     "Background/automatic work on that run is refused: do not resume its old checkpoint "
+                     "work, poll, compact or self-renew, and do not open a new Codex/Mycelium task to get "
+                     "around it. Only bounded reconciliation of that run is permitted.")
+        lines.append("STILL PERMITTED in this conversation: read-only discussion, diagnosis and questions "
+                     "about the completed work; and, on a GENUINE NEW OWNER WORK INSTRUCTION in this same "
+                     "task, opening the next run through the supported owner-request path (questions, "
+                     "reviews, peer summaries, stale checkpoints or an agent-authored reference never "
+                     "restart work).")
+        # R4 / owner-followup: the one permitted exception is explicit for EVERY stopped state — an
+        # already-owner-approved continuation is bounded administrative reconciliation the agent may
+        # perform itself, never a reason to ask the owner again.
+        lines.append("PERMITTED RECOVERY (only from the owner's actual instruction; no second confirmation): "
+                     "ONE call — exec-owner-request TASK --request-id ID --authorization <owner instruction "
+                     "ref> --scope <new scope/acceptance ref> [--manifest JSON] [--add-limits JSON] "
+                     "[--expires-at ISO] (MCP execution_owner_request) — opens run "
+                     f"{run + 1} from completed/closed/paused/expired/exhausted, archives run {run} and its "
+                     "receipt immutably, keeps cumulative usage, and gives the new scope its own "
+                     "acceptance state. A paused-only run may instead use exec-change-limits / exec-unpause "
+                     "with the same reference. Then read fresh exec-status/resume before any work; the "
+                     "fresh read supersedes this notice. An identical replay of the same request id never "
+                     "opens a second run; unauthorized or expired work without a new deadline stays STOP.")
     if ck and not stopped:
         lines.append(f"Current checkpoint rev {ck.get('revision')} (auth {ck.get('authorization_ref')}).")
         nxt = body.get("next_action") or body.get("next")

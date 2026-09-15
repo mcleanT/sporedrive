@@ -92,9 +92,10 @@ def test_r4_expired_and_paused_context_names_the_permitted_recovery(tmp_path):
     out = subprocess.run([sys.executable, str(hook), "t1", "cl"], input=json.dumps(packet), text=True,
                          capture_output=True, check=True).stdout
     ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
-    assert "STOP: execution expired and paused" in ctx
+    assert "STOP (autonomous work): run 1 of this execution is expired and paused" in ctx
     assert "PERMITTED RECOVERY" in ctx and "exec-change-limits" in ctx and "exec-unpause" in ctx
-    assert "agent-authored reference never creates authority" in ctx
+    assert "exec-owner-request" in ctx and "STILL PERMITTED in this conversation" in ctx
+    assert "agent-authored reference never" in ctx
     # a recorded recovery is surfaced so the agent does not ask again
     future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
     em.change_limits("t1", authorization_ref="owner:extend", changes={"expires_at": future})

@@ -262,6 +262,18 @@ class JobManager:
                 out[k] = st[k]
         return _shrink(out, budget)
 
+    def live_job_ids(self, task_id: str) -> list:
+        """Ids of this task's owned jobs still running — the identified live work an owner request
+        must not run over (owner-followup v1). Read-only; bounded by the job list page cap."""
+        out, cursor = [], None
+        for _ in range(50):
+            page = self.list(task_id=task_id, status=STATUS_RUNNING, limit=100, cursor=cursor)
+            out.extend(r.get("job_id") for r in page.get("jobs", []) if r.get("job_id"))
+            cursor = page.get("next_cursor")
+            if not cursor:
+                break
+        return sorted(set(out))
+
     def list(self, *, task_id=None, status=None, limit: int = 20, cursor=None,
              budget: int = BATCH_BUDGET_BYTES) -> dict:
         """Metadata-only listing, newest first, bounded by count AND a combined byte budget.

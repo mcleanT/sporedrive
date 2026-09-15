@@ -151,6 +151,8 @@ mycelium-coord wait-plan   --route mcp|cli --timeout S [--outer S] [--host-yield
 mycelium-coord exec-receipt  TASK [--after-version N] [--checks N] [--budget B]      # one combined bounded receipt
 mycelium-coord exec-evidence TASK (--criterion ID | --action-id ID | --completion) [--offset N] [--limit N] [--tail]
 mycelium-coord exec-unpause / exec-change-limits TASK --authorization REF [--scope-amendment "…"] …
+mycelium-coord exec-owner-request TASK --request-id ID --authorization REF --scope REF [--manifest JSON] \
+                           [--add-limits JSON] [--expires-at ISO] [--note "…"]   # next run of the SAME execution
 ```
 
 - **Routine model routing.** Profile `routine` selects `gpt-5.6-luna` at `low` explicitly per
@@ -183,6 +185,16 @@ mycelium-coord exec-unpause / exec-change-limits TASK --authorization REF [--sco
   and cursor. Retrieve a recorded artifact with `exec-evidence` (truthful `truncated` /
   `next_offset`). Complete the required work, deliver the receipt, stop. These caps bound only this
   package's outputs, never a host-native tool or the total model context.
+- **Owner-directed follow-up.** A completed/closed run's STOP scopes AUTONOMOUS work on that run —
+  it never forbids discussion, diagnosis or a genuine new owner work instruction in the same task.
+  On such an instruction run ONE `exec-owner-request` (`execution_owner_request`) with the owner
+  reference, an idempotent request id, the new scope/acceptance and any bounded added allowance or
+  new deadline: it opens the next run of the same execution (no new task), archives the prior run,
+  receipt and evidence immutably, keeps cumulative usage, gives the new scope fresh acceptance, and
+  refuses conflicting replays, live owned work and unreconciled automation shutdowns. Old receipts
+  cannot complete the new run; stale shutdowns cannot stop it. Questions/reviews alone never restart
+  work. Clients that have not reloaded the MCP server use the installed CLI
+  (`coordination/bin/mycelium-coord exec-owner-request …`).
 - **Owner-authorized recovery.** Paused/exhausted is recoverable only by the owner through
   `exec-change-limits` / `exec-unpause` with `--authorization` (and optional `--scope-amendment`,
   recorded append-only under `scope_amendments`). A recorded recovery shown under

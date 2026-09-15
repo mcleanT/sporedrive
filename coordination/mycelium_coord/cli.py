@@ -391,6 +391,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--expected-version", type=int, default=None, dest="expected_state_version"
     )
 
+    p = sub.add_parser("exec-owner-request", help="owner-directed follow-up: open the NEXT RUN of this same execution from completed/closed/paused/expired/exhausted (or active) on an explicit owner work instruction; prior run archived immutably, usage never reset, idempotent by --request-id")
+    p.add_argument("task_id")
+    p.add_argument("--request-id", required=True, dest="request_id", help="idempotent owner-request id")
+    p.add_argument("--authorization", required=True, dest="authorization_ref", help="reference to the ACTUAL owner instruction (recorded, never a grant)")
+    p.add_argument("--scope", required=True, dest="scope_ref", help="scope/acceptance reference for the new run")
+    p.add_argument("--manifest", default=None, help="JSON {cid:{description,kind,...}} acceptance criteria for the new run, or - for stdin")
+    p.add_argument("--add-limits", default=None, dest="add_limits", help="JSON {work_dispatches|review_launches|technical_calls|acceptance_calls: N} ADDED to current limits")
+    p.add_argument("--expires-at", default=None, dest="expires_at", help="new deadline (required when the execution is expired)")
+    p.add_argument("--note", default=None)
+    p.add_argument("--expected-version", type=int, default=None, dest="expected_state_version")
+
     p = sub.add_parser("exec-change-limits", help="owner-authorized limit/expiry change; never resets past usage or frozen acceptance")
     p.add_argument("task_id")
     p.add_argument("--authorization", required=True, dest="authorization_ref")
@@ -899,6 +910,21 @@ def run(argv: list[str] | None = None) -> int:
                     authorization_ref=args.authorization_ref,
                     expected_state_version=args.expected_state_version,
                     scope_amendment=args.scope_amendment,
+                )
+            )
+        elif op == "exec-owner-request":
+            _emit(
+                em.owner_request(
+                    args.task_id,
+                    request_id=args.request_id,
+                    authorization_ref=args.authorization_ref,
+                    scope_ref=args.scope_ref,
+                    acceptance_manifest=_load_json_arg(args.manifest) if args.manifest else None,
+                    add_limits=_load_json_arg(args.add_limits) if args.add_limits else None,
+                    expires_at=args.expires_at,
+                    note=args.note,
+                    live_work=jm.live_job_ids(args.task_id),
+                    expected_state_version=args.expected_state_version,
                 )
             )
         elif op == "exec-change-limits":

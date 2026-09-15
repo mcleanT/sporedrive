@@ -46,9 +46,21 @@ def checkpoint_view(checkpoint, *, after_revision=None, stopped=False):
 def execution_view(status):
     if status is None:
         return None
-    return {k: status.get(k) for k in ("execution_id", "status", "phase", "state_version",
-                                      "expired", "expires_at", "usage", "coverage",
-                                      "authorization")}
+    out = {k: status.get(k) for k in ("execution_id", "status", "phase", "state_version",
+                                     "expired", "expires_at", "usage", "coverage",
+                                     "authorization", "run", "run_id", "runs_archived")}
+    # owner-followup v1: a stopped run says WHICH run stopped and what closed it, so generated
+    # context can distinguish "this prior run cannot autonomously continue" from "this
+    # conversation cannot do anything". Legacy records read as run 1 with nothing archived.
+    out["run"] = int(status.get("run") or 1)
+    out["runs_archived"] = int(status.get("runs_archived") or 0)
+    closure = status.get("closure") or {}
+    out["completion_ref"] = closure.get("completion_ref")
+    out["shutdown_pending"] = bool(status.get("shutdown_pending"))
+    lo = status.get("last_owner_request") or None
+    out["last_owner_request"] = ({"request_id": lo.get("request_id"), "at": lo.get("at"),
+                                  "run": lo.get("run")} if lo else None)
+    return out
 
 
 def stops_wait(status):

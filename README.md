@@ -149,9 +149,26 @@ runtime fixes, all deterministic and none changing a global model default:
   `truncated`/`next_offset`. Complete the required work, deliver the receipt, then stop — no follow-on
   cleanup, audit, compaction or monitor. **Boundary:** these caps bound only this package's outputs;
   they do not cap arbitrary host tools or the total model context.
+- **Owner-directed follow-up (owner-followup v1).** A completion receipt is historical evidence, never
+  a permanent prohibition on the task. A STOP on a completed / closed / paused / expired / exhausted
+  run means *that run cannot autonomously continue*, not that the conversation can do nothing:
+  read-only discussion and diagnosis stay possible, and a GENUINE NEW OWNER WORK INSTRUCTION in the
+  same task is sufficient authority for ONE atomic call — `exec-owner-request TASK --request-id ID
+  --authorization <owner instruction ref> --scope <new scope/acceptance ref> [--manifest JSON]
+  [--add-limits JSON] [--expires-at ISO]` (`execution_owner_request`) — which opens the next run of
+  the SAME execution (no new Codex or Mycelium task), archives the prior run with its receipt,
+  acceptance evidence, usage and limits immutably under `runs`, gives the new scope its own
+  acceptance state (old accepted criteria cannot satisfy it), adds only the bounded allowance the
+  owner gave (cumulative usage is never reset), requires a new `expires_at` when expired, is
+  idempotent by `--request-id` (a conflicting replay is refused), refuses while identified live work
+  or an automation's unreconciled shutdown could conflict, and lets an old receipt or shutdown
+  neither complete nor stop the new run. Questions, reviews, peer summaries, stale checkpoints or an
+  agent-authored reference never restart work; automatic completion, expiry, pause, bounded review
+  and no-self-renewal for background work are unchanged. Legacy records read as run 1.
 - **Owner-authorized recovery.** Owner approval recorded through `exec-change-limits` /
   `exec-unpause` (`execution_change_limits` / `execution_unpause`, each requiring `--authorization`,
-  optional `--scope-amendment`) is sufficient: a fresh `exec-status` / `execution_read` / `resume`
+  optional `--scope-amendment`) is sufficient for a paused/exhausted/expired run that continues in
+  place (`unpause` on a completed/closed run answers `not_paused` and names `exec-owner-request`): a fresh `exec-status` / `execution_read` / `resume`
   showing `authorization.last_recovery` supersedes any older STOP snapshot and no second confirmation
   is requested. The path never resets past usage, never rewrites frozen acceptance or accepted
   evidence, and records an append-only `scope_amendments` entry. `unpause` is refused on an expired

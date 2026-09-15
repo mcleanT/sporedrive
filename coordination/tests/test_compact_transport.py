@@ -108,7 +108,7 @@ def test_cli_and_session_start_suppress_stale_checkpoint_when_paused(co):
     rendered = subprocess.run([sys.executable, str(hook), "t", "cl"], input=small.stdout,
                               env=env, text=True, capture_output=True, check=True)
     context = json.loads(rendered.stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "STOP:" in context and "DO_OLD_WORK" not in context
+    assert "STOP (autonomous work):" in context and "DO_OLD_WORK" not in context
     # Full/legacy-format packets get the same current-state precedence.
     legacy = co.resume("t", "cl", compact=False)
     rendered = subprocess.run([sys.executable, str(hook), "t", "cl"], input=json.dumps(legacy),

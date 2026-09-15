@@ -109,3 +109,26 @@ three-line source, the regression parses it with `node --input-type=module --che
 a module against a stub exposing only those two tools and `text` (one call with the declared
 arguments, one emitted result; the reproducer's shape is confirmed rejected), SOPs carry the exact
 template, and build `coord.request-reduction.20260915.r4` was exported (offline only, no model calls).
+
+## Owner-directed follow-up (owner-followup v1, 2026-09-15)
+
+Incident: Codex task "Create and assemble figure" on Mycelium task `sckg-figure-20260915` (execution
+`sckg-figure-run-1`, completed/closure v16 at 06:08Z) could not act on the owner's later revision list
+("unlock this and proceed", "just start a new session and remake it with these changes"): both
+`change_limits` calls recorded genuine authority but `unpause` answered `not_paused`, new work was
+`execution_completed`, `open_execution` on the task was `execution_identity_conflict`, and the startup
+context forbade a successor task. Fix (this release): ONE atomic `ExecutionManager.owner_request`
+(`exec-owner-request` / `execution_owner_request`) opens the next run of the SAME execution from
+completed/closed/paused/draining-free/exhausted/expired states on an explicit owner work instruction —
+prior run archived immutably under `runs` (status, closure, receipt, acceptance evidence, freeze,
+blockers, pause, shutdown, usage/limits at end), fresh acceptance state for the new scope, cumulative
+usage never reset, only the owner's bounded `add_limits` applied (recorded in `limit_changes`), a new
+`expires_at` required when expired, idempotent by `request_id` (conflicting replay refused), refused
+while owned jobs run / a run is draining / an automation shutdown is unreconciled. A prior run's
+completion ref is `stale_completion_receipt` for the new run; the archived shutdown cannot stop it.
+`_summary`/`execution_view` carry `run`, `run_id`, `runs_archived`, `completion_ref`,
+`last_owner_request` (legacy records read as run 1). The SessionStart context now separates "STOP
+(autonomous work): run N … is completed" from what the conversation may still do and names the
+owner-request path; `unpause`/`_guard_new_work` refusals name it too. Regression
+`coordination/tests/test_owner_followup.py` (core, CLI and MCP entry points) plus the offline
+reproduction on a COPY of the real record (`executor/offline-repro-real-record.*` under the brief).

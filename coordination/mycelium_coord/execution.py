@@ -723,6 +723,11 @@ class ExecutionManager:
             "closure": rec.get("closure"),
             "shutdown": shutdown,
             "shutdown_pending": bool(shutdown and shutdown.get("status") == "pending"),
+            "run": int(rec.get("run", 1)),
+            "run_id": rec.get("run_id") or rec["execution_id"],
+            "runs_archived": len(rec.get("runs") or []),
+            "owner_requests": len(rec.get("owner_requests") or []),
+            "last_owner_request": ((rec.get("owner_requests") or [None])[-1]),
         }
 
     def _freeze_manifest(self, manifest) -> dict:
@@ -913,12 +918,16 @@ class ExecutionManager:
                 "work-dispatch allowance exhausted",
             )
         if status == STATUS_COMPLETED:
-            # terminal: no work of any kind reactivates a completed execution (review R4). A late
-            # concern is a non-actionable backlog entry or a NEW user-authorized execution.
+            # terminal FOR AUTONOMOUS WORK: no background/automatic work reactivates a completed run
+            # (review R4). A completion receipt is historical evidence, never a permanent prohibition
+            # on the task: an explicit NEW OWNER WORK INSTRUCTION opens the next run of this same
+            # execution through owner_request (owner-followup v1).
             raise ProtocolError(
                 "execution_completed",
                 rec["task_id"],
-                "completed is terminal; a new concern uses a related new execution, not this one",
+                "run %d is completed: terminal for autonomous work; an explicit owner work "
+                "instruction opens the next run via owner_request (exec-owner-request / "
+                "execution_owner_request), never this reservation" % int(rec.get("run", 1)),
             )
         if status == STATUS_CLOSED or rec["phase"] == PHASE_CLOSURE:
             # closed (coverage complete, not yet finally completed): the ONLY new work permitted is a
@@ -1413,6 +1422,13 @@ class ExecutionManager:
             self._check_version(rec, expected_state_version)
             if rec["status"] == STATUS_COMPLETED:
                 return {"idempotent": True, "execution": self._summary(rec)}
+            for prior in rec.get("runs") or []:
+                pc = (prior.get("completion") or {}).get("completion_ref")
+                if pc and pc == completion_ref:
+                    raise ProtocolError(
+                        "stale_completion_receipt", completion_ref,
+                        "that completion receipt closed run %s; it cannot complete run %s"
+                        % (prior.get("run"), rec.get("run", 1)))
             manifest = rec.get("acceptance_manifest", {})
             covered = bool(manifest) and all(
                 c.get("accepted") for c in manifest.values()
@@ -1917,7 +1933,11 @@ class ExecutionManager:
             rec = self._require_managed(task_id)
             self._check_version(rec, expected_state_version)
             if rec["status"] not in (STATUS_PAUSED, STATUS_DRAINING):
-                raise ProtocolError("not_paused", task_id, "execution is not paused")
+                raise ProtocolError(
+                    "not_paused", task_id,
+                    "execution is %s, not paused; a completed/closed/exhausted run is reopened only "
+                    "by an explicit owner work instruction via owner_request (exec-owner-request / "
+                    "execution_owner_request)" % rec["status"])
             if self._expired(rec):
                 raise ProtocolError(
                     "execution_expired",
@@ -1998,6 +2018,196 @@ class ExecutionManager:
                  "scope_amendment": bool(scope_amendment)},
             )
             return {"execution": self._summary(rec), "applied": applied}
+
+    # ------------------------------------------------------------------ owner follow-up (new run)
+    OWNER_ADDABLE = ("work_dispatches", "review_launches", "technical_calls", "acceptance_calls")
+
+    @staticmethod
+    def _owner_request_fingerprint(request_id, authorization_ref, scope_ref, manifest, add_limits,
+                                   expires_at) -> str:
+        body = {
+            "request_id": request_id, "authorization_ref": authorization_ref, "scope_ref": scope_ref,
+            "criteria": {cid: {"description": c.get("description", ""), "kind": c.get("kind", "deliverable")}
+                         for cid, c in (manifest or {}).items()},
+            "add_limits": {k: int(v) for k, v in (add_limits or {}).items()},
+            "expires_at": expires_at,
+        }
+        return hashlib.sha256(json.dumps(body, sort_keys=True).encode("utf-8")).hexdigest()
+
+    def owner_request(
+        self,
+        task_id: str,
+        *,
+        request_id: str,
+        authorization_ref: str,
+        scope_ref: str,
+        acceptance_manifest=None,
+        add_limits=None,
+        expires_at=None,
+        note=None,
+        live_work=None,
+        expected_state_version=None,
+    ) -> dict:
+        """Owner-directed follow-up (owner-followup v1): ONE atomic operation that opens the NEXT RUN
+        of this same execution from ANY stopped state — completed, closed, paused, draining,
+        exhausted or expired — as well as from an active one, on the strength of an explicit NEW
+        OWNER WORK INSTRUCTION recorded as ``authorization_ref``. The agent performs it from that
+        existing approval; no owner shell command and no repeated confirmation. Background events,
+        stale checkpoints, a peer's summary or an agent-authored reference never create authority:
+        the reference only RECORDS what the owner actually said.
+
+        Atomic effects, under the task lock:
+        * the prior run (status, closure, completion receipt, acceptance manifest + evidence, freeze,
+          blockers, pause, shutdown, usage and limits at end) is appended IMMUTABLY to ``runs``;
+        * the record becomes run N+1: active (or truthfully ``exhausted`` when the work-dispatch
+          allowance is already spent), fresh acceptance state for the new scope (old accepted criteria
+          cannot satisfy it), ``closure``/``completion``/``shutdown``/``pause`` cleared for the new
+          run only, ``scope_ref`` replaced;
+        * ``add_limits`` ADD bounded allowance on top of the current limits (never reset, never
+          silently lifted; each addition is a recorded ``limit_changes`` entry); ``expires_at``
+          replaces the deadline when given and is REQUIRED when the execution is expired;
+        * cumulative usage, reservations, backlog and the audit log are untouched.
+
+        Idempotent by ``request_id``: an identical replay returns the run it already opened without a
+        second run or charge; a same-id different-content replay is refused
+        (``owner_request_conflict``). Refused while identified live work could conflict
+        (``live_work`` names running owned jobs; a ``draining`` run still has in-flight work) or an
+        automation's shutdown is still unreconciled (``owner_request_unreconciled_shutdown``) — an
+        owner is never force-unlocked."""
+        require_id(task_id, "task_id")
+        require_id(request_id, "request_id")
+        if not authorization_ref:
+            raise ProtocolError(
+                "missing_authorization", task_id,
+                "an owner request records the actual owner instruction reference")
+        if not scope_ref:
+            raise ProtocolError("missing_scope", task_id, "an owner request names the new scope/acceptance reference")
+        add_limits = dict(add_limits or {})
+        for k, v in add_limits.items():
+            if k not in self.OWNER_ADDABLE:
+                raise ProtocolError("unknown_limit", k, "owner request may add only %s" % (self.OWNER_ADDABLE,))
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise ProtocolError("invalid_limit", k, "%s addition must be a nonnegative integer" % k)
+        manifest = self._freeze_manifest(acceptance_manifest)
+        fingerprint = self._owner_request_fingerprint(request_id, authorization_ref, scope_ref, manifest,
+                                                      add_limits, expires_at)
+        with self.store.lock(task_id):
+            rec = self._require_managed(task_id)
+            self._check_version(rec, expected_state_version)
+            ledger = rec.setdefault("owner_requests", [])
+            for entry in ledger:
+                if entry.get("request_id") == request_id:
+                    if entry.get("fingerprint") == fingerprint:
+                        return {"idempotent": True, "run": entry["run"], "prior_run": entry["from_run"],
+                                "request": entry, "execution": self._summary(rec)}
+                    raise ProtocolError(
+                        "owner_request_conflict", request_id,
+                        "owner request id already applied with different content; a changed request "
+                        "uses a fresh request_id")
+            live = [str(j) for j in (live_work or []) if j]
+            if rec["status"] == STATUS_DRAINING:
+                live.append("draining:%s" % rec["execution_id"])
+            if live:
+                raise ProtocolError(
+                    "owner_request_live_work", task_id,
+                    "identified owned work is still live (%s); let it finish or cancel it through "
+                    "the job tools before opening the next run" % ", ".join(sorted(live)))
+            sd = rec.get("shutdown") or {}
+            if sd.get("status") == "pending" and rec.get("automation_ref"):
+                raise ProtocolError(
+                    "owner_request_unreconciled_shutdown", task_id,
+                    "automation %s has a pending, unreconciled shutdown; reconcile it first"
+                    % rec.get("automation_ref"))
+            limits = dict(rec["limits"])
+            applied = {}
+            for k, v in add_limits.items():
+                old = limits.get(k)
+                limits[k] = int(v) if old is None else int(old) + int(v)
+                applied[k] = {"old": old, "new": limits[k], "added": int(v)}
+            if expires_at is not None:
+                applied["expires_at"] = {"old": limits.get("expires_at"), "new": expires_at}
+                limits["expires_at"] = expires_at
+            self._validate_limits(limits)
+            probe = {"limits": limits}
+            if self._expired(probe):
+                raise ProtocolError(
+                    "owner_request_requires_deadline", task_id,
+                    "the execution is expired; the owner request must carry a future expires_at")
+            now = utcnow()
+            prior_no = int(rec.get("run", 1))
+            prior = {
+                "run": prior_no,
+                "run_id": rec.get("run_id") or rec["execution_id"],
+                "status": rec["status"],
+                "phase": rec["phase"],
+                "scope_ref": rec.get("scope_ref"),
+                "authorization_ref": rec.get("authorization_ref"),
+                "acceptance_manifest": rec.get("acceptance_manifest"),
+                "accepted_evidence": rec.get("accepted_evidence"),
+                "acceptance_freeze": rec.get("acceptance_freeze"),
+                "acceptance_invalidations": rec.get("acceptance_invalidations"),
+                "blockers": rec.get("blockers"),
+                "pause": rec.get("pause"),
+                "closure": rec.get("closure"),
+                "completion": rec.get("completion"),
+                "shutdown": rec.get("shutdown"),
+                "limits_at_end": dict(rec["limits"]),
+                "usage_at_end": {k: rec["usage"].get(k, 0) for k in self.OWNER_ADDABLE},
+                "state_version_at_end": rec.get("state_version"),
+                "opened_at": rec.get("run_opened_at") or rec.get("opened_at"),
+                "ended_at": now,
+                "ended_by": request_id,
+            }
+            rec.setdefault("runs", []).append(prior)
+            new_no = prior_no + 1
+            rec["run"] = new_no
+            rec["run_id"] = "%s/run-%d" % (rec["execution_id"], new_no)
+            rec["run_opened_at"] = now
+            rec["scope_ref"] = scope_ref
+            rec["phase"] = PHASE_IMPLEMENTATION
+            rec["acceptance_manifest"] = manifest
+            rec["accepted_evidence"] = {}
+            rec["acceptance_freeze"] = None
+            rec["acceptance_invalidations"] = []
+            rec["blockers"] = []
+            rec["pause"] = None
+            rec["closure"] = None
+            rec["completion"] = None
+            rec["shutdown"] = None
+            rec["limits"] = limits
+            if applied:
+                rec.setdefault("limit_changes", []).append(
+                    {"at": now, "authorization_ref": authorization_ref, "changes": applied,
+                     "owner_request_id": request_id})
+            wd = limits.get("work_dispatches")
+            spent = wd is not None and int(rec["usage"].get("work_dispatches", 0)) >= int(wd)
+            rec["status"] = STATUS_EXHAUSTED if spent else STATUS_ACTIVE
+            entry = {
+                "request_id": request_id,
+                "at": now,
+                "authorization_ref": authorization_ref,
+                "scope_ref": scope_ref,
+                "fingerprint": fingerprint,
+                "from_run": prior_no,
+                "from_status": prior["status"],
+                "run": new_no,
+                "run_id": rec["run_id"],
+                "added_limits": {k: v["added"] for k, v in applied.items() if k != "expires_at"},
+                "expires_at": limits.get("expires_at"),
+                "criteria": sorted(manifest),
+                "note": (str(note)[:500] if note else None),
+            }
+            ledger.append(entry)
+            self._record_amendment(rec, via="owner_request", authorization_ref=authorization_ref,
+                                   note=note or scope_ref, fields=applied.keys())
+            rec["last_action"] = {"id": request_id, "kind": "owner_request", "outcome": "run_opened",
+                                  "evidence_ref": authorization_ref}
+            rec = self._write(task_id, rec)
+            self._audit(task_id, "owner_request", {
+                "request_id": request_id, "authorization_ref": authorization_ref, "from_run": prior_no,
+                "from_status": prior["status"], "run": new_no, "fields": sorted(applied)})
+            return {"idempotent": False, "run": new_no, "prior_run": prior_no, "request": entry,
+                    "execution": self._summary(rec)}
 
     def set_phase(
         self, task_id: str, *, phase: str, expected_state_version=None

@@ -153,8 +153,18 @@ context on every tool call:
 
 ## Owner-authorized recovery, routine workers, one wait path (request reduction v1)
 
-- A paused / exhausted / expired execution is reopened ONLY through the owner-linked path, in this
-  order: `exec-change-limits TASK --authorization <owner instruction ref> --scope-amendment "…"
+- A COMPLETED or CLOSED run is not a dead task: its STOP covers autonomous continuation of that run
+  only. On a genuine new owner work instruction in the same task, run ONE
+  `exec-owner-request TASK --request-id <id> --authorization <owner instruction ref> --scope <new
+  scope/acceptance ref> [--manifest JSON] [--add-limits '{"work_dispatches": N, ...}'] [--expires-at ISO]`
+  (MCP `execution_owner_request`): it opens the next run of the same execution (never a new Codex or
+  Mycelium task), archives the prior run/receipt/evidence immutably under `runs`, keeps cumulative
+  usage, gives the new scope its own acceptance state, and refuses live owned work, unreconciled
+  automation shutdowns and conflicting replays (an identical replay is idempotent). Old receipts and
+  shutdowns cannot complete or stop the new run. Questions/reviews alone never restart work; an
+  agent-authored reference never creates authority. Then ONE fresh `exec-status`/`resume` is the truth.
+- A paused / exhausted / expired execution that continues IN PLACE is reopened through the
+  owner-linked path, in this order: `exec-change-limits TASK --authorization <owner instruction ref> --scope-amendment "…"
   --changes '{"expires_at": "...", "work_dispatches": N, ...}'` (when expired or the allowance is
   spent), then `exec-unpause TASK --authorization <same ref>`. Both record an append-only
   `scope_amendments` entry and never reset usage or frozen acceptance. `unpause` refuses an expired
