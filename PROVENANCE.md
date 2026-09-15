@@ -132,3 +132,13 @@ completion ref is `stale_completion_receipt` for the new run; the archived shutd
 owner-request path; `unpause`/`_guard_new_work` refusals name it too. Regression
 `coordination/tests/test_owner_followup.py` (core, CLI and MCP entry points) plus the offline
 reproduction on a COPY of the real record (`executor/offline-repro-real-record.*` under the brief).
+Scoped review repairs (REVIEW.md R1-R3): reservations carry their `run` and a stale-run reservation
+never dispatches (`reservation_stale_run`); renewal is refused under the lock while any reservation is
+open (`owner_request_open_reservations`, nothing forgiven); evidence that satisfied any criterion on an
+archived run is `stale_evidence_replay`; a completion shutdown intent needs a completed run
+(`shutdown_not_applicable`); refreshed callers pass `run` (`--run`) to record-evidence /
+record-completion / request-shutdown (`run_mismatch` for an archived run); the owner-request ledger is
+reconciled before the version guard (exact retry with the original expected version is idempotent) and
+the fingerprint binds normalized description/kind/evidence_requirements; a checkpoint published before
+the current run opened is `predates_run` in `resume` (next action dropped, current scope/request
+surfaced) and the SessionStart context says so. Exported as build `coord.owner-followup.20260915.r2`.

@@ -320,6 +320,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("exec-record-evidence")
     p.add_argument("task_id")
+    p.add_argument("--run", type=int, default=None, help="the run this write is for (refused if not the current run)")
     p.add_argument("--criterion", required=True, dest="criterion_id")
     p.add_argument("--evidence", required=True, dest="evidence_ref")
     p.add_argument("--attestation", default=None)
@@ -467,6 +468,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("exec-record-completion")
     p.add_argument("task_id")
+    p.add_argument("--run", type=int, default=None, help="the run this write is for (refused if not the current run)")
     p.add_argument("--completion-ref", required=True, dest="completion_ref")
     p.add_argument("--by", required=True, dest="accepted_by")
     p.add_argument("--attestation", default=None)
@@ -476,6 +478,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("exec-request-shutdown")
     p.add_argument("task_id")
+    p.add_argument("--run", type=int, default=None, help="the run this write is for (refused if not the current run)")
     p.add_argument("--reason", default="expiry")
     p.add_argument(
         "--expected-version", type=int, default=None, dest="expected_state_version"
@@ -840,6 +843,7 @@ def run(argv: list[str] | None = None) -> int:
                     attestation=args.attestation,
                     evidence_sha256=args.evidence_sha256,
                     accepted_by=args.accepted_by,
+                    run=args.run,
                     expected_state_version=args.expected_state_version,
                 )
             )
@@ -983,6 +987,7 @@ def run(argv: list[str] | None = None) -> int:
                     completion_ref=args.completion_ref,
                     accepted_by=args.accepted_by,
                     attestation=args.attestation,
+                    run=args.run,
                     expected_state_version=args.expected_state_version,
                 )
             )
@@ -991,6 +996,7 @@ def run(argv: list[str] | None = None) -> int:
                 em.request_shutdown(
                     args.task_id,
                     reason=args.reason,
+                    run=args.run,
                     expected_state_version=args.expected_state_version,
                 )
             )

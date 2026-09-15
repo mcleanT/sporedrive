@@ -29,13 +29,32 @@ def message_view(message):
             "summary_only": True}
 
 
-def checkpoint_view(checkpoint, *, after_revision=None, stopped=False):
+def checkpoint_predates_run(checkpoint, status) -> bool:
+    """R3 (owner-followup review): a checkpoint published BEFORE the current owner run opened
+    belongs to an earlier run. Its history stays readable, but its action-bearing content
+    (next_action) must never re-enter the new run. Run 1 (legacy records) is never stale."""
+    if not checkpoint or not status or int(status.get("run") or 1) <= 1:
+        return False
+    opened = status.get("run_opened_at")
+    published = checkpoint.get("published_at")
+    if not opened or not published:
+        return False
+    return str(published) < str(opened)  # both ISO-8601 UTC from the same store clock
+
+
+def checkpoint_view(checkpoint, *, after_revision=None, stopped=False, status=None):
     if not checkpoint:
         return None
     result = {k: checkpoint.get(k) for k in ("revision", "content_hash", "authorization_ref")}
     result["summary_only"] = True
     result["unchanged"] = checkpoint.get("revision") == after_revision
-    if not result["unchanged"] and not stopped:
+    stale = checkpoint_predates_run(checkpoint, status)
+    if stale:
+        result["predates_run"] = int(status.get("run") or 1)
+        result["current_scope_ref"] = status.get("scope_ref")
+        lo = status.get("last_owner_request") or {}
+        result["current_owner_request"] = lo.get("request_id")
+    if not result["unchanged"] and not stopped and not stale:
         body = checkpoint.get("checkpoint") or {}
         next_action = body.get("next_action") or body.get("next")
         if next_action:
@@ -48,7 +67,8 @@ def execution_view(status):
         return None
     out = {k: status.get(k) for k in ("execution_id", "status", "phase", "state_version",
                                      "expired", "expires_at", "usage", "coverage",
-                                     "authorization", "run", "run_id", "runs_archived")}
+                                     "authorization", "run", "run_id", "runs_archived",
+                                     "run_opened_at", "scope_ref")}
     # owner-followup v1: a stopped run says WHICH run stopped and what closed it, so generated
     # context can distinguish "this prior run cannot autonomously continue" from "this
     # conversation cannot do anything". Legacy records read as run 1 with nothing archived.

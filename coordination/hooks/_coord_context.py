@@ -65,7 +65,15 @@ def main() -> int:
                      "opens a second run; unauthorized or expired work without a new deadline stays STOP.")
     if ck and not stopped:
         lines.append(f"Current checkpoint rev {ck.get('revision')} (auth {ck.get('authorization_ref')}).")
-        nxt = body.get("next_action") or body.get("next")
+        predates = ck.get("predates_run")
+        if predates:
+            # R3: the checkpoint belongs to an earlier owner run — history, not instructions
+            lines.append(f"That checkpoint predates owner run {predates}: its next action, STOP/review and "
+                         "continuation instructions are superseded and must not be resumed. Current owner "
+                         f"scope: {ck.get('current_scope_ref') or execution.get('scope_ref')}"
+                         f"{' (owner request ' + str(ck.get('current_owner_request')) + ')' if ck.get('current_owner_request') else ''}. "
+                         "Work from the owner's new instruction; publish a fresh checkpoint for this run.")
+        nxt = None if predates else (body.get("next_action") or body.get("next"))
         if nxt:
             lines.append(f"Next action: {str(nxt)[:300]}")
         refs = body.get("knowledge_refs") or body.get("knowledge") or []

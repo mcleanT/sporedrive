@@ -194,7 +194,13 @@ mycelium-coord exec-owner-request TASK --request-id ID --authorization REF --sco
   refuses conflicting replays, live owned work and unreconciled automation shutdowns. Old receipts
   cannot complete the new run; stale shutdowns cannot stop it. Questions/reviews alone never restart
   work. Clients that have not reloaded the MCP server use the installed CLI
-  (`coordination/bin/mycelium-coord exec-owner-request …`).
+  (`coordination/bin/mycelium-coord exec-owner-request …`). Renewal is refused while any reservation is
+  still open (settle it first; nothing is forgiven); a reservation made on an earlier run never
+  dispatches on a later one; evidence that satisfied a criterion on an archived run is a stale
+  replay; refreshed callers pass `--run N` (MCP `run`) on exec-record-evidence /
+  exec-record-completion / exec-request-shutdown; an identical exec-owner-request retry with the
+  original `--expected-version` is idempotent. A checkpoint published before the current run opened
+  is history: `resume` flags it `predates_run` and drops its next action; publish a fresh one.
 - **Owner-authorized recovery.** Paused/exhausted is recoverable only by the owner through
   `exec-change-limits` / `exec-unpause` with `--authorization` (and optional `--scope-amendment`,
   recorded append-only under `scope_amendments`). A recorded recovery shown under

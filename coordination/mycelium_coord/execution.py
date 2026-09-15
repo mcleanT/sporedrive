@@ -443,6 +443,10 @@ class ExecutionManager:
         res = rec.get("usage", {}).get("reservations", {}).get(action_id)
         if res is None:
             return {"ok": False, "reason": "unknown_reservation", "status": status}
+        if int(res.get("run", 1) or 1) != self._run_of(rec):
+            # R1: a reservation made for an earlier owner run never funds work on the current run
+            return {"ok": False, "reason": "reservation_stale_run", "status": status,
+                    "reservation_run": int(res.get("run", 1) or 1), "run": self._run_of(rec)}
         if res.get("status") != "reserved":
             return {
                 "ok": False,
@@ -618,6 +622,21 @@ class ExecutionManager:
             )
 
     @staticmethod
+    def _run_of(rec: dict) -> int:
+        return int(rec.get("run", 1) or 1)
+
+    def _require_run(self, rec: dict, run, what: str) -> None:
+        """R1 (owner-followup review): a refreshed caller names the run a consequential write is
+        for; a write for an archived run is refused instead of landing on the current one."""
+        if run is None:
+            return
+        cur = self._run_of(rec)
+        if int(run) != cur:
+            raise ProtocolError(
+                "run_mismatch", str(run),
+                "%s names run %s but the current run is %d (archived runs are immutable)" % (what, run, cur))
+
+    @staticmethod
     def _expired(rec: dict) -> bool:
         exp = (rec.get("limits") or {}).get("expires_at")
         if not exp:
@@ -725,6 +744,8 @@ class ExecutionManager:
             "shutdown_pending": bool(shutdown and shutdown.get("status") == "pending"),
             "run": int(rec.get("run", 1)),
             "run_id": rec.get("run_id") or rec["execution_id"],
+            "run_opened_at": rec.get("run_opened_at") or rec.get("opened_at"),
+            "scope_ref": rec.get("scope_ref"),
             "runs_archived": len(rec.get("runs") or []),
             "owner_requests": len(rec.get("owner_requests") or []),
             "last_owner_request": ((rec.get("owner_requests") or [None])[-1]),
@@ -1018,6 +1039,7 @@ class ExecutionManager:
                 "outcome": None,
                 "evidence_ref": None,
                 "reserved_at": utcnow(),
+                "run": self._run_of(rec),  # R1: bound to the run it was reserved on
             }
             rec["last_action"] = {
                 "id": action_id,
@@ -1307,12 +1329,24 @@ class ExecutionManager:
         evidence_sha256=None,
         accepted_by=None,
         expected_state_version=None,
+        run=None,
     ) -> dict:
         require_id(task_id, "task_id")
         with self.store.lock(task_id):
             rec = self._require_managed(
                 task_id
             )  # a bounded closure op, allowed while paused
+            self._require_run(rec, run, "record_evidence")
+            for prior in rec.get("runs") or []:
+                for old_cid, old in (prior.get("accepted_evidence") or {}).items():
+                    if old.get("evidence_ref") == evidence_ref and (
+                            evidence_sha256 is None or old.get("evidence_sha256") == evidence_sha256):
+                        # R1: evidence that satisfied ANY criterion on an ARCHIVED run is a stale
+                        # replay for the current run's own acceptance state (same id or not)
+                        raise ProtocolError(
+                            "stale_evidence_replay", criterion_id,
+                            "that evidence already satisfied %s on archived run %s; run %d needs its own"
+                            % (old_cid, prior.get("run"), self._run_of(rec)))
             self._check_version(rec, expected_state_version)
             if rec["status"] == STATUS_COMPLETED:
                 raise ProtocolError(
@@ -1404,6 +1438,7 @@ class ExecutionManager:
         accepted_by: str,
         attestation=None,
         expected_state_version=None,
+        run=None,
     ) -> dict:
         """Record the explicit FINAL completion receipt: closure -> terminal ``completed`` (review
         R4). Requires coverage complete (status closed) and an attributable receipt. Terminal: after
@@ -1419,6 +1454,7 @@ class ExecutionManager:
             )
         with self.store.lock(task_id):
             rec = self._require_managed(task_id)
+            self._require_run(rec, run, "record_completion")
             self._check_version(rec, expected_state_version)
             if rec["status"] == STATUS_COMPLETED:
                 return {"idempotent": True, "execution": self._summary(rec)}
@@ -1789,12 +1825,20 @@ class ExecutionManager:
         }
 
     def request_shutdown(
-        self, task_id: str, *, reason: str = "expiry", expected_state_version=None
+        self, task_id: str, *, reason: str = "expiry", expected_state_version=None, run=None
     ) -> dict:
         """Explicitly record a pending shutdown intent (e.g. on detected expiry). Idempotent. Records
-        the intent for ANY execution; the host adapter only pauses automation when one is named."""
+        the intent for ANY execution; the host adapter only pauses automation when one is named.
+        R1: a ``completion`` intent is only meaningful on a completed run — a delayed completion
+        shutdown from an archived run can never land on the current one."""
         with self.store.lock(task_id):
             rec = self._require_managed(task_id)
+            self._require_run(rec, run, "request_shutdown")
+            if reason == "completion" and rec["status"] != STATUS_COMPLETED:
+                raise ProtocolError(
+                    "shutdown_not_applicable", task_id,
+                    "a completion shutdown intent requires a completed run; run %d is %s"
+                    % (self._run_of(rec), rec["status"]))
             self._check_version(rec, expected_state_version)
             self._record_shutdown_intent(rec, reason=reason)
             rec = self._write(task_id, rec)
@@ -2027,7 +2071,9 @@ class ExecutionManager:
                                    expires_at) -> str:
         body = {
             "request_id": request_id, "authorization_ref": authorization_ref, "scope_ref": scope_ref,
-            "criteria": {cid: {"description": c.get("description", ""), "kind": c.get("kind", "deliverable")}
+            "criteria": {cid: {"description": str(c.get("description") or "").strip(),
+                               "kind": str(c.get("kind") or "deliverable").strip(),
+                               "evidence_requirements": str(c.get("evidence_requirements") or "").strip()}
                          for cid, c in (manifest or {}).items()},
             "add_limits": {k: int(v) for k, v in (add_limits or {}).items()},
             "expires_at": expires_at,
@@ -2093,7 +2139,10 @@ class ExecutionManager:
                                                       add_limits, expires_at)
         with self.store.lock(task_id):
             rec = self._require_managed(task_id)
-            self._check_version(rec, expected_state_version)
+            # R2: reconcile an already-recorded request by its full immutable semantic payload
+            # BEFORE any new-request concurrency check, so an exact retry (uncertain delivery,
+            # same expected_state_version as the original call) returns the run it opened
+            # instead of state_version_conflict; a changed payload under the same id is refused.
             ledger = rec.setdefault("owner_requests", [])
             for entry in ledger:
                 if entry.get("request_id") == request_id:
@@ -2104,9 +2153,20 @@ class ExecutionManager:
                         "owner_request_conflict", request_id,
                         "owner request id already applied with different content; a changed request "
                         "uses a fresh request_id")
+            self._check_version(rec, expected_state_version)
             live = [str(j) for j in (live_work or []) if j]
             if rec["status"] == STATUS_DRAINING:
                 live.append("draining:%s" % rec["execution_id"])
+            # R1: an open (reserved, possibly claimed/delivered but unsettled) reservation can still
+            # launch work for the old run; refuse renewal under the lock until it is settled —
+            # never discarded or forgiven.
+            open_res = sorted(a for a, r in (rec["usage"].get("reservations") or {}).items()
+                              if r.get("status") == "reserved")
+            if open_res:
+                raise ProtocolError(
+                    "owner_request_open_reservations", task_id,
+                    "open reservations can still launch work for run %d (%s); settle them first"
+                    % (self._run_of(rec), ", ".join(open_res)))
             if live:
                 raise ProtocolError(
                     "owner_request_live_work", task_id,

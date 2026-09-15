@@ -1177,9 +1177,14 @@ class Coordinator:
         if compact:
             pending = [message_view(m) for m in pending]
             checkpoint = checkpoint_view(checkpoint, after_revision=after_checkpoint_revision,
-                                         stopped=stops_wait(status))
+                                         stopped=stops_wait(status), status=status)
             task = {k: task.get(k) for k in ("task_id", "revision", "authorization_ref")}
             p = {k: p.get(k) for k in ("participant_id", "role", "host", "state")}
+        if checkpoint and not compact:
+            from .views import checkpoint_predates_run
+            if checkpoint_predates_run(checkpoint, status):
+                checkpoint = dict(checkpoint, predates_run=int(status.get("run") or 1),
+                                  current_scope_ref=status.get("scope_ref"))
         return {
             "task": task,
             "participant": p,

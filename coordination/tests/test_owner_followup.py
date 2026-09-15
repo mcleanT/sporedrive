@@ -138,6 +138,10 @@ def test_expired_and_paused_owner_followups_succeed_and_exhausted_stays_truthful
     with pytest.raises(ProtocolError):
         em.reserve("te", action_id="d2", kind="work_dispatch")  # the attempt that flags exhaustion
     assert em.status("te")["status"] == "exhausted"
+    with pytest.raises(ProtocolError) as ei:
+        _followup(em, "te")  # R1: the open reservation d1 could still launch old-run work
+    assert ei.value.code == "owner_request_open_reservations" and "d1" in str(ei.value)
+    em.settle("te", action_id="d1", outcome="success", evidence_ref="/e/d1")
     ex = _followup(em, "te")["execution"]
     assert ex["status"] == "exhausted" and ex["run"] == 2 and ex["usage"]["work_dispatches"] == 1
     ex = _followup(em, "te", rid="owner-req-2", add_limits={"work_dispatches": 1})["execution"]
@@ -232,7 +236,7 @@ def test_live_conflicting_work_and_unreconciled_automation_shutdown_are_refused(
     assert em.status("td")["status"] == "draining"
     with pytest.raises(ProtocolError) as ei:
         _followup(em, "td")
-    assert ei.value.code == "owner_request_live_work"
+    assert ei.value.code == "owner_request_open_reservations"  # claimed, unsettled: refused under the lock
     # an unattended run whose automation shutdown is still pending is never force-unlocked
     future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
     em.open_execution("tu", execution_id="exec-tu", scope_ref=SCOPE, authorization_ref=AUTH,
@@ -341,3 +345,141 @@ def test_generated_context_distinguishes_stopped_run_from_stopped_conversation(t
     v2 = execution_view(st2)
     assert v2["run"] == 2 and v2["runs_archived"] == 1 and v2["completion_ref"] is None
     assert v2["last_owner_request"]["request_id"] == "owner-req-1" and stops_wait(st2) is False
+
+
+# ------------------------------------------------------------------ review repairs R1-R3
+def test_r1_new_run_is_isolated_from_old_reservations_evidence_and_shutdown(tmp_path):
+    em = _mgr(tmp_path)
+    _open(em, "t1", manifest=MANIFEST_V1)
+    em.reserve("t1", action_id="old-res", kind="work_dispatch")  # reserved, never launched
+    # renewal is refused under the lock while old-res could still launch work — not forgiven
+    with pytest.raises(ProtocolError) as ei:
+        _followup(em)
+    assert ei.value.code == "owner_request_open_reservations" and "old-res" in str(ei.value)
+    assert em.read_execution("t1")["usage"]["reservations"]["old-res"]["status"] == "reserved"
+    em.settle("t1", action_id="old-res", outcome="failure", evidence_ref="/e/old")
+    r = _followup(em)
+    assert r["execution"]["run"] == 2
+    # a reservation from run 1 (settled or not) never dispatches on run 2; run-2 reservations do
+    chk = em.dispatch_check("t1", action_id="old-res", dispatch_identity="old-message")
+    assert chk["ok"] is False and chk["reason"] in ("reservation_stale_run", "reservation_not_open")
+    em.reserve("t1", action_id="new-res", kind="work_dispatch")
+    rec = em.read_execution("t1")
+    assert rec["usage"]["reservations"]["new-res"]["run"] == 2 and rec["usage"]["reservations"]["old-res"]["run"] == 1
+    assert em.dispatch_check("t1", action_id="new-res", dispatch_identity="new-message")["ok"] is True
+    # legacy (run-less) reservation on a record that later got run 2: stale
+    rec["usage"]["reservations"]["new-res"]["run"] = 1
+    em.store.write(em._exec_rel("t1"), rec)
+    assert em.dispatch_check("t1", action_id="new-res", dispatch_identity="new-message")["reason"] == "reservation_stale_run"
+
+
+def test_r1_old_evidence_replay_cannot_close_run_2_even_with_the_same_criterion_id(tmp_path):
+    em = _mgr(tmp_path)
+    _complete(em)  # run 1 accepted figure_v1 with /e/figure-v1.svg
+    same_id_new_requirement = {"figure_v1": {"description": "figure REVISED per owner list",
+                                             "evidence_requirements": "revised svg + provenance"}}
+    _followup(em, acceptance_manifest=same_id_new_requirement)
+    with pytest.raises(ProtocolError) as ei:  # the exact run-1 record_evidence call, replayed
+        em.record_evidence("t1", criterion_id="figure_v1", evidence_ref="/e/figure-v1.svg",
+                           attestation="v1 delivered", accepted_by="codex-supervisor")
+    assert ei.value.code == "stale_evidence_replay"
+    st = em.status("t1")
+    assert st["status"] == "active" and st["coverage"]["accepted"] == 0
+    # the same archived artifact under a DIFFERENT criterion id is equally stale
+    _followup(em, rid="owner-req-2", acceptance_manifest={"other": {"description": "other"}})
+    with pytest.raises(ProtocolError) as ei:
+        em.record_evidence("t1", criterion_id="other", evidence_ref="/e/figure-v1.svg", attestation="x", accepted_by="s")
+    assert ei.value.code == "stale_evidence_replay"
+    _followup(em, rid="owner-req-3", acceptance_manifest=same_id_new_requirement)
+    # a refreshed caller names the run: an archived run is refused, the current run accepted
+    with pytest.raises(ProtocolError) as ei:
+        em.record_evidence("t1", criterion_id="figure_v1", evidence_ref="/e/figure-v2.svg",
+                           attestation="v2", accepted_by="sup", run=1)
+    assert ei.value.code == "run_mismatch"
+    cur = em.status("t1")["run"]  # run 4 after the two extra follow-ups above
+    em.record_evidence("t1", criterion_id="figure_v1", evidence_ref="/e/figure-v2.svg",
+                       attestation="v2", accepted_by="sup", run=cur)
+    assert em.status("t1")["status"] == "closed"
+    with pytest.raises(ProtocolError) as ei:
+        em.record_completion("t1", completion_ref="/e/receipt-v2.md", accepted_by="sup", run=1)
+    assert ei.value.code == "run_mismatch"
+    assert em.record_completion("t1", completion_ref="/e/receipt-v2.md", accepted_by="sup", run=cur)["execution"]["status"] == "completed"
+
+
+def test_r1_delayed_completion_shutdown_cannot_land_on_the_new_run(tmp_path):
+    em = _mgr(tmp_path)
+    _complete(em)
+    _followup(em)
+    with pytest.raises(ProtocolError) as ei:  # the unguarded old call
+        em.request_shutdown("t1", reason="completion")
+    assert ei.value.code == "shutdown_not_applicable"
+    with pytest.raises(ProtocolError) as ei:  # a refreshed caller naming the archived run
+        em.request_shutdown("t1", reason="operator", run=1)
+    assert ei.value.code == "run_mismatch"
+    st = em.status("t1")
+    assert st["shutdown"] is None and st["shutdown_pending"] is False and stops_wait(st) is False
+    # an operator/expiry intent for the CURRENT run still works (legacy behaviour kept)
+    assert em.request_shutdown("t1", reason="operator", run=2)["shutdown"]["status"] == "pending"
+
+
+def test_r2_exact_retry_with_original_expected_version_is_idempotent_and_requirements_bind(tmp_path):
+    em = _mgr(tmp_path)
+    _complete(em)
+    v = em.status("t1")["state_version"]
+    first = _followup(em, expected_state_version=v)
+    assert first["idempotent"] is False and first["run"] == 2
+    # uncertain delivery: the identical call retried with the ORIGINAL expected version
+    again = _followup(em, expected_state_version=v)
+    assert again["idempotent"] is True and again["run"] == 2
+    assert len(em.read_execution("t1")["runs"]) == 1 and again["execution"]["state_version"] == first["execution"]["state_version"]
+    # a NEW request with a stale expected version is still a conflict
+    with pytest.raises(ProtocolError) as ei:
+        _followup(em, rid="owner-req-2", expected_state_version=v)
+    assert ei.value.code == "state_version_conflict"
+    # evidence_requirements are part of the bound payload
+    changed = {cid: dict(spec, evidence_requirements="STRICTER") for cid, spec in MANIFEST_V2.items()}
+    with pytest.raises(ProtocolError) as ei:
+        _followup(em, acceptance_manifest=changed)
+    assert ei.value.code == "owner_request_conflict"
+    # whitespace-only differences are normalized away, not treated as a new request
+    spaced = {cid: dict(spec, description=" " + spec["description"] + " ") for cid, spec in MANIFEST_V2.items()}
+    assert _followup(em, acceptance_manifest=spaced)["idempotent"] is True
+
+
+def test_r3_prior_run_checkpoint_next_action_is_suppressed_after_owner_recovery(tmp_path):
+    """R3: an old checkpoint's action-bearing content never enters the new owner run; the current
+    scope/request is surfaced instead; a checkpoint published for the new run shows normally."""
+    import importlib.util, subprocess
+    from mycelium_coord.coord import Coordinator
+    root = tmp_path / "state"
+    co = Coordinator(CoordStore(str(root)))
+    co.create_task("t1", project="p", worktree_realpath=str(tmp_path), revision=1)
+    co.attach("t1", "cl", role="executor", worktree_realpath=str(tmp_path),
+              host={"host": "claude", "session": "s", "native_id": "n"})
+    em = ExecutionManager(co.store)
+    _complete(em)
+    co.publish_checkpoint("t1", revision=1, participant_id="cl", checkpoint={"next_action": "DO_OLD_WORK now"},
+                          authorization_ref=AUTH)
+    stopped = co.resume("t1", "cl", compact=True)
+    assert stopped["stop_waiting"] is True and "checkpoint" not in (stopped["checkpoint"] or {})
+    import time; time.sleep(0.01)
+    _followup(em)
+    r = co.resume("t1", "cl", compact=True)
+    assert r["stop_waiting"] is False and r["execution"]["run"] == 2
+    ck = r["checkpoint"]
+    assert ck["predates_run"] == 2 and ck["current_scope_ref"] == "/scope/figure-v2-revisions.md"
+    assert ck["current_owner_request"] == "owner-req-1" and "checkpoint" not in ck  # no next_action
+    full = co.resume("t1", "cl", compact=False)
+    assert full["checkpoint"]["predates_run"] == 2  # history kept, flagged
+    hook = Path(__file__).resolve().parents[1] / "hooks" / "_coord_context.py"
+    out = subprocess.run([sys.executable, str(hook), "t1", "cl"], input=json.dumps(r), text=True, capture_output=True)
+    ctx = json.loads(out.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "DO_OLD_WORK" not in ctx and "predates owner run 2" in ctx
+    assert "/scope/figure-v2-revisions.md" in ctx and "owner request owner-req-1" in ctx and "STOP (autonomous" not in ctx
+    # a checkpoint published for the NEW run is surfaced normally
+    co.publish_checkpoint("t1", revision=2, participant_id="cl", checkpoint={"next_action": "REVISE panels per owner"},
+                          authorization_ref=OWNER)
+    r2 = co.resume("t1", "cl", compact=True)
+    assert "predates_run" not in r2["checkpoint"] and r2["checkpoint"]["checkpoint"]["next_action"].startswith("REVISE")
+    out = subprocess.run([sys.executable, str(hook), "t1", "cl"], input=json.dumps(r2), text=True, capture_output=True)
+    assert "Next action: REVISE panels per owner" in json.loads(out.stdout)["hookSpecificOutput"]["additionalContext"]

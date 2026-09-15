@@ -829,6 +829,7 @@ async def execution_record_evidence(
     evidence_sha256: str | None = None,
     accepted_by: str | None = None,
     expected_state_version: int | None = None,
+    run: int | None = None,
 ) -> dict:
     """Record accepted evidence for a FROZEN acceptance criterion. Missing/unknown evidence is never a
     pass. On each settlement coverage is recomputed; once every criterion is accepted the record
@@ -853,6 +854,7 @@ async def execution_record_evidence(
                 attestation=attestation,
                 evidence_sha256=evidence_sha256,
                 accepted_by=accepted_by,
+                run=run,
                 expected_state_version=expected_state_version,
             ),
         )
@@ -1302,6 +1304,7 @@ async def execution_record_completion(
     accepted_by: str,
     attestation: str | None = None,
     expected_state_version: int | None = None,
+    run: int | None = None,
 ) -> dict:
     """Record the explicit FINAL completion receipt: closure -> terminal completed (review R4).
     Requires coverage complete (closed) and an attributable receipt. Terminal thereafter: no mutation
@@ -1322,6 +1325,7 @@ async def execution_record_completion(
                 completion_ref=completion_ref,
                 accepted_by=accepted_by,
                 attestation=attestation,
+                run=run,
                 expected_state_version=expected_state_version,
             ),
         )
@@ -1333,6 +1337,7 @@ async def execution_request_shutdown(
     task_id: str,
     reason: str = "expiry",
     expected_state_version: int | None = None,
+    run: int | None = None,
 ) -> dict:
     """Record a durable pending shutdown intent (review R5). Idempotent. A host adapter later pauses
     the named automation and reconciles.
@@ -1346,7 +1351,8 @@ async def execution_request_shutdown(
         lambda: _wrap(
             "execution_request_shutdown",
             lambda: _em().request_shutdown(
-                task_id, reason=reason, expected_state_version=expected_state_version
+                task_id, reason=reason, run=run,
+                expected_state_version=expected_state_version
             ),
         )
     )
