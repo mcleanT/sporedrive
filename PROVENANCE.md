@@ -88,3 +88,6 @@ checkout `/Users/mst36/tools/mycelium-lifecycle-wfi` @ `12862e5` plus the tracke
 records each overlay sha256 and the source sha256 it replaced). Previous accepted build:
 `coord.efficiency-v2.20260911` from `78b17c0`. The earlier scheduler canary discrepancy (immediate-route
 rrule hours) is a separately recorded historical limitation and is unchanged by this release.
+Repairs R1-R5 of the scoped review landed at `5c2058e` and were exported as build
+`coord.request-reduction.20260915.r2` (same source checkout and overlay; the candidate closure records
+canonical `5c2058e`). Native identity and fresh-session smokes passed against r2 on both hosts.
