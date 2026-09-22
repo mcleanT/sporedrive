@@ -1,16 +1,64 @@
 #!/usr/bin/env python3
-"""Render a coordination `resume` result into a SessionStart hookSpecificOutput.additionalContext
-payload (model-visible). Reads the resume JSON on stdin; task/participant from argv[1]/argv[2].
-Emits nothing (exit 0) when there is no usable state, so the hook stays silent on errors."""
+"""Render coordination state into a hookSpecificOutput.additionalContext payload (model-visible).
+
+Two modes, selected by the COORD_HOOK_EVENT env var (the adapter sets it):
+
+* SessionStart (default): read a `resume` result on stdin (task/participant from argv[1]/argv[2]) and
+  render the current checkpoint + bounded pending messages, so a starting/resuming session reattaches
+  without a transcript copy.
+* PostToolUse: read a bounded `boundary-inbox` result from the COORD_BOUNDARY_JSON env var and render
+  ONLY the new addressed mail (already count/byte capped upstream). This is the active-boundary
+  exposure that lets an already-running peer see fresh mail mid-turn. Emits NOTHING when nothing is
+  unread, so an active turn is never spammed.
+
+Emits nothing (exit 0) whenever there is no usable state, so the hook stays silent on errors."""
 from __future__ import annotations
 
 import json
+import os
 import sys
+
+
+def _emit(event: str, lines: list[str]) -> None:
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": event, "additionalContext": "\n".join(lines)}}))
+
+
+def _render_active(task: str, who: str) -> int:
+    raw = os.environ.get("COORD_BOUNDARY_JSON") or ""
+    try:
+        b = json.loads(raw)
+    except Exception:
+        return 0
+    if not isinstance(b, dict):
+        return 0
+    unread = b.get("unread") or []
+    if not unread:
+        return 0  # silent: nothing new at this active boundary
+    lines = [
+        f"Mycelium coordination — new addressed mail for {who} on task {task} "
+        f"({b.get('unread_count', len(unread))} bounded, after seq {b.get('after_seq')}):"
+    ]
+    for m in unread:
+        lines.append(
+            f"  - {m.get('message_id')} [{m.get('kind')}] from {m.get('sender')} "
+            f"rev {m.get('task_revision')}: {str(m.get('text_preview') or '')[:200]}"
+        )
+    lines.append(
+        "Read/ack via the mycelium-coord CLI or coord_* MCP tools. Coordination state only; it "
+        "changes no repository ownership and runs no analysis hooks."
+    )
+    _emit("PostToolUse", lines)
+    return 0
 
 
 def main() -> int:
     task = sys.argv[1] if len(sys.argv) > 1 else ""
     who = sys.argv[2] if len(sys.argv) > 2 else ""
+    event = os.environ.get("COORD_HOOK_EVENT", "SessionStart")
+    if event == "PostToolUse":
+        return _render_active(task, who)
+
     try:
         r = json.load(sys.stdin)
     except Exception:
@@ -48,8 +96,7 @@ def main() -> int:
         "Read/ack via the mycelium-coord CLI or the coord_* MCP tools. This is coordination "
         "state only; it does not change repository ownership or run analysis hooks."
     )
-    print(json.dumps({"hookSpecificOutput": {
-        "hookEventName": "SessionStart", "additionalContext": "\n".join(lines)}}))
+    _emit("SessionStart", lines)
     return 0
 
 

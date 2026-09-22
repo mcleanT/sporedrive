@@ -77,10 +77,15 @@ def env(tmp_path, monkeypatch):
     surf = cli.add_claude_surface()
     store = StateStore(tmp_path / "state")
     bridge = Bridge(cli=cli, store=store, clock=clk, sleep=clk.sleep)
-    holder = {"proc_start": "Tue Sep  8 11:47:38 2026"}
+    holder = {
+        "proc_start": "Tue Sep  8 11:47:38 2026",
+        # the executor's own command line as `ps -o command=` prints it: an explicit --model
+        "argv": "claude --dangerously-skip-permissions --model opus --session-id 00000000-0000-4000-8000-000000000000",
+    }
     monkeypatch.setattr(
         core.Bridge, "_proc_start", staticmethod(lambda pid: holder["proc_start"])
     )
+    monkeypatch.setattr(core.Bridge, "_proc_argv", staticmethod(lambda pid: holder["argv"]))
     return SimpleNamespace(
         cli=cli,
         clk=clk,
@@ -1773,3 +1778,79 @@ def test_footer_agent_hint_is_raw_and_never_gates_writes(env):
     assert o["background_agents"] == 2 and o["state"] == "prompt_idle"
     out = env.bridge.submit(b["binding_id"], "r-hint", "do the thing", 1)
     assert out["status"] == "accepted"
+
+
+# ---------------------------------------------------------------- authorized scoped queued steering
+# A steer (kind="steer") may queue its single-line payload into a RUNNING turn. Every identity/lease/
+# gate check still applies; only the idle precondition is relaxed for this one case. Acceptance still
+# requires the exact delivered payload to appear in the durable transcript — enqueue / an empty editor
+# / a UserPromptSubmit event alone never prove it (contract R3).
+
+
+def test_steer_into_running_turn_accepted_when_absorbed(env):
+    b = bind_writer(env)
+    env.cli.set_screen(env.surf, claude_screen(running=True))  # agent busy
+    env.cli.keep_running_on_send = True  # typing keeps the spinner (queued input)
+    out = env.bridge.submit(b["binding_id"], "r-steer-ok", "scoped review: fix the gate", 1, "steer")
+    assert out["status"] == "accepted" and out["revision"] == 2
+    assert out["evidence"]["rule"] == "exact transcript correlation"
+    assert env.cli.send_count == 1 and env.cli.enter_count == 1
+
+
+def test_steer_queued_unconfirmed_when_not_absorbed_in_window(env):
+    b = bind_writer(env)
+    env.cli.set_screen(env.surf, claude_screen(running=True))
+    env.cli.keep_running_on_send = True
+    env.cli.queue_on_enter = True  # Enter QUEUES; no transcript user-message yet
+    out = env.bridge.submit(b["binding_id"], "r-steer-q", "checkpoint please", 1, "steer")
+    # the bridge pressed Enter exactly once to queue, then found no transcript correlation in the
+    # bounded window -> uncertain (bridge_link relabels this queued_unconfirmed). Nothing re-sent.
+    assert out["status"] == "uncertain"
+    assert env.cli.send_count == 1 and env.cli.enter_count == 1
+    # a reconcile with the SAME request id must not press Enter again while still unabsorbed
+    again = env.bridge.submit(b["binding_id"], "r-steer-q", "checkpoint please", 1, "steer")
+    assert again["status"] == "uncertain"
+    assert env.cli.enter_count == 1  # no second keystroke, no auto-resend
+
+
+def test_steer_reconcile_accepts_once_absorbed_without_re_enter(env):
+    b = bind_writer(env)
+    env.cli.set_screen(env.surf, claude_screen(running=True))
+    env.cli.keep_running_on_send = True
+    env.cli.queue_on_enter = True
+    out = env.bridge.submit(b["binding_id"], "r-steer-a", "scoped review: recheck", 1, "steer")
+    assert out["status"] == "uncertain" and env.cli.enter_count == 1
+    # the running turn yields and absorbs the queued message: it becomes a real user turn now
+    env.cli.write_user_message(env.surf, "scoped review: recheck")
+    again = env.bridge.submit(b["binding_id"], "r-steer-a", "scoped review: recheck", 1, "steer")
+    assert again["status"] == "accepted" and again["reconciled"] is True
+    assert env.cli.enter_count == 1  # accepted via transcript correlation, never a second Enter
+
+
+def test_ordinary_task_still_refused_busy_on_running_turn(env):
+    b = bind_writer(env)
+    env.cli.set_screen(env.surf, claude_screen(running=True))
+    with pytest.raises(BridgeError) as ei:
+        env.bridge.submit(b["binding_id"], "r-task-busy", "do the thing", 1)  # kind defaults to task
+    assert ei.value.code == "busy"
+    assert env.cli.send_count == 0 and env.cli.enter_count == 0
+
+
+def test_steer_refused_in_modal(env):
+    b = bind_writer(env)
+    env.cli.set_screen(env.surf, modal_screen())
+    with pytest.raises(BridgeError) as ei:
+        env.bridge.submit(b["binding_id"], "r-steer-modal", "scoped review", 1, "steer")
+    assert ei.value.code == "busy"  # a steer queues only into a running turn, never a dialog
+    assert env.cli.enter_count == 0
+
+
+def test_steer_foreign_input_after_send_is_never_queued(env):
+    b = bind_writer(env)
+    env.cli.set_screen(env.surf, claude_screen(running=True))
+    env.cli.keep_running_on_send = True
+    env.cli.foreign_after_send = "a human typed something else"
+    with pytest.raises(BridgeError) as ei:
+        env.bridge.submit(b["binding_id"], "r-steer-foreign", "scoped review", 1, "steer")
+    assert ei.value.code == "staged_unverified"  # the editor is not provably ours -> no Enter
+    assert env.cli.enter_count == 0

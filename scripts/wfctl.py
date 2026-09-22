@@ -31,6 +31,9 @@ Safety properties (v2)
 Usage:
   wfctl.py snapshot <label>                     take a snapshot of the installed targets
   wfctl.py install [--label L] [--accept-drift] snapshot, then copy src -> installed locations
+                   [--only PATH ...]            --only scopes install to specific TARGETS src_rels,
+                                                 a single file inside a dir TARGET, and/or "settings"
+                                                 (repeatable); unrelated installed drift is preserved
   wfctl.py verify                               compare installed files/fields to src (exit 1 on drift)
   wfctl.py rollback <label> [--dry-run] [--force]  restore owned files + owned settings leaves
   wfctl.py list                                 list snapshots
@@ -685,24 +688,122 @@ def cleanup_staging(paths: list[Path]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# --only scoping
+# ---------------------------------------------------------------------------
+
+
+def dedup_preserve(items: list[str]) -> list[str]:
+    out: list[str] = []
+    for x in items:
+        if x not in out:
+            out.append(x)
+    return out
+
+
+def resolve_only(only: list[str]) -> tuple[dict, list[str]]:
+    """Resolve deduplicated --only PATH selectors against TARGETS.
+
+    Returns (selection, errs). selection is always a usable (possibly partial)
+    result, even when errs is non-empty:
+        {
+          "settings": bool,
+          "whole": set[str],                    # src_rel of fully-selected targets
+          "file_in_dir": dict[str, list[str]],   # dir src_rel -> ordered rel paths
+        }
+    """
+    c = cfg()
+    target_src_rels = {src_rel for _, src_rel, _ in c.targets}
+    dir_src_rels = [src_rel for kind, src_rel, _ in c.targets if kind == "dir"]
+
+    settings_selected = False
+    whole: set[str] = set()
+    file_in_dir: dict[str, list[str]] = {}
+    errs: list[str] = []
+
+    for p in only:
+        if p == "settings":
+            settings_selected = True
+            continue
+        if p in target_src_rels:
+            whole.add(p)
+            continue
+        matched_dir = None
+        rel = None
+        for dsrc in dir_src_rels:
+            prefix = dsrc.rstrip("/") + "/"
+            if p.startswith(prefix) and len(p) > len(prefix):
+                matched_dir = dsrc
+                rel = p[len(prefix):]
+                break
+        if matched_dir is None:
+            errs.append(
+                f"--only path matches no target, no file within a dir target, "
+                f"and is not 'settings': {p}"
+            )
+            continue
+        if not (c.repo / matched_dir / rel).is_file():
+            errs.append(f"--only path does not exist as a source file: {p}")
+            continue
+        bucket = file_in_dir.setdefault(matched_dir, [])
+        if rel not in bucket:
+            bucket.append(rel)
+
+    for dsrc in sorted(whole & set(file_in_dir)):
+        errs.append(
+            f"--only names dir target {dsrc!r} both entirely and via a file inside "
+            "it (ambiguous)"
+        )
+
+    return {
+        "settings": settings_selected,
+        "whole": whole,
+        "file_in_dir": file_in_dir,
+    }, errs
+
+
+# ---------------------------------------------------------------------------
 # preflight
 # ---------------------------------------------------------------------------
 
 
-def preflight(label: str, accept_drift: bool) -> list[str]:
+def preflight(label: str, accept_drift: bool, selection: dict | None = None) -> list[str]:
     c = cfg()
     errs: list[str] = []
 
-    for kind, src_rel, _dest in c.targets:
+    if selection is None:
+        whole_targets = list(c.targets)
+        partial_dirs: list[tuple[str, Path, list[str]]] = []
+        settings_active = True
+    else:
+        whole_targets = [
+            (kind, src_rel, dest)
+            for kind, src_rel, dest in c.targets
+            if src_rel in selection["whole"]
+        ]
+        partial_dirs = [
+            (src_rel, dest, selection["file_in_dir"][src_rel])
+            for _kind, src_rel, dest in c.targets
+            if src_rel in selection["file_in_dir"]
+        ]
+        settings_active = selection["settings"]
+
+    for kind, src_rel, _dest in whole_targets:
         src = c.repo / src_rel
         if kind == "dir" and not src.is_dir():
             errs.append(f"missing source dir: {src}")
         elif kind == "file" and not src.is_file():
             errs.append(f"missing source file: {src}")
-    if not c.settings_fields_src.is_file():
+    if settings_active and not c.settings_fields_src.is_file():
         errs.append(f"missing source file: {c.settings_fields_src}")
 
-    for dest in [d for _, _, d in c.targets] + [c.settings_path]:
+    dest_list = [d for _, _, d in whole_targets]
+    for _src_rel, dest_dir, rels in partial_dirs:
+        for rel in rels:
+            dest_list.append(dest_dir / rel)
+    if settings_active:
+        dest_list.append(c.settings_path)
+
+    for dest in dest_list:
         anc = dest.parent
         while not anc.exists() and anc != anc.parent:
             anc = anc.parent
@@ -712,21 +813,24 @@ def preflight(label: str, accept_drift: bool) -> list[str]:
             errs.append(f"destination parent not writable: {anc}")
 
     settings: dict | None = None
-    if not c.settings_path.is_file():
-        errs.append(f"settings.json missing: {c.settings_path}")
-    else:
-        try:
-            loaded = json.loads(c.settings_path.read_text())
-        except Exception as e:
-            errs.append(f"settings.json does not parse: {c.settings_path}: {e}")
+    if settings_active:
+        if not c.settings_path.is_file():
+            errs.append(f"settings.json missing: {c.settings_path}")
         else:
-            if not isinstance(loaded, dict):
-                errs.append(f"settings.json is not a JSON object: {c.settings_path}")
+            try:
+                loaded = json.loads(c.settings_path.read_text())
+            except Exception as e:
+                errs.append(f"settings.json does not parse: {c.settings_path}: {e}")
             else:
-                settings = loaded
+                if not isinstance(loaded, dict):
+                    errs.append(
+                        f"settings.json is not a JSON object: {c.settings_path}"
+                    )
+                else:
+                    settings = loaded
 
     leaves: list[tuple[tuple[str, ...], Any]] = []
-    if c.settings_fields_src.is_file():
+    if settings_active and c.settings_fields_src.is_file():
         try:
             leaves = wanted_leaves()
         except Exception as e:
@@ -755,7 +859,7 @@ def preflight(label: str, accept_drift: bool) -> list[str]:
         errs.append(f"snapshot label directory already exists: {c.snapshots / label}")
 
     seen_parents: set[Path] = set()
-    for dest in [d for _, _, d in c.targets] + [c.settings_path]:
+    for dest in dest_list:
         parent = dest.parent
         if parent in seen_parents or not parent.is_dir():
             continue
@@ -766,7 +870,7 @@ def preflight(label: str, accept_drift: bool) -> list[str]:
 
     if not accept_drift:
         posts = recorded_postimages()
-        for kind, _src_rel, dest in c.targets:
+        for kind, _src_rel, dest in whole_targets:
             recorded = postimage_hashes(posts, str(dest))
             if not recorded:
                 continue  # never installed by wfctl -> not a conflict
@@ -778,6 +882,26 @@ def preflight(label: str, accept_drift: bool) -> list[str]:
                     f"destination diverged from every recorded wfctl postimage: {dest} "
                     "(pass --accept-drift to install over it; the pre-install snapshot keeps your edit)"
                 )
+        for src_rel, dest_dir, rels in partial_dirs:
+            recorded_dir_hashes = postimage_hashes(posts, str(dest_dir))
+            for rel in rels:
+                dest_file = dest_dir / rel
+                cur_hash = path_hash("file", dest_file)
+                if cur_hash is None:
+                    continue  # absent destination: nothing of the user's to clobber
+                recorded = [
+                    (h or {}).get(rel)
+                    for h in recorded_dir_hashes
+                    if isinstance(h, dict)
+                ]
+                recorded = [r for r in recorded if r is not None]
+                if not recorded:
+                    continue  # never installed by wfctl -> not a conflict
+                if not any(cur_hash == r for r in recorded):
+                    errs.append(
+                        f"destination diverged from every recorded wfctl postimage: {dest_file} "
+                        "(pass --accept-drift to install over it; the pre-install snapshot keeps your edit)"
+                    )
         if settings is not None:
             for segs, _ in leaves:
                 key = dotted(segs)
@@ -798,43 +922,87 @@ def preflight(label: str, accept_drift: bool) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def build_steps() -> list[dict]:
+def build_steps(selection: dict | None = None) -> list[dict]:
+    """Build the ordered commit plan. ``selection`` (see resolve_only) scopes it to
+    specific targets / files-within-a-dir-target / settings; None means everything
+    (the unscoped default). Step "id"s are stable and tied to a target's position in
+    TARGETS (f"step-{i}", or f"step-{i}.{j}" for the j-th selected file of a
+    partially-installed dir target). "index" is the 1-based position of the step in
+    the final commit plan (used, like id, for WFCTL_FAIL_AT matching).
+    """
     c = cfg()
     steps: list[dict] = []
     for i, (kind, src_rel, dest) in enumerate(c.targets, 1):
-        src = c.repo / src_rel
+        if selection is None:
+            sel = "whole"
+        elif src_rel in selection["whole"]:
+            sel = "whole"
+        elif src_rel in selection["file_in_dir"]:
+            sel = "file_in_dir"
+        else:
+            continue
+
+        if sel == "whole":
+            src = c.repo / src_rel
+            steps.append(
+                {
+                    "id": f"step-{i}",
+                    "kind": kind,
+                    "src": str(src),
+                    "src_rel": src_rel,
+                    "dest": str(dest),
+                    "staging": str(staging_for(dest)),
+                    "pre_hash": path_hash(kind, dest),
+                    "post_hash": path_hash(kind, src),
+                    "dest_mode": mode_of(dest),
+                    "src_mode": mode_of(src),
+                    "status": "planned",
+                    "target_src_rel": src_rel,
+                    "target_dest": str(dest),
+                }
+            )
+        else:
+            for j, rel in enumerate(selection["file_in_dir"][src_rel], 1):
+                src = c.repo / src_rel / rel
+                dest_file = dest / rel
+                steps.append(
+                    {
+                        "id": f"step-{i}.{j}",
+                        "kind": "file",
+                        "src": str(src),
+                        "src_rel": f"{src_rel}/{rel}",
+                        "dest": str(dest_file),
+                        "staging": str(staging_for(dest_file)),
+                        "pre_hash": path_hash("file", dest_file),
+                        "post_hash": path_hash("file", src),
+                        "dest_mode": mode_of(dest_file),
+                        "src_mode": mode_of(src),
+                        "status": "planned",
+                        "target_src_rel": src_rel,
+                        "target_dest": str(dest),
+                        "scoped_rel": rel,
+                    }
+                )
+
+    if selection is None or selection.get("settings", False):
         steps.append(
             {
-                "id": f"step-{i}",
-                "index": i,
-                "kind": kind,
-                "src": str(src),
-                "src_rel": src_rel,
-                "dest": str(dest),
-                "staging": str(staging_for(dest)),
-                "pre_hash": path_hash(kind, dest),
-                "post_hash": path_hash(kind, src),
-                "dest_mode": mode_of(dest),
-                "src_mode": mode_of(src),
+                "id": "settings",
+                "kind": "settings",
+                "src": str(c.settings_fields_src),
+                "src_rel": SETTINGS_FIELDS_SRC,
+                "dest": str(c.settings_path),
+                "staging": str(staging_for(c.settings_path, settings_style=True)),
+                "pre_hash": path_hash("file", c.settings_path),
+                "post_hash": None,
+                "dest_mode": mode_of(c.settings_path),
+                "src_mode": mode_of(c.settings_fields_src),
                 "status": "planned",
             }
         )
-    steps.append(
-        {
-            "id": "settings",
-            "index": len(steps) + 1,
-            "kind": "settings",
-            "src": str(c.settings_fields_src),
-            "src_rel": SETTINGS_FIELDS_SRC,
-            "dest": str(c.settings_path),
-            "staging": str(staging_for(c.settings_path, settings_style=True)),
-            "pre_hash": path_hash("file", c.settings_path),
-            "post_hash": None,
-            "dest_mode": mode_of(c.settings_path),
-            "src_mode": mode_of(c.settings_fields_src),
-            "status": "planned",
-        }
-    )
+
+    for idx, st in enumerate(steps, 1):
+        st["index"] = idx
     return steps
 
 
@@ -905,6 +1073,33 @@ def restore_step(st: dict, snap: Path, manifest: dict, owned_leaves: dict) -> bo
             staging.write_text(json.dumps(doc, indent=2) + "\n")
             commit_file(staging, Path(st["dest"]), st["dest_mode"] or FILE_MODE)
             return True
+        if st.get("scoped_rel") is not None:
+            # scoped file-in-dir step: restore only this one file from the owning
+            # dir target's FULL pre-install snapshot copy, leaving every other
+            # file in the installed dir exactly as it stood before the failed step.
+            dest = Path(st["dest"])
+            rec = next(
+                (r for r in manifest.get("owned", []) if r["path"] == st["target_dest"]),
+                None,
+            )
+            if rec is None:
+                return False
+            file_hashes = rec.get("files") or {}
+            if st["scoped_rel"] not in file_hashes:
+                # the file did not exist before this install -> undo its creation
+                if dest.is_dir():
+                    shutil.rmtree(dest)
+                elif dest.exists():
+                    dest.unlink()
+                return True
+            copy = snap / rec["snapshot_copy"] / st["scoped_rel"]
+            staging = staging_for(dest)
+            cleanup_staging([staging])
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(copy, staging)
+            mode = (rec.get("file_modes") or {}).get(st["scoped_rel"])
+            commit_file(staging, dest, mode if mode is not None else mode_of(copy))
+            return True
         rec = next(
             (r for r in manifest.get("owned", []) if r["path"] == st["dest"]), None
         )
@@ -955,10 +1150,15 @@ def restore_owned_leaves(doc: dict, owned_leaves: dict) -> list[str]:
     return touched
 
 
-def install(label: str | None, accept_drift: bool) -> int:
+def install(label: str | None, accept_drift: bool, only: list[str] | None = None) -> int:
     c = cfg()
     label = label or f"pre-install-{now_label()}"
-    errs = preflight(label, accept_drift)
+    only_list = dedup_preserve(only) if only else None
+    selection: dict | None = None
+    only_errs: list[str] = []
+    if only_list is not None:
+        selection, only_errs = resolve_only(only_list)
+    errs = only_errs + preflight(label, accept_drift, selection)
     if errs:
         for e in errs:
             print(f"preflight: {e}", file=sys.stderr)
@@ -972,7 +1172,7 @@ def install(label: str | None, accept_drift: bool) -> int:
     verify_snapshot_copies(snap, manifest.get("owned", []))
     owned_leaves = json.loads((snap / "owned-leaves.json").read_text())
 
-    steps = build_steps()
+    steps = build_steps(selection)
     staging_paths = [Path(s["staging"]) for s in steps]
     try:
         changed, parent_created = stage_all(steps)
@@ -996,6 +1196,7 @@ def install(label: str | None, accept_drift: bool) -> int:
         "home": str(c.home),
         "pre_install_snapshot": str(snap),
         "accept_drift": accept_drift,
+        "only": only_list,
         "status": "staged",
         "steps": steps,
     }
@@ -1035,22 +1236,70 @@ def install(label: str | None, accept_drift: bool) -> int:
     write_json(snap / "postimage.json", post, mode=FILE_MODE)
     with open(c.history, "a") as fh:
         fh.write(json.dumps(post) + "\n")
+
+    # Build this run's target-level entries. A whole file/dir target -> one entry.
+    # A dir target partially installed via --only -> one entry for the whole dir,
+    # with the SPECIFIC files touched recorded under "scoped_files"; src_sha256/
+    # dest_sha256 are recomputed (truthful) dir hashes, which may differ because
+    # untouched sibling files keep whatever drift they already had.
+    target_kind_by_src = {src_rel: kind for kind, src_rel, _ in c.targets}
+    by_target: dict[str, dict] = {}
+    for st in committed:
+        if st["kind"] == "settings":
+            continue
+        trel = st["target_src_rel"]
+        info = by_target.setdefault(trel, {"dest": st["target_dest"], "scoped_files": []})
+        if st.get("scoped_rel") is not None:
+            info["scoped_files"].append(st["scoped_rel"])
+
+    new_entries_by_src: dict[str, dict] = {}
+    for trel, info in by_target.items():
+        kind = target_kind_by_src[trel]
+        entry = {
+            "kind": kind,
+            "src": trel,
+            "dest": info["dest"],
+            "src_sha256": path_hash(kind, c.repo / trel),
+            "dest_sha256": path_hash(kind, Path(info["dest"])),
+        }
+        if info["scoped_files"]:
+            entry["scoped_files"] = info["scoped_files"]
+        new_entries_by_src[trel] = entry
+
+    settings_step = next((s for s in committed if s["kind"] == "settings"), None)
+    if settings_step is not None:
+        new_entries_by_src[SETTINGS_FIELDS_SRC] = {
+            "kind": "settings",
+            "src": SETTINGS_FIELDS_SRC,
+            "dest": settings_step["dest"],
+            "src_sha256": settings_step["post_hash"],
+            "dest_sha256": path_hash("file", Path(settings_step["dest"])),
+        }
+
+    # Merge: entries for targets NOT touched this run carry over unchanged from
+    # whatever manifest already existed (if any); entries for targets touched this
+    # run are replaced with the freshly-computed ones above.
+    previous_entries: dict[str, dict] = {}
+    if c.installed_manifest.is_file():
+        try:
+            prev = json.loads(c.installed_manifest.read_text())
+            for e in prev.get("entries", []) or []:
+                if isinstance(e, dict) and e.get("src"):
+                    previous_entries[e["src"]] = e
+        except Exception:
+            previous_entries = {}
+    merged_entries = dict(previous_entries)
+    merged_entries.update(new_entries_by_src)
+    ordered_srcs = [src_rel for _, src_rel, _ in c.targets] + [SETTINGS_FIELDS_SRC]
+    entries = [merged_entries[s] for s in ordered_srcs if s in merged_entries]
+    entries.extend(e for s, e in merged_entries.items() if s not in ordered_srcs)
+
     installed_manifest = {
         "installed_at": post["ts"],
         "repo_head": post["repo_head"],
         "pre_install_snapshot": str(snap),
-        "entries": [
-            {
-                "kind": s["kind"],
-                "src": s["src_rel"],
-                "dest": s["dest"],
-                "src_sha256": s["post_hash"],
-                "dest_sha256": path_hash(
-                    "dir" if s["kind"] == "dir" else "file", Path(s["dest"])
-                ),
-            }
-            for s in steps
-        ],
+        "scope": only_list,
+        "entries": entries,
         "settings_fields_changed": changed,
         "postimage": post,
     }
@@ -1058,8 +1307,9 @@ def install(label: str | None, accept_drift: bool) -> int:
     receipt["status"] = "committed"
     receipt["finished_at"] = post["ts"]
     write_json(receipt_path, receipt)
+    target_step_count = sum(1 for st in committed if st["kind"] != "settings")
     print(
-        f"installed {len(steps) - 1} targets; settings leaves changed: {changed or 'none'}"
+        f"installed {target_step_count} targets; settings leaves changed: {changed or 'none'}"
     )
     print(f"pre-install snapshot: {snap}")
     print(f"transaction receipt: {receipt_path}")
@@ -1353,6 +1603,15 @@ def main(argv: list[str]) -> int:
     p_inst = sub.add_parser("install")
     p_inst.add_argument("--label")
     p_inst.add_argument("--accept-drift", action="store_true")
+    p_inst.add_argument(
+        "--only",
+        action="append",
+        metavar="PATH",
+        help=(
+            "scope install to this repo-relative TARGET src_rel, a single file "
+            "inside a dir TARGET, or the literal 'settings'; repeatable"
+        ),
+    )
     sub.add_parser("verify")
     p_roll = sub.add_parser("rollback")
     p_roll.add_argument("label")
@@ -1368,7 +1627,7 @@ def main(argv: list[str]) -> int:
     if args.cmd == "snapshot":
         snapshot(args.label or now_label())
     elif args.cmd == "install":
-        return install(args.label, args.accept_drift)
+        return install(args.label, args.accept_drift, args.only)
     elif args.cmd == "verify":
         return verify()
     elif args.cmd == "rollback":

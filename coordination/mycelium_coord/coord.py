@@ -7,6 +7,7 @@ link all call it, so Claude and Codex share identical semantics.
 from __future__ import annotations
 
 import base64
+import datetime
 import hashlib
 import json
 import os
@@ -104,6 +105,45 @@ def _page(rows, key, cursor, limit):
         lp, lu = page[-1][0]
         nxt = _enc_cursor(lp, lu)
     return [r for _k, r in page], nxt, more
+
+
+_HANDLE_PREFIX = "sd:"  # short correlated notification handle: sd: + 24 hex == 27 chars
+
+
+def _valid_handle(h) -> bool:
+    """A well-formed short handle is EXACTLY 'sd:' + 24 lowercase hex (27 chars). Anything else is
+    refused rather than guessed — a handle is an opaque identity, never a substring to search for."""
+    return (
+        isinstance(h, str)
+        and len(h) == 27
+        and h.startswith(_HANDLE_PREFIX)
+        and all(c in "0123456789abcdef" for c in h[3:])
+    )
+
+
+def _handle_ref_key(task_id, message_id, recipient, revision) -> str:
+    """Deterministic reverse-index key for (task, message, recipient, revision). Hash-based so the
+    four id fields (which may themselves contain '.', ':', '-') can never collide via separator
+    ambiguity — minting is idempotent by this exact tuple."""
+    raw = "\x00".join(
+        [str(task_id), str(message_id), str(recipient), str(int(revision))]
+    )
+    return hashlib.sha256(raw.encode()).hexdigest()[:40]
+
+
+def _age_seconds(iso_str) -> float | None:
+    """Seconds between an ISO-8601 timestamp and now (UTC). None if unparseable/absent — a status
+    whose age cannot be established is treated as STALE, never as fresh."""
+    if not iso_str:
+        return None
+    try:
+        s = str(iso_str).replace("Z", "+00:00")
+        t = datetime.datetime.fromisoformat(s)
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=datetime.timezone.utc)
+        return (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds()
+    except Exception:
+        return None
 
 
 class Coordinator:
@@ -1128,4 +1168,460 @@ class Coordinator:
             "pending_unacked": pending,
             "pending_count": len(pending),
             "cursor_after_seq": self.get_cursor(task_id, participant_id),
+        }
+
+    # ============================================================ short notification handles (sd:) §2
+    # An immutable, opaque 27-char handle (sd: + 24 hex) that resolves to task/message/recipient/
+    # revision within the ADDRESSED scope only. Substantive content stays in Mycelium; the handle is
+    # what a bounded notification row carries. Minting is idempotent by (task,message,recipient,
+    # revision); resolution refuses any caller whose task/participant/native-session does not match.
+
+    def mint_handle(
+        self,
+        task_id: str,
+        message_id: str,
+        recipient: str,
+        revision: int,
+        *,
+        controller_id: str | None = None,
+    ) -> dict:
+        require_id(task_id, "task_id")
+        require_id(message_id, "message_id")
+        require_id(recipient, "recipient")
+        rev = int(revision)
+        with self._lock(task_id):
+            msg = self.get_message(task_id, message_id)
+            if not msg:
+                raise ProtocolError(
+                    "unknown_message",
+                    message_id,
+                    "no such message to mint a handle for",
+                )
+            ref_key = _handle_ref_key(task_id, message_id, recipient, rev)
+            ref = self.store.read(f"handle_refs/{ref_key}.json")
+            if ref:
+                cur = self.store.read(f"handles/{ref['handle']}.json")
+                if cur:
+                    return {**cur, "created": False}
+            # scope: the recipient's currently-bound native session, captured IMMUTABLY at mint time
+            sess = None
+            rp = self.store.read(f"{_task_root(task_id)}/participants/{recipient}.json")
+            if rp:
+                sess = (rp.get("host") or {}).get("session")
+            handle = None
+            for _ in range(8):
+                cand = _HANDLE_PREFIX + os.urandom(12).hex()
+                if not self.store.exists(f"handles/{cand}.json"):
+                    handle = cand
+                    break
+            if handle is None:
+                raise StoreError(
+                    "handle_allocation_failed",
+                    "handles",
+                    "could not allocate a unique handle after retries",
+                )
+            rec = {
+                "handle": handle,
+                "task_id": task_id,
+                "message_id": message_id,
+                "recipient": recipient,
+                "revision": rev,
+                "scope": {
+                    "task_id": task_id,
+                    "recipient": recipient,
+                    "native_session_id": sess,
+                },
+                "controller_id": controller_id,
+                "created_at": utcnow(),
+            }
+            # forward record first, then the reverse index. A crash between the two leaves an
+            # unreferenced forward record (harmless — a re-mint just allocates a fresh handle), never
+            # a reverse ref pointing at a missing forward record.
+            self.store.write(f"handles/{handle}.json", rec)
+            self.store.write(
+                f"handle_refs/{ref_key}.json",
+                {
+                    "handle": handle,
+                    "task_id": task_id,
+                    "message_id": message_id,
+                    "recipient": recipient,
+                    "revision": rev,
+                },
+            )
+            return {**rec, "created": True}
+
+    def resolve_handle(
+        self,
+        handle: str,
+        *,
+        task_id: str | None = None,
+        participant_id: str | None = None,
+        native_session_id: str | None = None,
+    ) -> dict:
+        """Resolve a handle to its mapping, ONLY within the addressed scope. A caller that supplies a
+        task/participant/native-session that does not match the stored scope is refused — a handle is
+        never resolved for a foreign scope, and never guessed from title/focus."""
+        if not _valid_handle(handle):
+            raise ProtocolError(
+                "invalid_handle", str(handle), "handle must be 'sd:' + 24 hex"
+            )
+        rec = self.store.read(f"handles/{handle}.json")
+        if not rec:
+            raise ProtocolError("unknown_handle", handle, "no such handle")
+        scope = rec.get("scope") or {}
+        if task_id is not None and str(task_id) != str(rec.get("task_id")):
+            raise ProtocolError(
+                "handle_scope_mismatch", handle, "handle does not belong to this task"
+            )
+        if participant_id is not None and str(participant_id) != str(
+            rec.get("recipient")
+        ):
+            raise ProtocolError(
+                "handle_scope_mismatch",
+                handle,
+                "handle is not addressed to this participant",
+            )
+        if native_session_id is not None:
+            want = scope.get("native_session_id")
+            if not (want and _sid_match(want, native_session_id)):
+                raise ProtocolError(
+                    "handle_scope_mismatch",
+                    handle,
+                    "handle is bound to a different native session",
+                )
+        return rec
+
+    # ==================================================================== capability / doctor §1 routing
+    def capability(
+        self,
+        *,
+        task_id: str | None = None,
+        participant_id: str | None = None,
+        probe_transport: bool = False,
+    ) -> dict:
+        """One bounded capability report shared by CLI and MCP. Reports the INSTALLED package identity,
+        the route preference, supported status sources and wake routes, authenticated-socket access,
+        and (when a participant is named) its resolved native-session binding. Reads REAL capability at
+        call time; a historical prose/checkpoint restriction is evidence from its date, not a permanent
+        denial. Never opens socket access or exposes a credential — only the password-file PATH's
+        presence and whether its mode is owner-only."""
+        mod_dir = os.path.dirname(os.path.abspath(__file__))
+
+        def _sha(fn):
+            try:
+                with open(os.path.join(mod_dir, fn), "rb") as fh:
+                    return hashlib.sha256(fh.read()).hexdigest()
+            except OSError:
+                return None
+
+        version = None
+        d = mod_dir
+        for _ in range(6):
+            vp = os.path.join(d, "VERSION")
+            if os.path.exists(vp):
+                try:
+                    with open(vp) as fh:
+                        version = fh.read().strip()
+                except OSError:
+                    version = None
+                break
+            d = os.path.dirname(d)
+
+        pw = os.environ.get("CMUX_BRIDGE_PASSWORD_FILE")
+        pw_info = {"password_file_set": bool(pw)}
+        if pw:
+            try:
+                st = os.stat(pw)
+                pw_info["password_file_present"] = True
+                pw_info["mode_owner_only"] = (st.st_mode & 0o077) == 0
+            except OSError:
+                pw_info["password_file_present"] = False
+
+        transport = {"probed": False}
+        if probe_transport:
+            try:
+                from .bridge_link import probe_transport as _pt
+
+                transport = _pt()
+            except (
+                Exception
+            ) as e:  # bridge/cmux not reachable is a REPORTED fact, not a crash
+                transport = {"probed": False, "error": f"{type(e).__name__}: {e}"}
+
+        binding = None
+        if task_id and participant_id:
+            try:
+                p = self._participant(task_id, participant_id)
+                host = p.get("host") or {}
+                sess = host.get("session")
+                sel = (
+                    self.store.read(
+                        f"sessions/{host.get('host')}/{_session_seg(sess)}.json"
+                    )
+                    if (host.get("host") and sess)
+                    else None
+                )
+                binding = {
+                    "participant_id": participant_id,
+                    "host": host,
+                    "worktree_realpath": p.get("worktree_realpath"),
+                    "selection": sel,
+                }
+            except ProtocolError as e:
+                binding = {"participant_id": participant_id, "error": e.code}
+
+        return {
+            "capability_version": 1,
+            "probe_time": utcnow(),
+            "installed_identity": {
+                "version": version,
+                "execution_py_sha256": _sha("execution.py"),
+                "coord_py_sha256": _sha("coord.py"),
+                "bridge_link_py_sha256": _sha("bridge_link.py"),
+            },
+            "route_preference": [
+                "mcp",
+                "cli",
+                "terminal_text",
+                "gui_after_recorded_direct_failure",
+            ],
+            "status_sources": [
+                "claude_native_hook",
+                "codex_native_hook",
+                "coordinator_receipt_time",
+            ],
+            "wake_routes": {
+                "claude": {
+                    "route": "cmux_bridge",
+                    "status": "supported",
+                    "modes": ["idle_send", "authorized_scoped_queued_steering"],
+                },
+                "codex": {
+                    "route": "desktop_ipc",
+                    "status": "not_established",
+                    "socket": "~/.codex/ipc/ipc.sock",
+                    "evidence": (
+                        "owner-only ipc.sock owner-discovery read-only ok; "
+                        "live start/steer pending a reserved acceptance turn"
+                    ),
+                    "app_server_control_socket": "absent",
+                },
+            },
+            "authenticated_socket_access": pw_info,
+            "transport_probe": transport,
+            "binding": binding,
+        }
+
+    # ============================================================ per-session status & boundary inbox §3
+    def publish_session_status(
+        self,
+        task_id: str,
+        participant_id: str,
+        *,
+        native_session_id: str,
+        seq: int,
+        source: str,
+        generation: int = 0,
+        runtime_state: str = "unknown",
+        task_lifecycle: str | None = None,
+        current_task: str | None = None,
+        current_turn: str | None = None,
+        blocker: str | None = None,
+        wait_reason: str | None = None,
+        latest_checkpoint_rev: int | None = None,
+        unread_cursor: int | None = None,
+        transport_capability: str | None = None,
+        context_accounting: dict | None = None,
+        jobs: dict | None = None,
+        event_time: str | None = None,
+        allocate: bool = False,
+    ) -> dict:
+        """Publish a per-session status observation at a native lifecycle/tool boundary. Freshness is
+        the COORDINATOR RECEIPT TIME (never a host clock). Ordering is per (native session, generation)
+        by strictly-increasing seq; an update from a REPLACED session generation or an out-of-order/
+        duplicate seq is REFUSED. Axes stay separate: runtime_state, task_lifecycle, message delivery
+        and owned jobs are distinct fields; missing data is 'unknown', never synthesised as idle or
+        completed. This NEVER calls a model, demands an ack, or writes into a scientific tree."""
+        require_id(task_id, "task_id")
+        require_id(participant_id, "participant_id")
+        if not native_session_id:
+            raise ProtocolError(
+                "status_session_required",
+                participant_id,
+                "native_session_id is required for a session status",
+            )
+        gen = int(generation)
+        seqn = int(seq)
+        with self._lock(task_id):
+            rel = f"{_task_root(task_id)}/session_status/{participant_id}.json"
+            # PLAN-v2 R4: a native adapter allocates seq + binding generation from DURABLE,
+            # lock-serialised coordinator state — never a host wall clock (time_ns) — so the
+            # sequence is strictly increasing and persisted across independent hook processes.
+            # Same native session -> next seq in the same generation; a genuinely different
+            # session takes over the slot with a strictly newer generation (seq restarts). No
+            # host event cursor is available on these SessionStart/PostToolUse inputs, so this
+            # adapter sequence IS the ordering authority and is labelled as such (sequence_source).
+            if allocate:
+                sqrel = f"{_task_root(task_id)}/session_status_seq/{participant_id}.json"
+                sq = self.store.read(sqrel) or {}
+                if not sq:
+                    gen, seqn = 0, 0
+                elif _sid_match(sq.get("native_session_id"), native_session_id):
+                    gen, seqn = int(sq.get("generation", 0)), int(sq.get("seq", -1)) + 1
+                else:
+                    gen, seqn = int(sq.get("generation", 0)) + 1, 0
+                self.store.write(
+                    sqrel,
+                    {
+                        "native_session_id": native_session_id,
+                        "generation": gen,
+                        "seq": seqn,
+                        "updated_at": utcnow(),
+                    },
+                )
+            prev = self.store.read(rel)
+            if prev:
+                psess = prev.get("native_session_id")
+                pgen = int(prev.get("generation", 0))
+                if psess and not _sid_match(psess, native_session_id):
+                    # a DIFFERENT native session may take over the slot ONLY with a STRICTLY newer
+                    # generation; a superseded/older one — or a second session claiming the SAME
+                    # generation as the incumbent — can never overwrite it
+                    if gen <= pgen:
+                        raise ProtocolError(
+                            "status_replaced_session",
+                            participant_id,
+                            "a different session must present a newer generation to take over",
+                        )
+                elif gen < pgen:
+                    raise ProtocolError(
+                        "status_stale_generation",
+                        participant_id,
+                        "generation went backwards for this session",
+                    )
+                elif gen == pgen and seqn <= int(prev.get("seq", -1)):
+                    raise ProtocolError(
+                        "status_out_of_order",
+                        participant_id,
+                        "seq did not strictly increase within this generation",
+                    )
+            rec = {
+                "task_id": task_id,
+                "participant_id": participant_id,
+                "native_session_id": native_session_id,
+                "generation": gen,
+                "seq": seqn,
+                "runtime_state": runtime_state,
+                "task_lifecycle": task_lifecycle,
+                "current_task": current_task,
+                "current_turn": current_turn,
+                "blocker": blocker,
+                "wait_reason": wait_reason,
+                "latest_checkpoint_rev": latest_checkpoint_rev,
+                "unread_cursor": unread_cursor,
+                "transport_capability": transport_capability,
+                "context_accounting": context_accounting,
+                "jobs": jobs,
+                "evidence_source": source,
+                "sequence_source": "coordinator_persisted" if allocate else "caller_supplied",
+                "event_time": event_time,  # host-reported, kept SEPARATE from receipt time
+                "observed_at": utcnow(),  # coordinator receipt time == the freshness basis
+            }
+            self.store.write(rel, rec)
+            return rec
+
+    def read_session_status(
+        self,
+        task_id: str,
+        participant_id: str | None = None,
+        *,
+        max_age_s: float = 300.0,
+    ) -> dict:
+        """Read per-session status. Freshness is by coordinator receipt time: a record older than
+        max_age_s (default 300s) reads runtime_state='unknown' (stale), NEVER idle/completed. A missing
+        record is 'unknown', not idle. Returns one record (participant_id given) or every participant's."""
+        max_age = max(0.0, float(max_age_s))
+
+        def _mark(rec):
+            if not rec:
+                return None
+            out = dict(rec)
+            age = _age_seconds(rec.get("observed_at"))
+            out["age_seconds"] = age
+            out["stale"] = (age is None) or (age > max_age)
+            if out["stale"]:
+                out["runtime_state"] = "unknown"
+                out["freshness"] = "stale"
+            else:
+                out["freshness"] = "fresh"
+            return out
+
+        if participant_id is not None:
+            rec = self.store.read(
+                f"{_task_root(task_id)}/session_status/{participant_id}.json"
+            )
+            return {
+                "participant_id": participant_id,
+                "present": rec is not None,
+                "status": _mark(rec),
+                "max_age_s": max_age,
+            }
+        d = f"{_task_root(task_id)}/session_status"
+        out = {}
+        try:
+            names = self.store.listdir(d)
+        except Exception:
+            names = []
+        for fn in names:
+            base = os.path.basename(str(fn))
+            pid = base[:-5] if base.endswith(".json") else base
+            out[pid] = _mark(self.store.read(f"{d}/{base}"))
+        return {"statuses": out, "count": len(out), "max_age_s": max_age}
+
+    def boundary_inbox(
+        self,
+        task_id: str,
+        participant_id: str,
+        *,
+        limit: int = 20,
+        max_bytes: int = 4000,
+    ) -> dict:
+        """Bounded UNREAD delta for a native boundary/startup or resume: messages after the
+        participant's notification cursor, capped in count and total text bytes (NEVER a full
+        transcript per tool). Does not advance the cursor and does not demand an ack — it only
+        surfaces what is pending so a boundary can act on it."""
+        after = self.get_cursor(task_id, participant_id)
+        res = self.inbox(task_id, participant_id, after_seq=after)
+        msgs = res.get("messages", [])
+        capped = msgs[: max(0, int(limit))]
+        trimmed = []
+        total = 0
+        for m in capped:
+            t = m.get("text") or ""
+            total += len(t.encode("utf-8", "ignore"))
+            if total > int(max_bytes) and trimmed:
+                break
+            item = {
+                k: m.get(k)
+                for k in (
+                    "seq",
+                    "message_id",
+                    "kind",
+                    "sender",
+                    "recipient",
+                    "task_revision",
+                    "created_at",
+                    "reply_to",
+                    "execution_action_id",
+                )
+            }
+            item["text_preview"] = t[:200] + ("…" if len(t) > 200 else "")
+            trimmed.append(item)
+        return {
+            "participant_id": participant_id,
+            "after_seq": after,
+            "unread": trimmed,
+            "unread_count": len(trimmed),
+            "next_after_seq": res.get("next_after_seq", after),
+            "truncated_for_boundary": len(trimmed) < len(msgs),
         }

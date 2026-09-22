@@ -436,6 +436,91 @@ def build_parser() -> argparse.ArgumentParser:
         "--expected-version", type=int, default=None, dest="expected_state_version"
     )
 
+    # ---- direct messaging: short handle, capability/doctor, per-session status (SporeDrive direct) ----
+    p = sub.add_parser("handle-mint")
+    p.add_argument("task_id")
+    p.add_argument("message_id")
+    p.add_argument("recipient")
+    p.add_argument("--revision", type=int, required=True)
+    p.add_argument("--controller-id", default=None)
+
+    p = sub.add_parser("handle-resolve")
+    p.add_argument("handle")
+    p.add_argument("--task", default=None, dest="task_id")
+    p.add_argument("--participant", default=None, dest="participant_id")
+    p.add_argument("--session", default=None, dest="native_session_id")
+
+    p = sub.add_parser("capability")
+    p.add_argument("--task", default=None, dest="task_id")
+    p.add_argument("--participant", default=None, dest="participant_id")
+    p.add_argument("--probe-transport", action="store_true")
+
+    p = sub.add_parser("status-publish")
+    p.add_argument("task_id")
+    p.add_argument("participant_id")
+    p.add_argument("--session", required=True, dest="native_session_id")
+    p.add_argument("--seq", type=int, default=0)
+    p.add_argument("--source", required=True)
+    p.add_argument("--generation", type=int, default=0)
+    p.add_argument("--runtime-state", default="unknown")
+    p.add_argument("--task-lifecycle", default=None)
+    p.add_argument("--current-task", default=None)
+    p.add_argument("--current-turn", default=None)
+    p.add_argument("--blocker", default=None)
+    p.add_argument("--wait-reason", default=None)
+    p.add_argument("--latest-checkpoint-rev", type=int, default=None)
+    p.add_argument("--unread-cursor", type=int, default=None)
+    p.add_argument("--transport-capability", default=None)
+    p.add_argument(
+        "--context-accounting", default=None, help="JSON object or - for stdin"
+    )
+    p.add_argument("--jobs", default=None, help="JSON object or - for stdin")
+    p.add_argument("--event-time", default=None)
+    # Allocate the seq + binding generation from durable, locked coordinator state instead of
+    # trusting caller-supplied --seq/--generation. Native hook adapters pass this so the
+    # per-session sequence is strictly increasing and persisted across independent processes.
+    p.add_argument("--allocate-seq", action="store_true")
+
+    p = sub.add_parser("status-read")
+    p.add_argument("task_id")
+    p.add_argument("--participant", default=None, dest="participant_id")
+    p.add_argument("--max-age", type=float, default=300.0)
+
+    p = sub.add_parser("boundary-inbox")
+    p.add_argument("task_id")
+    p.add_argument("participant_id")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--max-bytes", type=int, default=4000)
+
+    # Codex desktop idle-wake: an ADDRESSED, gated, guarded wake of the peer's owning thread through
+    # the app's own IPC router. Default is prepared-not-armed (no send). --arm is a reserved canary.
+    p = sub.add_parser("wake-peer")
+    p.add_argument("task_id")
+    p.add_argument("message_id")
+    p.add_argument("--controller-id", default="", dest="controller_id")
+    p.add_argument(
+        "--conversation-id",
+        default=None,
+        dest="conversation_id",
+        help="IPC thread/conversation id to wake; defaults to the addressed participant's native session",
+    )
+    p.add_argument("--execution-action", default=None, dest="execution_action_id")
+    p.add_argument(
+        "--arm", action="store_true", help="arm the guarded seam (reserved canary only)"
+    )
+    p.add_argument(
+        "--live",
+        action="store_true",
+        help="with --arm, actually fire (dry_run=False); default is dry-run",
+    )
+    p.add_argument(
+        "--handshake-authorized",
+        action="store_true",
+        dest="handshake_authorized",
+        help="authorize an armed wake to a protected/root thread (ready/arm/yield handshake)",
+    )
+    p.add_argument("--timeout", type=float, default=12.0, dest="timeout_s")
+
     return ap
 
 
@@ -603,6 +688,91 @@ def run(argv: list[str] | None = None) -> int:
                     expected_revision=args.expected_revision,
                     accept_timeout_s=args.accept_timeout,
                     execution_action_id=args.execution_action_id,
+                )
+            )
+        elif op == "handle-mint":
+            _emit(
+                co.mint_handle(
+                    args.task_id,
+                    args.message_id,
+                    args.recipient,
+                    args.revision,
+                    controller_id=args.controller_id,
+                )
+            )
+        elif op == "handle-resolve":
+            _emit(
+                co.resolve_handle(
+                    args.handle,
+                    task_id=args.task_id,
+                    participant_id=args.participant_id,
+                    native_session_id=args.native_session_id,
+                )
+            )
+        elif op == "capability":
+            _emit(
+                co.capability(
+                    task_id=args.task_id,
+                    participant_id=args.participant_id,
+                    probe_transport=args.probe_transport,
+                )
+            )
+        elif op == "status-publish":
+            _emit(
+                co.publish_session_status(
+                    args.task_id,
+                    args.participant_id,
+                    native_session_id=args.native_session_id,
+                    seq=args.seq,
+                    source=args.source,
+                    generation=args.generation,
+                    runtime_state=args.runtime_state,
+                    task_lifecycle=args.task_lifecycle,
+                    current_task=args.current_task,
+                    current_turn=args.current_turn,
+                    blocker=args.blocker,
+                    wait_reason=args.wait_reason,
+                    latest_checkpoint_rev=args.latest_checkpoint_rev,
+                    unread_cursor=args.unread_cursor,
+                    transport_capability=args.transport_capability,
+                    context_accounting=_load_json_arg(args.context_accounting),
+                    jobs=_load_json_arg(args.jobs),
+                    event_time=args.event_time,
+                    allocate=args.allocate_seq,
+                )
+            )
+        elif op == "status-read":
+            _emit(
+                co.read_session_status(
+                    args.task_id,
+                    args.participant_id,
+                    max_age_s=args.max_age,
+                )
+            )
+        elif op == "boundary-inbox":
+            _emit(
+                co.boundary_inbox(
+                    args.task_id,
+                    args.participant_id,
+                    limit=args.limit,
+                    max_bytes=args.max_bytes,
+                )
+            )
+        elif op == "wake-peer":
+            from .codex_wake_link import wake_peer
+
+            _emit(
+                wake_peer(
+                    co,
+                    task_id=args.task_id,
+                    message_id=args.message_id,
+                    controller_id=args.controller_id,
+                    conversation_id=args.conversation_id,
+                    execution_action_id=args.execution_action_id,
+                    armed=args.arm,
+                    dry_run=not args.live,
+                    handshake_authorized=args.handshake_authorized,
+                    timeout_s=args.timeout_s,
                 )
             )
         elif op == "exec-open":

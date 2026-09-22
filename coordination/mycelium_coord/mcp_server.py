@@ -540,6 +540,61 @@ async def coord_notify_via_bridge(
     )
 
 
+@mcp.tool(title="Coord Wake Peer", annotations=_WRITE)
+async def coord_wake_peer(
+    task_id: str,
+    message_id: str,
+    controller_id: str = "",
+    conversation_id: str | None = None,
+    execution_action_id: str | None = None,
+    arm: bool = False,
+    live: bool = False,
+    handshake_authorized: bool = False,
+    timeout_s: float = 12.0,
+) -> dict:
+    """Prepare (and only when explicitly armed + authorized, fire) an ADDRESSED idle-wake of the Codex
+    desktop session that owns the addressed participant's thread, through the app's OWN already-running
+    IPC router. Mirrors the notify execution gate (a non-actionable notice on a completed/closed task
+    does NOT wake; a managed dispatch needs a reservation + a fresh pre-send check). Read-only existing
+    owner + app-build guards run BEFORE any send; by default the seam is NOT armed, so it returns
+    prepared_not_armed with wake_status not_established. Arming is a reserved human-authorized canary;
+    an armed wake to a protected/root thread refuses without handshake_authorized; an uncertain live
+    outcome is retained under the same request id, never upgraded to delivered. Never a second server,
+    daemon, or dispatcher.
+
+    Args:
+        task_id: Task id.
+        message_id: The addressed coordination message to wake the peer about.
+        controller_id: Stable controller id (for the sd: handle correlation).
+        conversation_id: IPC thread/conversation id to wake; defaults to the addressed participant's
+            native session id when omitted.
+        execution_action_id: Caller fallback for a managed dispatch's reservation id.
+        arm: Arm the guarded seam. Default false PREPARES the wake without sending (reserved canary).
+        live: With arm, actually fire (dry_run=False). Default keeps a dry-run even when armed.
+        handshake_authorized: Authorize an armed wake to a protected/root thread (ready/arm/yield).
+        timeout_s: Bounded owner-discovery probe timeout (seconds).
+    """
+    from .codex_wake_link import wake_peer
+
+    return await asyncio.to_thread(
+        lambda: _wrap(
+            "coord_wake_peer",
+            lambda: wake_peer(
+                _co(),
+                task_id=task_id,
+                message_id=message_id,
+                controller_id=controller_id,
+                conversation_id=conversation_id,
+                execution_action_id=execution_action_id,
+                armed=arm,
+                dry_run=not live,
+                handshake_authorized=handshake_authorized,
+                timeout_s=timeout_s,
+            ),
+        )
+    )
+
+
 # ---- execution record (SporeDrive stopping/permission layer; identical core to the CLI) ----
 @mcp.tool(title="Execution Open", annotations=_WRITE)
 async def execution_open(
@@ -1206,6 +1261,229 @@ async def execution_reconcile_shutdown(
                 outcome=outcome,
                 detail=detail,
                 expected_state_version=expected_state_version,
+            ),
+        )
+    )
+
+
+# ---- direct messaging: short handle, capability/doctor, per-session status (SporeDrive direct) ----
+@mcp.tool(title="Coord Handle Mint", annotations=_WRITE)
+async def coord_handle_mint(
+    task_id: str,
+    message_id: str,
+    recipient: str,
+    revision: int,
+    controller_id: str | None = None,
+) -> dict:
+    """Mint (or return the existing) short correlated handle 'sd:'+24hex for one coordination message
+    addressed to a recipient at a task revision. Idempotent by (task, message, recipient, revision);
+    the handle's scope captures the recipient's bound native session at mint time. This is an opaque
+    identity, never derived from a window title or focus.
+
+    Args:
+        task_id: Task id.
+        message_id: The coordination message this handle correlates to.
+        recipient: The addressed participant.
+        revision: Task revision the message pertains to.
+        controller_id: Optional stable controller id recorded with the handle.
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap(
+            "coord_handle_mint",
+            lambda: _co().mint_handle(
+                task_id,
+                message_id,
+                recipient,
+                revision,
+                controller_id=controller_id,
+            ),
+        )
+    )
+
+
+@mcp.tool(title="Coord Handle Resolve", annotations=_READ)
+async def coord_handle_resolve(
+    handle: str,
+    task_id: str | None = None,
+    participant_id: str | None = None,
+    native_session_id: str | None = None,
+) -> dict:
+    """Resolve a short handle to its mapping, ONLY within the addressed scope. A caller supplying a
+    task / participant / native-session that does not match the stored scope is refused; an
+    ill-formed or unknown handle is refused rather than guessed.
+
+    Args:
+        handle: The 'sd:'+24hex handle.
+        task_id: If given, must equal the handle's task.
+        participant_id: If given, must equal the handle's recipient.
+        native_session_id: If given, must match the handle's bound native session.
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap(
+            "coord_handle_resolve",
+            lambda: _co().resolve_handle(
+                handle,
+                task_id=task_id,
+                participant_id=participant_id,
+                native_session_id=native_session_id,
+            ),
+        )
+    )
+
+
+@mcp.tool(title="Coord Capability", annotations=_READ)
+async def coord_capability(
+    task_id: str | None = None,
+    participant_id: str | None = None,
+    probe_transport: bool = False,
+) -> dict:
+    """Report installed package identity, route preference, supported status sources and wake routes,
+    authenticated-socket access, and (when a participant is named) its resolved native-session
+    binding. Reads REAL capability at call time. Never opens socket access or exposes a credential —
+    only whether a password file is present and owner-only. probe_transport does a bounded read-only
+    bridge reachability check.
+
+    Args:
+        task_id: Optional task to resolve a participant binding within.
+        participant_id: Optional participant whose native-session binding to report.
+        probe_transport: When true, attempt a bounded read-only bridge transport probe.
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap(
+            "coord_capability",
+            lambda: _co().capability(
+                task_id=task_id,
+                participant_id=participant_id,
+                probe_transport=probe_transport,
+            ),
+        )
+    )
+
+
+@mcp.tool(title="Coord Session Status Publish", annotations=_WRITE)
+async def coord_session_status_publish(
+    task_id: str,
+    participant_id: str,
+    native_session_id: str,
+    seq: int,
+    source: str,
+    generation: int = 0,
+    runtime_state: str = "unknown",
+    task_lifecycle: str | None = None,
+    current_task: str | None = None,
+    current_turn: str | None = None,
+    blocker: str | None = None,
+    wait_reason: str | None = None,
+    latest_checkpoint_rev: int | None = None,
+    unread_cursor: int | None = None,
+    transport_capability: str | None = None,
+    context_accounting: dict | None = None,
+    jobs: dict | None = None,
+    event_time: str | None = None,
+) -> dict:
+    """Publish a per-session status observation at a native lifecycle/tool boundary. Freshness is the
+    COORDINATOR RECEIPT TIME (never a host clock). Ordering is per (native session, generation) by
+    strictly-increasing seq; a replaced-generation or out-of-order/duplicate update is refused.
+    Missing data stays 'unknown', never synthesised as idle/completed. Never calls a model, demands
+    an ack, or writes into a scientific tree.
+
+    Args:
+        task_id: Task id.
+        participant_id: The participant this status is about.
+        native_session_id: The reporting native session id (required).
+        seq: Strictly-increasing sequence within (session, generation).
+        source: Evidence source (e.g. claude_native_hook / codex_native_hook).
+        generation: Session generation; a newer session needs a higher generation to take over.
+        runtime_state: working | waiting | idle | unknown (never synthesised).
+        task_lifecycle: Optional managed-execution lifecycle label.
+        current_task: Optional current task label.
+        current_turn: Optional current turn marker.
+        blocker: Optional blocker summary.
+        wait_reason: Optional reason the session is waiting.
+        latest_checkpoint_rev: Optional latest checkpoint revision observed.
+        unread_cursor: Optional notification cursor position.
+        transport_capability: Optional transport capability note.
+        context_accounting: Optional structured context/budget accounting.
+        jobs: Optional owned-jobs summary.
+        event_time: Optional host-reported event time (kept separate from receipt time).
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap(
+            "coord_session_status_publish",
+            lambda: _co().publish_session_status(
+                task_id,
+                participant_id,
+                native_session_id=native_session_id,
+                seq=seq,
+                source=source,
+                generation=generation,
+                runtime_state=runtime_state,
+                task_lifecycle=task_lifecycle,
+                current_task=current_task,
+                current_turn=current_turn,
+                blocker=blocker,
+                wait_reason=wait_reason,
+                latest_checkpoint_rev=latest_checkpoint_rev,
+                unread_cursor=unread_cursor,
+                transport_capability=transport_capability,
+                context_accounting=context_accounting,
+                jobs=jobs,
+                event_time=event_time,
+            ),
+        )
+    )
+
+
+@mcp.tool(title="Coord Session Status Read", annotations=_READ)
+async def coord_session_status_read(
+    task_id: str,
+    participant_id: str | None = None,
+    max_age_s: float = 300.0,
+) -> dict:
+    """Read per-session status. Freshness is by coordinator receipt time: a record older than
+    max_age_s (default 300s) reads runtime_state='unknown' (stale), never idle/completed; a missing
+    record is 'unknown', not idle. Returns one participant's record or every participant's.
+
+    Args:
+        task_id: Task id.
+        participant_id: One participant, or null for all.
+        max_age_s: Freshness window in seconds (default 300).
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap(
+            "coord_session_status_read",
+            lambda: _co().read_session_status(
+                task_id, participant_id, max_age_s=max_age_s
+            ),
+        )
+    )
+
+
+@mcp.tool(title="Coord Boundary Inbox", annotations=_READ)
+async def coord_boundary_inbox(
+    task_id: str,
+    participant_id: str,
+    limit: int = 20,
+    max_bytes: int = 4000,
+) -> dict:
+    """Bounded UNREAD delta for a native boundary/startup or resume: messages after the participant's
+    notification cursor, capped in count and total text bytes (never a full transcript per tool).
+    Does not advance the cursor and does not demand an ack.
+
+    Args:
+        task_id: Task id.
+        participant_id: The participant whose unread delta to surface.
+        limit: Max messages (clamped to 200).
+        max_bytes: Approx total preview bytes (clamped to 20000).
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap(
+            "coord_boundary_inbox",
+            lambda: _co().boundary_inbox(
+                task_id,
+                participant_id,
+                limit=min(max(0, limit), 200),
+                max_bytes=min(max(0, max_bytes), 20000),
             ),
         )
     )

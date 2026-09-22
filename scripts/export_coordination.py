@@ -275,18 +275,28 @@ def _coord_hook_entry() -> dict:
 
 def merge_hooks(source: Path) -> dict:
     """Preserve the source hooks.json (SessionStart health, PostToolUse, Stop) and ADD the
-    coordination attach hook to SessionStart without duplicates."""
+    coordination adapter WITHOUT duplicates, on both boundaries the same one script self-detects:
+      * SessionStart (startup|resume|clear|compact): startup/resume checkpoint + pending context;
+      * PostToolUse (Bash): the active tool boundary, so an already-running peer publishes fresh
+        status and sees new addressed mail without a restart (criterion C active-boundary reqt).
+    Both fire on BOTH hosts (the entry resolves PLUGIN_ROOT on Codex / CLAUDE_PLUGIN_ROOT on Claude)."""
     hooks = _load_json(source / "hooks" / "hooks.json")
     hooks.setdefault("hooks", {})
+
+    def _has_coord(groups: list) -> bool:
+        return any(
+            "mycelium-coord-attach.sh" in h.get("command", "")
+            for grp in groups
+            for h in grp.get("hooks", [])
+        )
+
     ss = hooks["hooks"].setdefault("SessionStart", [])
-    entry = _coord_hook_entry()
-    already = any(
-        "mycelium-coord-attach.sh" in h.get("command", "")
-        for grp in ss
-        for h in grp.get("hooks", [])
-    )
-    if not already:
-        ss.append({"matcher": "startup|resume|clear|compact", "hooks": [entry]})
+    if not _has_coord(ss):
+        ss.append({"matcher": "startup|resume|clear|compact", "hooks": [_coord_hook_entry()]})
+
+    ptu = hooks["hooks"].setdefault("PostToolUse", [])
+    if not _has_coord(ptu):
+        ptu.append({"matcher": "Bash", "hooks": [_coord_hook_entry()]})
     return hooks
 
 

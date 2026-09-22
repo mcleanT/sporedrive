@@ -636,6 +636,177 @@ def test_t10b_list_reports_postimage_and_mode(env: Env):
 
 
 # ---------------------------------------------------------------------------
+# T12 — `install --only` scoped installs
+# ---------------------------------------------------------------------------
+
+CMUX_SKILL_DEST = ".codex/skills/cmux-driver/SKILL.md"
+CMUX_SKILL_SRC = "src/codex/skills/cmux-driver/SKILL.md"
+CMUX_X_DEST = ".codex/skills/cmux-driver/references/x.md"
+CMUX_X_SRC = "src/codex/skills/cmux-driver/references/x.md"
+CMUX_DIR_SRC = "src/codex/skills/cmux-driver"
+
+
+def _write_src(env: Env, rel: str, text: str) -> None:
+    _write(env.repo / rel, text)
+
+
+def test_t12a_only_file_in_dir_replaces_only_that_file(env: Env):
+    settings_before = (env.home / ".claude/settings.json").read_text()
+    claude_md_before = env.dest_text(".claude/CLAUDE.md")
+    skill_before = env.dest_text(CMUX_SKILL_DEST)  # sibling in the same dir target
+    assert skill_before != SRC_FILES[CMUX_SKILL_SRC]  # "drifted" relative to source
+
+    r = env.run("install", "--label", "T12a", "--only", CMUX_X_SRC)
+    assert r.returncode == 0, r.stderr
+
+    assert env.dest_text(CMUX_X_DEST) == SRC_FILES[CMUX_X_SRC]
+    # the untouched sibling file in the SAME installed dir is byte-identical
+    assert env.dest_text(CMUX_SKILL_DEST) == skill_before
+    # an entirely unrelated target is untouched
+    assert env.dest_text(".claude/CLAUDE.md") == claude_md_before
+    # settings step was not selected -> settings.json bytes are untouched
+    assert (env.home / ".claude/settings.json").read_text() == settings_before
+
+    manifest = json.loads((env.repo / "installed/manifest.json").read_text())
+    assert manifest["scope"] == [CMUX_X_SRC]
+    assert len(manifest["entries"]) == 1
+    entry = manifest["entries"][0]
+    assert entry["src"] == CMUX_DIR_SRC and entry["kind"] == "dir"
+    assert entry["scoped_files"] == ["references/x.md"]
+
+
+def test_t12b_unknown_only_path_is_preflight_error(env: Env):
+    before = env.dest_state()
+    before_settings = env.settings()
+
+    r = env.run("install", "--label", "T12b", "--only", "nope/not/a/target.md")
+
+    assert r.returncode == 2, r.stdout
+    assert "matches no target" in r.stderr
+    assert env.dest_state() == before
+    assert env.settings() == before_settings
+    assert not env.snap("T12b").exists()
+    assert not (env.repo / "installed").exists()
+
+
+def test_t12c_ambiguous_dir_and_file_in_dir_is_preflight_error(env: Env):
+    r = env.run(
+        "install", "--label", "T12c", "--only", CMUX_DIR_SRC, "--only", CMUX_X_SRC
+    )
+    assert r.returncode == 2, r.stdout
+    assert "ambiguous" in r.stderr
+    assert not env.snap("T12c").exists()
+
+
+def test_t12d_drift_on_unselected_target_does_not_block_scoped_install(env: Env):
+    assert env.run("install", "--label", "T12d-base").returncode == 0
+    _write(env.home / ".claude/CLAUDE.md", "DRIFTED outside wfctl\n", 0o640)
+
+    r = env.run("install", "--label", "T12d", "--only", CMUX_X_SRC)
+    assert r.returncode == 0, r.stderr
+    assert env.dest_text(".claude/CLAUDE.md") == "DRIFTED outside wfctl\n"
+    assert env.dest_text(CMUX_X_DEST) == SRC_FILES[CMUX_X_SRC]
+
+
+def test_t12e_drift_on_selected_file_blocks_then_accept_drift(env: Env):
+    assert env.run("install", "--label", "T12e-base").returncode == 0
+    _write(env.home / CMUX_X_DEST, "USER EDIT x\n")
+
+    r = env.run("install", "--label", "T12e", "--only", CMUX_X_SRC)
+    assert r.returncode == 2, r.stdout
+    assert "diverged from every recorded wfctl postimage" in r.stderr
+    assert env.dest_text(CMUX_X_DEST) == "USER EDIT x\n"
+    assert not env.snap("T12e").exists()
+
+    r = env.run("install", "--label", "T12e", "--only", CMUX_X_SRC, "--accept-drift")
+    assert r.returncode == 0, r.stderr
+    assert env.dest_text(CMUX_X_DEST) == SRC_FILES[CMUX_X_SRC]
+    # the pre-install snapshot keeps the pre-drift-overwrite copy
+    assert (env.snap("T12e") / "files" / CMUX_X_DEST).read_text() == "USER EDIT x\n"
+
+
+def test_t12f_rollback_of_scoped_install_restores_previous_bytes(env: Env):
+    assert env.run("install", "--label", "T12f-base").returncode == 0
+    original = env.dest_text(CMUX_X_DEST)
+    assert original == SRC_FILES[CMUX_X_SRC]
+
+    _write_src(env, CMUX_X_SRC, "SRC: cmux reference x v2\n")
+    r = env.run("install", "--label", "T12f", "--only", CMUX_X_SRC)
+    assert r.returncode == 0, r.stderr
+    assert env.dest_text(CMUX_X_DEST) == "SRC: cmux reference x v2\n"
+
+    r = env.run("rollback", "T12f")
+    assert r.returncode == 0, r.stderr
+    assert env.dest_text(CMUX_X_DEST) == original
+
+
+def test_t12g_manifest_merge_carries_over_untouched_targets(env: Env):
+    assert env.run("install", "--label", "T12g-base").returncode == 0
+    base_manifest = json.loads((env.repo / "installed/manifest.json").read_text())
+    base_claude_entry = next(
+        e for e in base_manifest["entries"] if e["src"] == "src/claude/CLAUDE.md"
+    )
+
+    _write_src(env, CMUX_X_SRC, "SRC: cmux reference x v3\n")
+    r = env.run("install", "--label", "T12g", "--only", CMUX_X_SRC)
+    assert r.returncode == 0, r.stderr
+
+    manifest = json.loads((env.repo / "installed/manifest.json").read_text())
+    assert manifest["scope"] == [CMUX_X_SRC]
+    claude_entry = next(
+        e for e in manifest["entries"] if e["src"] == "src/claude/CLAUDE.md"
+    )
+    assert claude_entry == base_claude_entry  # carried over unchanged
+
+    dir_entry = next(e for e in manifest["entries"] if e["src"] == CMUX_DIR_SRC)
+    assert dir_entry["scoped_files"] == ["references/x.md"]
+    assert dir_entry["dest_sha256"]["references/x.md"] == src_hash(env, CMUX_X_SRC)
+    assert dir_entry["dest_sha256"]["SKILL.md"] == src_hash(env, CMUX_SKILL_SRC)
+
+
+def test_t12h_fail_at_scoped_step_recovers(env: Env):
+    assert env.run("install", "--label", "T12h-base").returncode == 0
+    skill_before = env.dest_text(CMUX_SKILL_DEST)
+    x_before = env.dest_text(CMUX_X_DEST)
+
+    _write_src(env, CMUX_SKILL_SRC, "SRC: cmux driver skill v2\n")
+    _write_src(env, CMUX_X_SRC, "SRC: cmux reference x v2\n")
+
+    r = env.run(
+        "install",
+        "--label",
+        "T12h",
+        "--only",
+        CMUX_SKILL_SRC,
+        "--only",
+        CMUX_X_SRC,
+        extra_env={"WFCTL_FAIL_AT": "step-9.2"},
+    )
+    assert r.returncode == 3, r.stdout
+    assert "install FAILED" in r.stderr
+
+    # step-9.1 (SKILL.md) committed then was rolled back; step-9.2 (x.md) never ran
+    assert env.dest_text(CMUX_SKILL_DEST) == skill_before
+    assert env.dest_text(CMUX_X_DEST) == x_before
+
+    receipt = json.loads((env.repo / "installed/transaction-T12h.json").read_text())
+    by_id = {s["id"]: s for s in receipt["steps"]}
+    assert (
+        by_id["step-9.1"]["status"] == "rolled-back"
+        and by_id["step-9.1"]["recovered"] is True
+    )
+    assert by_id["step-9.2"]["status"] == "not-run"
+    assert receipt["only"] == [CMUX_SKILL_SRC, CMUX_X_SRC]
+
+    leftovers = [
+        p
+        for p in env.home.rglob("*")
+        if p.name.endswith((".wfctl-staging", ".wfctl-tmp", ".wfctl-old"))
+    ]
+    assert leftovers == []
+
+
+# ---------------------------------------------------------------------------
 # T11 — the suite never touches the real home or the real repo
 # ---------------------------------------------------------------------------
 

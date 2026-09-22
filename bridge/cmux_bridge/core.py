@@ -41,6 +41,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .cmuxcli import CmuxCLI, CmuxError, SimulatedFault
+from .model_policy import (
+    DEFAULT_PURPOSE,
+    PURPOSES,
+    check_session_model,
+    footer_model,
+    model_family,
+)
+from .model_policy import argv_model as _argv_model
+from .model_policy import transcript_model as _transcript_model
 from .state import StateError, StateStore
 
 CONTRACT = "codex-claude-workflow 1.2.0"
@@ -70,7 +79,11 @@ WAIT_UNTIL = (
     "task_complete",
     "compaction_complete",
 )
-SUBMIT_KINDS = ("task", "reply")
+SUBMIT_KINDS = (
+    "task",
+    "reply",
+    "steer",
+)  # "steer" = authorized scoped queued-input into a RUNNING turn
 RESENDABLE = ("not_attempted_simulated",)
 
 UUID_RE = re.compile(
@@ -162,7 +175,9 @@ def classify_screen(lines: list[str]) -> dict:
         a = AGENTS_RE.search(l)
         if a:
             agents = int(a.group(1))
-    base = {"ctx_used_pct": ctx, "background_agents": agents}
+    # `model` is the footer display name ("Opus 5", "Fable 5.1"); it is the live model the
+    # session will answer with next and the evidence the purpose/model gate reads (2026-09-20).
+    base = {"ctx_used_pct": ctx, "background_agents": agents, "model": footer_model(tail)}
     if not tail or all(not l.strip() for l in tail):
         return {"state": "unknown", "reason": "empty screen", "claude": False, **base}
     # A modal replaces the input box, so its text must be in the LAST rows. `--lines N` implies
@@ -184,10 +199,18 @@ def classify_screen(lines: list[str]) -> dict:
         }
     above = tail[:prompt_idx] if prompt_idx is not None else tail
     if any(SPINNER_RE.match(l) for l in above[-12:]):
+        # A steer types into the editor WHILE the spinner runs, so the running classification also
+        # reports the input-line text (input_text). It is the ONLY way queued_is_ours can verify a
+        # payload provably ours before pressing Enter to queue it — staged_is_ours needs state
+        # 'staged', which a spinner suppresses. Extra key; no existing caller reads it.
+        running_input = ""
+        if prompt_idx is not None:
+            running_input = (PROMPT_RE.match(tail[prompt_idx]).group(1) or "").strip()
         return {
             "state": "running",
             "reason": "spinner line visible",
             "claude": True,
+            "input_text": running_input,
             **base,
         }
     if prompt_idx is None:
@@ -283,6 +306,49 @@ def staged_is_ours(text: str, screen: dict) -> tuple[bool, dict]:
     want = text.rstrip()
     return (got == want), {
         "rule": "exact_single_line",
+        "trailing_ws_ignored": text != want,
+        "observed_len": len(got),
+        "expected_len": len(want),
+    }
+
+
+def queued_is_ours(text: str, screen: dict) -> tuple[bool, dict]:
+    """Steer (queued-input) staging rule — the running-turn analogue of staged_is_ours.
+
+    While the agent is running, typed input sits in the editor UNDER the spinner and the screen
+    classifies as 'running' (never 'staged'), so staged_is_ours cannot verify it. This accepts a
+    single-line payload that is provably ours in EITHER a running editor (input_text) or an
+    idle/staged editor (staged_text, e.g. the turn ended between staging and this read) — with the
+    SAME exactness staged_is_ours demands: one line, no continuation row, exact match after trailing
+    whitespace is normalized (a terminal pads/trims the right edge unreadably). A multi-line payload
+    is refused — a paste marker's line count is not identity; submit converts it to a single-line
+    task-file reference first. Any other screen state is refused: a steer is never queued into a
+    modal, an unknown surface, or a foreign staged draft.
+    """
+    if "\n" in text:
+        return False, {
+            "rule": "multiline_not_screen_verifiable",
+            "detail": "a paste marker's line count is not payload identity; deliver a task-file reference instead",
+        }
+    state = screen.get("state")
+    if state == "running":
+        got = (screen.get("input_text") or "").rstrip()
+    elif state == "staged":
+        continuation = screen.get("continuation") or []
+        if continuation:
+            return False, {
+                "rule": "ambiguous_continuation_row",
+                "detail": "one or more extra editor rows follow the staged line; not provably ours",
+                "continuation_lines": len(continuation),
+                "continuation_preview": continuation[:3],
+            }
+        got = (screen.get("staged_text") or "").rstrip()
+    else:
+        return False, {"rule": "not_steerable_state", "screen_state": state}
+    want = text.rstrip()
+    return (got == want), {
+        "rule": "exact_single_line_queued",
+        "screen_state": state,
         "trailing_ws_ignored": text != want,
         "observed_len": len(got),
         "expected_len": len(want),
@@ -500,6 +566,47 @@ class Bridge:
         return {
             "workspace_uuid": ws.group(1).upper(),
             "surface_uuid": sf.group(1).upper(),
+        }
+
+    @staticmethod
+    def _proc_argv(pid: int) -> str | None:
+        """`ps -ww -o command= -p <pid>` -> the Claude process's own command line (argv only; the
+        environment is NOT requested, so no token can leak into a binding or a log). It shows what
+        was REQUESTED at launch (`--model opus`), independently of the footer, which shows what the
+        session will use next. Static so tests and the fake can monkeypatch it."""
+        try:
+            out = subprocess.run(
+                ["ps", "-ww", "-o", "command=", "-p", str(int(pid))],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout
+        except Exception:
+            return None
+        return out.strip() or None
+
+    def _model_evidence(
+        self, claude_pid: int, claude_session_id: str, worktree_realpath: str, screen: dict | None
+    ) -> dict:
+        """The three independent model readings for a session (each None when unavailable): the live
+        footer (what answers next), the launch argv (what was requested), the transcript tail (what
+        actually answered). Read-only; no cmux mutation."""
+        argv = self._proc_argv(claude_pid) if self._pid_alive(claude_pid) else None
+        tr = None
+        if claude_session_id and worktree_realpath:
+            tr = _transcript_model(
+                self._transcript(
+                    {
+                        "claude_session_id": claude_session_id,
+                        "worktree_realpath": worktree_realpath,
+                    }
+                )
+            )
+        return {
+            "footer": (screen or {}).get("model"),
+            "argv": _argv_model(argv),
+            "argv_present": argv is not None,
+            "transcript": tr,
         }
 
     @staticmethod
@@ -723,6 +830,7 @@ class Bridge:
                     "cwd": a.get("cwd"),
                     "last_agent_event": a.get("last_event"),
                     "last_agent_seq": a.get("seq"),
+                    "model": self._target_model(s["pid"], a.get("session_id"), a.get("cwd")),
                 }
             )
         for (
@@ -749,6 +857,7 @@ class Bridge:
                     "cwd": a.get("cwd"),
                     "last_agent_event": a.get("last_event"),
                     "last_agent_seq": a.get("seq"),
+                    "model": self._target_model(pid, a.get("session_id"), a.get("cwd")),
                 }
             )
         targets.sort(key=lambda t: -t["seq"])
@@ -767,6 +876,21 @@ class Bridge:
             "targets": targets[:max_targets],
             "targets_truncated": len(targets) > max_targets,
             "note": "targets come from sidebar status events in the retained window; a session with no recent status change may be absent until its next event",
+        }
+
+    def _target_model(self, pid, session_id, cwd) -> dict:
+        """Off-screen model evidence for a discover target (no surface read): the launch argv and
+        the transcript tail. `fable_evidence` marks a planning session that an implementation bind
+        will refuse. The live footer is read at bind, not here."""
+        ev = self._model_evidence(int(pid), session_id, cwd, None)
+        argv_fam, tr_fam = model_family(ev["argv"]), model_family(ev["transcript"])
+        return {
+            "argv": ev["argv"],
+            "argv_present": ev["argv_present"],
+            "argv_family": argv_fam,
+            "transcript": ev["transcript"],
+            "transcript_family": tr_fam,
+            "fable_evidence": "fable" in (argv_fam, tr_fam),
         }
 
     # ------------------------------------------------------------------ leases
@@ -790,9 +914,15 @@ class Bridge:
         controller_id: str,
         role: str = "writer",
         lease_ttl_s: int = DEFAULT_LEASE_S,
+        purpose: str = DEFAULT_PURPOSE,
+        expected_model: str | None = None,
     ) -> dict:
         if role not in ("writer", "monitor"):
             raise BridgeError("bad_request", "role must be writer or monitor")
+        if purpose not in PURPOSES:
+            raise BridgeError(
+                "bad_request", f"purpose must be one of {list(PURPOSES)}", purpose=purpose
+            )
         for name, v in (
             ("workspace_uuid", workspace_uuid),
             ("surface_uuid", surface_uuid),
@@ -963,6 +1093,31 @@ class Bridge:
                 "surface does not show a Claude Code prompt/footer",
                 screen=screen,
             )
+        # 5b. purpose / model gate (owner rule 2026-09-20: Fable is planning-only). A WRITER binding
+        # is the authority to dispatch work into this session, so for purpose=implementation the
+        # session must be on an implementation model NOW (footer) and must not be a Fable planning
+        # session being reused (argv / transcript). An unreadable footer never passes. A monitor
+        # only observes, so its verdict is recorded but not enforced. Window/focus play no part.
+        model_ev = self._model_evidence(claude_pid, claude_session_id, real, screen)
+        model_check = check_session_model(
+            purpose,
+            footer=model_ev["footer"],
+            argv=model_ev["argv"],
+            transcript=model_ev["transcript"],
+            expected=expected_model,
+        )
+        if role == "writer" and not model_check["ok"]:
+            raise BridgeError(
+                model_check["code"],
+                model_check["reason"],
+                purpose=purpose,
+                model=model_ev,
+                instruction=(
+                    "launch a dedicated executor with an explicit --model (scripts/executor_session.py "
+                    "launch) or bind the owner's planning session with purpose=planning; never "
+                    "implement in a Fable session"
+                ),
+            )
         # 6. leases + binding: one transaction, no CLI call inside
         now = self.clock()
         binding_id = f"b-{secrets.token_hex(6)}"
@@ -993,6 +1148,15 @@ class Bridge:
             "released": False,
             "superseded": False,
             "identity_evidence": identity_evidence,
+            "purpose": purpose,
+            "model": {
+                **model_ev,
+                "family": model_check["family"],
+                "expected": expected_model,
+                "verified": bool(model_check["ok"]),
+                "code": model_check["code"],
+                "verified_at": self._now(),
+            },
             "hook_event_workspace": hook_ws,
             "hook_event_workspace_conflict": hook_ws_conflict,
             "hook_event_workspace_reconciled": hook_ws_reconciled,
@@ -1088,6 +1252,9 @@ class Bridge:
                 "claude_pid": claude_pid,
                 "claude_session_id": claude_session_id,
                 "identity_evidence": identity_evidence,
+                "purpose": purpose,
+                "model_family": model_check["family"],
+                "model_verified": bool(model_check["ok"]),
             },
         )
         return b
@@ -1487,7 +1654,8 @@ class Bridge:
                 "identity_lost", "identity check failed; re-bind", identity=v
             )
         screen, _ = self._screen(b, 40, deadline)
-        self._require_writable(screen)
+        self._require_writable(screen, kind)
+        self._require_model_current(b, screen)
         # atomic reservation: re-check the authoritative binding under the state lock, then reserve.
         # No CLI runs inside this lock; reconcile/deliver happen after it is released.
         reserved = None
@@ -1603,16 +1771,52 @@ class Bridge:
                 )
 
     @staticmethod
-    def _require_writable(screen: dict) -> None:
-        if screen["state"] != "prompt_idle":
-            raise BridgeError(
-                "busy",
-                f"surface state is {screen['state']}: {screen['reason']}",
-                screen=screen,
-            )
+    def _require_writable(screen: dict, kind: str = "task") -> None:
+        state = screen["state"]
+        if state == "prompt_idle":
+            return
+        # An authorized scoped steer may queue input into a RUNNING turn (the agent is busy) — that is
+        # the ONLY non-idle state a steer may write into. Every other busy/ambiguous state (modal,
+        # unknown, a foreign staged draft) is still refused, and a non-steer submit still needs an idle
+        # prompt. Identity/lease/pre-Enter gates downstream are unchanged, so authorization is not
+        # relaxed here, only the idle precondition for the one queued-steer case.
+        if kind == "steer" and state == "running":
+            return
+        raise BridgeError(
+            "busy",
+            f"surface state is {state}: {screen['reason']}",
+            screen=screen,
+        )
         # `background_agents` is the footer's "← N agent" hint, reported raw. A brand-new session shows
         # "← 1 agent" (live run 2026-09-08T18:12Z), so it is NOT evidence of owned jobs and never gates
         # a write; job state stays unknown unless the caller's explicit drained checkpoint proves it.
+
+    @staticmethod
+    def _require_model_current(b: dict, screen: dict) -> None:
+        """Re-read the live footer model at submit time and refuse when the session is no longer the
+        one the binding verified: a `/model` switch to Fable is `model_policy`; a switch to any other
+        family is `model_changed` (re-bind to re-verify); an unreadable footer is `model_unverified`.
+        Bindings made before this gate existed carry no `model` record and are held to the purpose
+        default (implementation) on the live footer alone. Nothing is typed; nothing is resent."""
+        purpose = b.get("purpose") or DEFAULT_PURPOSE
+        bound = (b.get("model") or {}).get("footer")
+        live = screen.get("model")
+        # policy first (a switch to Fable is named as such), then drift from the bound model
+        v = check_session_model(purpose, footer=live)
+        if v["ok"] and (not bound or model_family(bound) == model_family(live)):
+            return
+        code, reason = v["code"], v["reason"]
+        if v["ok"]:
+            code = "model_changed"
+            reason = f"the session's model changed from {bound!r} to {live!r} since the bind"
+        raise BridgeError(
+            code,
+            reason,
+            purpose=purpose,
+            bound_model=bound,
+            live_model=screen.get("model"),
+            instruction="re-bind (bridge_bind) to re-verify the session's model and purpose before dispatching",
+        )
 
     def _assert_writer_before_enter(self, b: dict, rec: dict, rel: str) -> None:
         """Atomically re-check the writer lease immediately before an Enter press (item 2). The
@@ -1725,13 +1929,25 @@ class Bridge:
                 detail=e.message,
             )
         self._mark(rec, rel, "delivering", send_result="ok")
+        # A steer queues its payload into a RUNNING turn, where the editor classifies 'running' (the
+        # spinner suppresses 'staged'); an ordinary submit stages into an idle prompt. Pick the
+        # matching verifier off the request's own kind so reconcile stays consistent.
+        is_steer = rec.get("kind") == "steer"
         screen = {}
         for _ in range(5):  # a long paste can take a moment to render
             self.sleep(0.5)
             screen, _ = self._screen(b, 40, deadline)
             if screen["state"] == "staged":
                 break
-        ok, why = staged_is_ours(text, screen)
+            if (
+                is_steer
+                and screen["state"] == "running"
+                and (screen.get("input_text") or "").strip()
+            ):
+                break
+        ok, why = (
+            queued_is_ours(text, screen) if is_steer else staged_is_ours(text, screen)
+        )
         if not ok:
             self._mark(rec, rel, "staged_unverified", staged_check=why, screen=screen)
             raise BridgeError(

@@ -83,6 +83,8 @@ async def bridge_bind(
     controller_id: str,
     role: str = "writer",
     lease_ttl_s: int = 1800,
+    purpose: str = "implementation",
+    expected_model: str | None = None,
 ) -> dict:
     """Bind one Claude Code session by full identity and take a controller lease.
 
@@ -97,6 +99,13 @@ async def bridge_bind(
             for this session/pid with a matching cwd) or monitor (observe/wait only; allowed with
             partial identity evidence).
         lease_ttl_s: Lease lifetime in seconds (60..86400, default 1800).
+        purpose: implementation (default) or planning. Fable is planning-only: a WRITER binding for
+            implementation is refused (model_policy / planning_session / model_unverified) unless
+            the session's live footer shows Opus, Sonnet or Haiku AND neither its launch argv nor
+            its transcript shows Fable. Every submit re-checks the footer (model_changed on a
+            /model switch). A monitor records the verdict without enforcing it.
+        expected_model: Optional model the controller asked for (alias, id or display name); its
+            family must match the footer (model_mismatch otherwise).
     """
     try:
         return await asyncio.to_thread(
@@ -109,6 +118,8 @@ async def bridge_bind(
             controller_id,
             role,
             int(lease_ttl_s),
+            purpose,
+            expected_model,
         )
     except ToolError:
         raise

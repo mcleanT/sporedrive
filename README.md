@@ -142,6 +142,20 @@ example shows plain coordination only; a *managed* task additionally opens an ex
   write, what may be dispatched, when a task is done -- and the durable record around it. The quality
   of the actual code and analysis is still the models' own reasoning; this layer makes that work
   bounded, addressable, and auditable, not smarter.
+- **Direct addressed messaging and per-session status are point-to-point, not a dispatcher.** Beyond
+  the shared store, the direct-integration layer adds (a) short opaque `sd:` handles so a notification
+  resolves only in the addressed task / participant / native-session scope; (b) an owner-authorized
+  scoped `steer` submit that a *running* executor absorbs mid-turn (single-line, screen-verified,
+  `queued_unconfirmed` on any doubt, never auto-resent); and (c) natural per-session status published
+  by the native hooks at SessionStart and at tool boundaries, ordered by a coordinator-persisted
+  per-session sequence (no cross-host-clock ordering, no synthesized idle/completed). None of this is
+  a background dispatcher, daemon, or listener.
+- **Codex desktop idle-wake is not established.** Reaching an idle Codex desktop session has a
+  read-only, zero-model-turn owner-discovery probe over the app's own `~/.codex/ipc/ipc.sock`, a
+  guarded start/steer seam built against a pinned app build, and a peer-usable entry point
+  (`wake-peer` / `coord_wake_peer`) that applies the same pause/expiry/closure gate and carries the
+  `sd:` correlation -- but no delivered wake has been validated, so the capability reports
+  `not_established` and the seam refuses to fire outside a reserved, human-authorized canary.
 
 ## Layout
 
@@ -185,6 +199,13 @@ head -3 $HOME/.claude/CLAUDE.md      # each installed file names its maintained 
 4. `python3 scripts/wfctl.py verify`.
 5. Commit your own fork/copy of this bundle if you're tracking it under version control.
 
+Scoped install: `python3 scripts/wfctl.py install --only <src path> [--only ...]` installs only the
+named targets, or single files inside a `dir` target (e.g.
+`--only src/codex/skills/cmux-driver/references/cmux-runbook.md`), or the literal `settings`. The
+pre-install snapshot is still the full one, so `rollback <label>` stays whole-target; every other
+installed file keeps whatever local drift it has, and `installed/manifest.json` merges the new
+entries over the previous ones (`scope` and `scoped_files` record what was touched).
+
 Rollback: `python3 scripts/wfctl.py list`, then
 `python3 scripts/wfctl.py rollback <label> --dry-run` and, once the plan reads right,
 `python3 scripts/wfctl.py rollback <label>`. Files present in the snapshot are restored byte for
@@ -203,7 +224,14 @@ the snapshot.
 
 `bridge/cmux_bridge/` is a minimal `codex-claude-bridge` MCP server (a small set of bounded tools
 over the cmux CLI); the operator-side contract for using it lives in
-`src/codex/skills/cmux-driver/references/bridge-mcp.md`. Offline simulated test suite:
+`src/codex/skills/cmux-driver/references/bridge-mcp.md`. **Model routing (owner rule, 2026-09-20):
+Fable is planning-only.** `bridge/cmux_bridge/model_policy.py` is the single policy source —
+implementation runs on an explicit Opus (default), Sonnet or Haiku, never on a session that
+inherited the settings default or that is (or was) a Fable planning session. It is enforced at
+`bridge_bind(purpose=…)` and re-checked on every `bridge_submit`, and mirrored verbatim into the
+installed operator script `src/codex/skills/cmux-driver/scripts/executor_session.py`
+(`launch` a dedicated executor with an explicit `--model` and a pre-generated `--session-id`;
+`verify` an existing session's footer/argv/transcript before reuse; runbook §0). Offline simulated test suite:
 `cd bridge && python3 -m pytest tests -q`. A **live** acceptance run (`bridge/run_live.sh`,
 `bridge/live_acceptance.py`) requires a real cmux session, a disposable working directory, network
 access, and the live `codex`/`claude` CLIs -- it is **not** exercised as part of preparing or

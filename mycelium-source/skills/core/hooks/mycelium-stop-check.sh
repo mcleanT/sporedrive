@@ -25,11 +25,19 @@ mycelium_handoff_has_headings() {
 }
 
 # Consume the hook payload. Claude Code and Codex set stop_hook_active=true
-# after a Stop hook asks the model to continue. That flag must not bypass an
-# outstanding Mycelium reminder: the state checks below naturally stop
-# blocking once .living/ has been updated, which is the recursion guard.
+# after a Stop hook asks the model to continue. Host flags are not a retry
+# budget: the shared emitter independently caps unresolved continuations.
 INPUT=$(cat)
 HOST_SESSION_ID=$(printf '%s' "$INPUT" | mycelium_json_get 'session_id')
+MYCELIUM_STOP_BLOCKED=false
+mycelium_stop_cleanup() {
+  local status=$?
+  if [[ "$status" -eq 0 && "$MYCELIUM_STOP_BLOCKED" != true ]]; then
+    python3 "$HERE/../scripts/stop_retry_budget.py" "$STATE_DIR" \
+      "${HOST_SESSION_ID:-legacy}" clear >/dev/null 2>&1 || true
+  fi
+  mycelium_release_stop_lock
+}
 # Per https://code.claude.com/docs/en/hooks#stop-decision-control,
 # hookSpecificOutput.additionalContext on a Stop hook is NOT a one-shot,
 # non-blocking notice: it continues the conversation under the same
@@ -61,7 +69,7 @@ if ! mycelium_acquire_stop_lock "$STATE_DIR"; then
     "STOP BLOCKED — the lifecycle transaction lock remained busy. Active state was preserved; wait for the other lifecycle hook to finish, then retry Stop."
   exit 0
 fi
-trap mycelium_release_stop_lock EXIT
+trap mycelium_stop_cleanup EXIT
 
 # Resolve and validate the active transaction before any Stop-side mutation.
 # The host session ID is per invocation; repository timestamps are shared and
@@ -366,8 +374,7 @@ if [[ "$ACTIVE_MARKER_VALID" == true ]]; then
         if [ "$FOREIGN_EXCLUDED_COUNT" -gt 0 ]; then
           REASON="${REASON} (${FOREIGN_EXCLUDED_COUNT} additional file(s) attributed to other session(s) [${FOREIGN_SESSION_IDS}] — excluded, not this session's responsibility.)"
         fi
-        ESCAPED_REASON=$(printf '%s' "$REASON" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" 2>/dev/null)
-        printf '{"decision": "block", "reason": %s}\n' "$ESCAPED_REASON"
+        mycelium_emit_stop_block "$REASON"
         exit 0
       fi
     fi
@@ -750,5 +757,4 @@ fi
 # Block: work happened but .living/ was never updated
 REASON="STOP BLOCKED — ${FILE_COUNT} files changed (${FILE_NAMES}) but .living/ not updated. Run mycelium session-end protocol: triage to learnings/decisions/conventions/findings, then update last-session.md."
 
-ESCAPED_REASON=$(printf '%s' "$REASON" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" 2>/dev/null)
-printf '{"decision": "block", "reason": %s}\n' "$ESCAPED_REASON"
+mycelium_emit_stop_block "$REASON"

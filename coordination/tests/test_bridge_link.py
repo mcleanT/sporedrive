@@ -59,6 +59,8 @@ class _FakeBridgeError(Exception):
 def _fake(status=None, err=None, spy=None, stage_hook=None):
     class FakeBridge:
         def submit(self, *a, **k):
+            if spy is not None and len(a) >= 3:
+                spy["text"] = a[2]  # the exact line staged + verified by staged_is_ours
             # model the bridge's own staging/waits: an optional hook fires HERE (a pause can land),
             # then the post-staging pre_enter_gate runs immediately before the real Enter/mutation.
             if stage_hook is not None:
@@ -611,3 +613,43 @@ def test_coord_send_managed_gate():
             execution_action_id="a1",
         )
         assert co.get_message("t1", "w2") is not None
+
+
+def test_notification_envelope_is_bounded_and_handle_led():
+    """short-line-contract regression (RED before the bounded-envelope fix): the DELIVERED coord-mail
+    line must stay a short single row so it never soft-wraps into a second editor row. A wrapped row
+    is indistinguishable from a foreign row to the staged verifier and is correctly refused, which is
+    exactly how the first dev smoke failed. The opaque sd:<24hex> handle leads and is the whole
+    correlation payload; the retired long template (task=…/rev=…/<you>/duplicated task id) is gone."""
+    handle = "sd:9f49cce73420ff8408ea727a"  # the real sd:<24hex> shape, 27 chars
+    msg = {"message_id": "m1", "kind": "progress", "task_revision": 1}
+    line = bridge_link._notification_line("dev-handle-roundtrip", msg, handle)
+    assert "\n" not in line
+    assert len(line) <= bridge_link._ENVELOPE_MAX
+    assert line.startswith("Coord mail " + handle)  # handle leads; a trim can never cut it
+    # the wrapping-prone long-template markers must be absent (no task-id duplication, no <you>)
+    for gone in ("task=", "rev=", "<you>", "[progress]", "dev-handle-roundtrip"):
+        assert gone not in line, f"retired long-template marker present: {gone}"
+    # bounded even with the theoretical max-length handle input
+    assert len(bridge_link._notification_line("t", msg, "sd:" + "f" * 24)) <= bridge_link._ENVELOPE_MAX
+    # no-handle fallback stays a bounded single line and still carries the (bounded) message id
+    nofb = bridge_link._notification_line("t", msg, None)
+    assert "\n" not in nofb and len(nofb) <= bridge_link._ENVELOPE_MAX and "msg:m1" in nofb
+
+
+def test_delivered_envelope_text_is_bounded_single_line():
+    """The line actually handed to the bridge (and thus verified by staged_is_ours) is the bounded,
+    handle-led envelope — the fix reaches the delivery path, not just the pure helper."""
+    with tempfile.TemporaryDirectory() as t:
+        co = _mk(t)
+        spy = {"called": False}
+        _fake(status="accepted", spy=spy)
+        bridge_link._read_binding = lambda bid: dict(BINDING_OK)
+        r = bridge_link.notify_via_bridge(
+            co, task_id="t1", message_id="m1", binding_id="b1",
+            controller_id="ctl", expected_revision=0,
+        )
+        assert r["delivered"]
+        sent = spy.get("text")
+        assert sent and "\n" not in sent and len(sent) <= bridge_link._ENVELOPE_MAX
+        assert r.get("handle") and sent.startswith("Coord mail " + r["handle"])

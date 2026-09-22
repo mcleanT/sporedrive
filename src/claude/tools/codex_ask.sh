@@ -449,7 +449,10 @@ fi
 echo "[codex_ask] model=${MODEL} effort=${EFFORT} prompt=${PROMPT_FILE} out=${OUT_FILE}" >&2
 INVOKED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")"
 SECONDS=0
-CODEX_ARGS=(exec --sandbox read-only -m "$MODEL" -c model_reasoning_effort="$EFFORT")
+# Read-only reviewers cannot satisfy write-oriented lifecycle hooks. Disable
+# hook dispatch for this invocation only, including nested review agents.
+# This does not change the user's global Codex configuration or writer tasks.
+CODEX_ARGS=(exec --sandbox read-only --disable hooks -m "$MODEL" -c model_reasoning_effort="$EFFORT")
 [ -n "$LAST_MSG_FILE" ] && CODEX_ARGS+=(-o "$LAST_MSG_FILE")
 CODEX_ARGS+=(-)
 if [ -n "$DEADLINE" ]; then

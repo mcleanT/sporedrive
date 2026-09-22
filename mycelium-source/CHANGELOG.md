@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Bound unresolved Stop-hook continuation prompts to two per session, regardless of host recursion flags or changing failure reasons. Exhaustion retains pending lifecycle evidence and a deferred retry receipt; a successful repair clears the budget. Read-only `codex_ask` launchers must disable hook dispatch (`--disable hooks`) so reviews do not own write-oriented lifecycle bookkeeping. Existing projects need no migration. New Codex tasks pick up the installed hook update.
+
 ## [0.6.0] - 2026-08-02
 
 ### Added

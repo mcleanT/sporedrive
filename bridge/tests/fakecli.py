@@ -42,8 +42,11 @@ BRACKET_END = "\x1b[201~"
 COMPACT_CONTENT = "<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>"
 
 
-def footer(pct: float = 17.0) -> str:
-    return f"  Model: Fable 5.1 | Context: … Ctx Used: {pct:.1f}% | v2.1.263 | Session: 49m | ↻ 1"
+DEFAULT_MODEL = "Opus 5"  # an executor's footer; planning-session tests pass model="Fable 5.1"
+
+
+def footer(pct: float = 17.0, model: str = DEFAULT_MODEL) -> str:
+    return f"  Model: {model} | Context: … Ctx Used: {pct:.1f}% | v2.1.263 | Session: 49m | ↻ 1"
 
 
 def tail_extra(agents: int | None = None) -> list[str]:
@@ -59,6 +62,7 @@ def claude_screen(
     running: bool = False,
     pct: float = 17.0,
     agents: int | None = None,
+    model: str = DEFAULT_MODEL,
 ) -> list[str]:
     """A Claude Code surface: optional spinner above, the ❯ input line, separator, footer."""
     lines: list[str] = []
@@ -69,16 +73,20 @@ def claude_screen(
         SEP + " ultracode ─",
         IDLE_INPUT + staged,
         SEP,
-        footer(pct),
+        footer(pct, model),
     ] + tail_extra(agents)
     return lines
 
 
 def pasted_screen(
-    extra_lines: int, *, pct: float = 17.0, agents: int | None = None
+    extra_lines: int,
+    *,
+    pct: float = 17.0,
+    agents: int | None = None,
+    model: str = DEFAULT_MODEL,
 ) -> list[str]:
     return claude_screen(
-        f"[Pasted text #1 +{extra_lines} lines]", pct=pct, agents=agents
+        f"[Pasted text #1 +{extra_lines} lines]", pct=pct, agents=agents, model=model
     )
 
 
@@ -193,6 +201,9 @@ class FakeCLI(CmuxCLI):
             "Tue Sep  8 11:47:38 2026"  # what tests monkeypatch Bridge._proc_start to
         )
         self._pending_stop: tuple[str, int] | None = None
+        # queued-steer knobs (opt-in; default off preserves every existing test's behaviour)
+        self.keep_running_on_send = False  # a `send` into a busy turn keeps the spinner (running)
+        self.queue_on_enter = False  # Enter QUEUES: no transcript user-message, turn stays running
 
     # ------------------------------------------------------------ scenario construction
     def _now_iso(self) -> str:
@@ -212,6 +223,7 @@ class FakeCLI(CmuxCLI):
         uuid: str | None = None,
         session_id: str | None = None,
         agents: int | None = None,
+        model: str = DEFAULT_MODEL,
     ) -> str:
         u = (uuid or str(_uuid.uuid4())).upper()
         self.surfaces[u] = {
@@ -223,7 +235,8 @@ class FakeCLI(CmuxCLI):
             "pid": int(pid if pid is not None else os.getpid()),
             "pct": pct,
             "agents": agents,
-            "screen": claude_screen(pct=pct, agents=agents),
+            "model": model,
+            "screen": claude_screen(pct=pct, agents=agents, model=model),
             "staged": "",
         }
         self.emit_sidebar(u)
@@ -241,6 +254,7 @@ class FakeCLI(CmuxCLI):
             "pid": None,
             "pct": None,
             "agents": None,
+            "model": None,
             "screen": zsh_screen(),
             "staged": "",
         }
@@ -252,12 +266,20 @@ class FakeCLI(CmuxCLI):
     def set_ctx_pct(self, surface: str, pct: float) -> None:
         s = self.surfaces[surface.upper()]
         s["pct"] = pct
-        s["screen"] = claude_screen(pct=pct, agents=s["agents"])
+        s["screen"] = claude_screen(pct=pct, agents=s["agents"], model=s["model"])
 
     def set_background_agents(self, surface: str, n: int | None) -> None:
         s = self.surfaces[surface.upper()]
         s["agents"] = n
-        s["screen"] = claude_screen(pct=s["pct"], agents=n)
+        s["screen"] = claude_screen(pct=s["pct"], agents=n, model=s["model"])
+
+    def set_model(self, surface: str, model: str) -> None:
+        """Model the footer shows from now on (a `/model` switch inside the session)."""
+        s = self.surfaces[surface.upper()]
+        s["model"] = model
+        s["screen"] = claude_screen(
+            s["staged"], pct=s["pct"] or 17.0, agents=s["agents"], model=model
+        )
 
     # ------------------------------------------------------------ transcript modelling
     def transcript_file(self, surface: str) -> Path | None:
@@ -381,7 +403,7 @@ class FakeCLI(CmuxCLI):
         s = self.surfaces[surface.upper()]
         ev = self.emit_agent(surface, "Stop")
         self.write_turn_end(surface)
-        s["screen"] = claude_screen(pct=s["pct"], agents=s["agents"])
+        s["screen"] = claude_screen(pct=s["pct"], agents=s["agents"], model=s["model"])
         return ev
 
     def bump_boot_id(self) -> None:
@@ -488,13 +510,14 @@ class FakeCLI(CmuxCLI):
             inner = text[len(BRACKET_START) : -len(BRACKET_END)]
             s["staged"] = inner
             shown = inner.count("\n") + (1 if self.mangle_paste else 0)
-            s["screen"] = pasted_screen(shown, pct=s["pct"] or 17.0, agents=s["agents"])
+            s["screen"] = pasted_screen(shown, pct=s["pct"] or 17.0, agents=s["agents"], model=s["model"])
         else:
             s["staged"] = text
             s["screen"] = claude_screen(
                 text.splitlines()[-1] if text else "",
+                running=self.keep_running_on_send,
                 pct=s["pct"] or 17.0,
-                agents=s["agents"],
+                agents=s["agents"], model=s["model"],
             )
         if self.foreign_after_send is not None:
             # a foreign process pastes its own text right after our send, before our verify read
@@ -503,7 +526,7 @@ class FakeCLI(CmuxCLI):
             s["screen"] = claude_screen(
                 foreign.splitlines()[-1] if foreign else "",
                 pct=s["pct"] or 17.0,
-                agents=s["agents"],
+                agents=s["agents"], model=s["model"],
             )
         return "", "", 0
 
@@ -526,7 +549,7 @@ class FakeCLI(CmuxCLI):
             return "", "", 0
         s["staged"] = text
         shown = text.count("\n") + (1 if self.mangle_paste else 0)
-        s["screen"] = pasted_screen(shown, pct=s["pct"] or 17.0, agents=s["agents"])
+        s["screen"] = pasted_screen(shown, pct=s["pct"] or 17.0, agents=s["agents"], model=s["model"])
         return "", "", 0
 
     def _cmd_send_key(self, args):
@@ -550,16 +573,25 @@ class FakeCLI(CmuxCLI):
             )
         if staged.strip() == "/compact":
             self.write_user_message(s["uuid"], COMPACT_CONTENT)
-            s["screen"] = claude_screen(pct=s["pct"] or 17.0, agents=s["agents"])
+            s["screen"] = claude_screen(pct=s["pct"] or 17.0, agents=s["agents"], model=s["model"])
             if self.compact_emits_session_start:
                 self.emit_agent(s["uuid"], "SessionStart")
             if self.compact_emits_boundary:
                 self.clock.advance(self.cmd_tick)
                 self.write_compact_boundary(s["uuid"])
             return "", "", 0
+        if self.queue_on_enter:
+            # a steer QUEUED into a running turn: the input clears and a UserPromptSubmit may fire,
+            # but the message is NOT yet a user turn in the transcript — it is absorbed only when the
+            # running turn yields. The bridge must not claim acceptance from the empty editor or the
+            # event alone; absorption is modelled later by an explicit write_user_message.
+            s["screen"] = claude_screen(
+                running=True, pct=s["pct"] or 17.0, agents=s["agents"], model=s["model"]
+            )
+            return "", "", 0
         self.write_user_message(s["uuid"], staged)
         s["screen"] = claude_screen(
-            running=True, pct=s["pct"] or 17.0, agents=s["agents"]
+            running=True, pct=s["pct"] or 17.0, agents=s["agents"], model=s["model"]
         )
         if self.stop_on_enter:
             self.finish_turn(s["uuid"])

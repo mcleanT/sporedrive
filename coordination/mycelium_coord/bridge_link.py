@@ -39,7 +39,47 @@ BRIDGE_UNCERTAIN = (
     "delivering",
     "lease_lost",
 )
-_SINGLE_LINE_MAX = 160
+# The delivered coord-mail envelope is bounded to a conservative single-line width so it never
+# soft-wraps into a second editor row. A wrapped row is indistinguishable from a foreign row to
+# the staged verifier (staged_is_ours) and is correctly refused, so the fix is to keep the
+# DELIVERED line short at the source, not to reconstruct wraps. Distinct from core's task-file
+# threshold (SINGLE_LINE_MAX), which governs long payloads, not this pointer envelope.
+_ENVELOPE_MAX = 72
+
+# Authorized scoped-steering kinds: a review finding (scoped review) or a checkpoint request MAY be
+# queued into a RUNNING executor turn (contract §2, R3). A new competing task is NOT here — it needs a
+# drained/idle boundary and falls back to an ordinary idle send that a busy surface simply refuses.
+STEER_KINDS = ("review_finding", "checkpoint_request")
+
+
+def probe_transport() -> dict:
+    """Read-only bridge transport reachability probe (capability §1). Reports whether cmux_bridge is
+    importable and whether its own state store resolves on THIS host. It contacts no cmux surface,
+    opens no session, stages nothing and mutates no state — a capability report, never a delivery. A
+    missing bridge is a reported fact, not an error."""
+    Bridge, _ = _import_bridge()
+    importable = Bridge is not None
+    state_readable = False
+    state_dir = None
+    if importable:
+        try:
+            from cmux_bridge.state import StateStore  # type: ignore
+
+            ss = StateStore()
+            state_dir = str(getattr(ss, "root", "") or "") or None
+            # a bounded read of a non-existent binding proves the store path resolves without any
+            # cmux contact (_read_binding uses the same accessor); missing returns None, not raise.
+            ss.read("bindings/__transport_probe__.json")
+            state_readable = True
+        except Exception:
+            state_readable = False
+    return {
+        "probed": True,
+        "bridge_importable": importable,
+        "state_store_readable": state_readable,
+        "state_dir": state_dir,
+        "at": utcnow(),
+    }
 
 
 def _ensure_bridge_path() -> None:
@@ -194,13 +234,21 @@ def _bridge_request_id(task_id: str, message_id: str) -> str:
     )
 
 
-def _notification_line(task_id: str, msg: dict) -> str:
-    line = (
-        f"Coord mail {msg['message_id']} [{msg.get('kind')}] task={task_id} "
-        f"rev={msg.get('task_revision')} to={msg.get('recipient')} — read: "
-        f"mycelium-coord inbox {task_id} <you>"
-    )
-    return line if len(line) <= _SINGLE_LINE_MAX else line[:_SINGLE_LINE_MAX]
+def _notification_line(task_id: str, msg: dict, handle: str | None = None) -> str:
+    # The DELIVERED envelope is a bounded single-line pointer, NOT the message. The opaque
+    # sd:<24hex> handle is the whole correlation payload the recipient steers on; task, kind,
+    # revision and content are resolved from the handle's immutable mapping and the native
+    # boundary inbox, never re-typed into the editor. The previous long template (message id +
+    # [kind] + task=… + rev=… + read-hint + task again + <you>) wrapped past the pane width into a
+    # second editor row, and the single-line staged verifier correctly refused it as an ambiguous
+    # continuation — exactly like a foreign row. Keeping the envelope short fixes that at the
+    # source without weakening the whole-payload / foreign-input safeguards or building a wrap-
+    # reconstruction harness (short-line-contract). The handle leads, so the hard bound below only
+    # ever trims the trailing hint, never the ref the recipient resolves on. With no handle the
+    # (bounded) message id keeps the line verifiable and short.
+    ref = handle or f"msg:{msg['message_id']}"
+    line = f"Coord mail {ref} — mycelium-coord boundary-inbox"
+    return line if len(line) <= _ENVELOPE_MAX else line[:_ENVELOPE_MAX]
 
 
 def notify_via_bridge(
@@ -332,7 +380,31 @@ def notify_via_bridge(
         if not claim.get("ok"):
             return _gate_refuse(claim.get("reason"), claim)
 
-    text = _notification_line(task_id, msg)
+    # Mint (idempotently) the short handle for this exact (task, message, recipient, revision) and
+    # splice it into the delivered line. Minting persists BEFORE staging; a handle failure never
+    # blocks delivery (the line simply carries no handle).
+    handle = None
+    try:
+        hrec = co.mint_handle(
+            task_id,
+            message_id,
+            recip.get("participant_id", ""),
+            int(msg.get("task_revision", 0)),
+            controller_id=controller_id,
+        )
+        handle = hrec.get("handle")
+    except Exception:
+        handle = None
+
+    # Delivery policy (contract §2, R3): an authorized scoped steer (review finding / checkpoint
+    # request) submits with kind="steer", which the bridge may queue into a RUNNING turn AND still
+    # deliver normally into an idle prompt; every other message is an idle task dispatch that a busy
+    # surface refuses (stays pending, never forced). A managed WORK dispatch is never a steer.
+    steer = (not managed_dispatch) and (msg.get("kind") in STEER_KINDS)
+    submit_kind = "steer" if steer else "task"
+    delivery_policy = "authorized_scoped_steering" if steer else "idle_task_dispatch"
+
+    text = _notification_line(task_id, msg, handle)
 
     # The AUTHORITATIVE post-staging gate: the bridge invokes this immediately before its real Enter
     # keystroke, i.e. AFTER its own staging/waits, so a pause/expiry that lands DURING submit's staging
@@ -362,7 +434,7 @@ def notify_via_bridge(
             req_id,
             text,
             int(expected_revision),
-            "task",
+            submit_kind,
             float(accept_timeout_s),
             pre_enter_gate=pre_enter_gate,
         )
@@ -419,12 +491,35 @@ def notify_via_bridge(
                 "status": status,
                 "recipient": recip.get("participant_id"),
                 "delivered_text_sha256": res.get("delivered_text_sha256"),
+                "delivery_policy": delivery_policy,
             },
         )
-        out = {"delivered": True, "state": "delivered", "bridge_result": summary}
+        out = {
+            "delivered": True,
+            "state": "delivered",
+            "delivery_policy": delivery_policy,
+            "handle": handle,
+            "bridge_result": summary,
+        }
     elif status in BRIDGE_UNCERTAIN:
-        out = {"delivered": False, "state": "uncertain", "bridge_result": summary}
+        # A queued steer that the bounded acceptance window did not confirm absorbed is
+        # queued_unconfirmed with the SAME request id — retained, never auto-resent, and a later
+        # reconcile (same request_id) can still confirm it without a second keystroke.
+        state = "queued_unconfirmed" if steer else "uncertain"
+        out = {
+            "delivered": False,
+            "state": state,
+            "delivery_policy": delivery_policy,
+            "handle": handle,
+            "bridge_result": summary,
+        }
     else:
-        out = {"delivered": False, "state": "unknown", "bridge_result": summary}
+        out = {
+            "delivered": False,
+            "state": "unknown",
+            "delivery_policy": delivery_policy,
+            "handle": handle,
+            "bridge_result": summary,
+        }
     _record(out, recip.get("participant_id", ""))
     return {"message_id": message_id, "bridge_request_id": req_id, **out}
