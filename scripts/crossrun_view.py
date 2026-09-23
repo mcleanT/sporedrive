@@ -39,6 +39,16 @@ def load_json(p: Path):
     return obj
 
 
+def _iso_normalise(value) -> str:
+    """'Z' -> '+00:00'; pad/trim a fractional second to 6 digits (python < 3.11 fromisoformat)."""
+    import re
+
+    text = str(value).strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    return re.sub(r"\.(\d+)(?=[+-]\d{2}:?\d{2}$|$)", lambda m: "." + (m.group(1) + "000000")[:6], text)
+
+
 def wall_clock_s(started, finished):
     """Derived wall-clock seconds from ISO start/finish. Returns None (unknown — DISTINCT from 0.0)
     for every ill-defined interval: missing endpoint, unparseable timestamp, mixed naive/aware
@@ -50,8 +60,11 @@ def wall_clock_s(started, finished):
     if not started or not finished:
         return None
     try:
-        a = datetime.fromisoformat(str(started))
-        b = datetime.fromisoformat(str(finished))
+        # python < 3.11 rejects a trailing 'Z' and any fraction that is not 3 or 6 digits;
+        # normalise so an unknown duration is only ever an absent/unparseable timestamp, not
+        # an interpreter difference.
+        a = datetime.fromisoformat(_iso_normalise(started))
+        b = datetime.fromisoformat(_iso_normalise(finished))
         secs = (
             b - a
         ).total_seconds()  # inside the guard: mixed naive/aware raises here

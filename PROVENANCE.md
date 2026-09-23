@@ -77,3 +77,68 @@ installed Mycelium R3 **package** closure (`36d2b54`, export manifest `80aa927f`
 **workflow-instruction** manifest (`ae0d755`) on the developer's hosts -- those are separate installed
 artifacts. This bundle is the reproducible source/build input: a downstream adopter rebuilds the native
 Mycelium candidate from `mycelium-source/` + `coordination/` via `scripts/export_coordination.py`.
+
+### Request reduction v1 (2026-09-15)
+
+Canonical HEAD `b0dc9b9` (this repository, clean) exported as candidate build
+`coord.request-reduction.20260915` (Claude manifest `0.6.0+coord.request-reduction.20260915`, Codex
+`0.6.0+codex.20260802225518.coord.request-reduction.20260915`) from the preserved dirty source
+checkout `/Users/mst36/tools/mycelium-lifecycle-wfi` @ `12862e5` plus the tracked `core-overlay/`
+(three core hooks and `housekeeping_ledger.py`; `EXPORT_MANIFEST.json` `overlay_from_canonical`
+records each overlay sha256 and the source sha256 it replaced). Previous accepted build:
+`coord.efficiency-v2.20260911` from `78b17c0`. The earlier scheduler canary discrepancy (immediate-route
+rrule hours) is a separately recorded historical limitation and is unchanged by this release.
+Repairs R1-R5 of the scoped review landed at `5c2058e` and were exported as build
+`coord.request-reduction.20260915.r2` (same source checkout and overlay; the candidate closure records
+canonical `5c2058e`). Native identity and fresh-session smokes passed against r2 on both hosts.
+The R5 verification (supervisor message `request-reduction-r5-verification-1`) found the generated
+`functions.exec` example invented a `timeout_ms` argument; the real Codex outer allowance is the
+first-line `// @exec: {"yield_time_ms": 60000}` pragma of a code-mode script around the direct MCP
+call (`host_yield_s=60`), and Codex `exec_command`'s 30000 ms initial yield cap cannot hold a 50 s
+synchronous CLI wait (that CLI form is Claude Code's Bash `timeout: 60000`). `waitpath.py`, the
+`wait-plan --preferred` output, the SOPs and the R5 regression (which now parses and exercises the
+generated pragma) were corrected under the same open repair reservation and exported as build
+`coord.request-reduction.20260915.r3` (offline verification only; no new model or native smoke calls,
+so the r2 native evidence stands as MCP-only probe evidence and proves no core-hook trust step).
+The exact-contract verification (`request-reduction-r5-exact-contract-1`, reproducer
+`r5-module-probe.json`: `SyntaxError: Illegal return statement`) found the r3 script still wrong:
+`functions.exec` evaluates an async JS MODULE whose MCP tools live on `tools`
+(`tools.mcp__mycelium_coord__coord_wait` / `job_join`) and whose result is emitted by `text(...)`, and
+Claude's Bash tool takes `{command, timeout}`. `waitpath.exec_script` now generates that exact
+three-line source, the regression parses it with `node --input-type=module --check` and executes it as
+a module against a stub exposing only those two tools and `text` (one call with the declared
+arguments, one emitted result; the reproducer's shape is confirmed rejected), SOPs carry the exact
+template, and build `coord.request-reduction.20260915.r4` was exported (offline only, no model calls).
+
+## Owner-directed follow-up (owner-followup v1, 2026-09-15)
+
+Incident: Codex task "Create and assemble figure" on Mycelium task `sckg-figure-20260915` (execution
+`sckg-figure-run-1`, completed/closure v16 at 06:08Z) could not act on the owner's later revision list
+("unlock this and proceed", "just start a new session and remake it with these changes"): both
+`change_limits` calls recorded genuine authority but `unpause` answered `not_paused`, new work was
+`execution_completed`, `open_execution` on the task was `execution_identity_conflict`, and the startup
+context forbade a successor task. Fix (this release): ONE atomic `ExecutionManager.owner_request`
+(`exec-owner-request` / `execution_owner_request`) opens the next run of the SAME execution from
+completed/closed/paused/draining-free/exhausted/expired states on an explicit owner work instruction —
+prior run archived immutably under `runs` (status, closure, receipt, acceptance evidence, freeze,
+blockers, pause, shutdown, usage/limits at end), fresh acceptance state for the new scope, cumulative
+usage never reset, only the owner's bounded `add_limits` applied (recorded in `limit_changes`), a new
+`expires_at` required when expired, idempotent by `request_id` (conflicting replay refused), refused
+while owned jobs run / a run is draining / an automation shutdown is unreconciled. A prior run's
+completion ref is `stale_completion_receipt` for the new run; the archived shutdown cannot stop it.
+`_summary`/`execution_view` carry `run`, `run_id`, `runs_archived`, `completion_ref`,
+`last_owner_request` (legacy records read as run 1). The SessionStart context now separates "STOP
+(autonomous work): run N … is completed" from what the conversation may still do and names the
+owner-request path; `unpause`/`_guard_new_work` refusals name it too. Regression
+`coordination/tests/test_owner_followup.py` (core, CLI and MCP entry points) plus the offline
+reproduction on a COPY of the real record (`executor/offline-repro-real-record.*` under the brief).
+Scoped review repairs (REVIEW.md R1-R3): reservations carry their `run` and a stale-run reservation
+never dispatches (`reservation_stale_run`); renewal is refused under the lock while any reservation is
+open (`owner_request_open_reservations`, nothing forgiven); evidence that satisfied any criterion on an
+archived run is `stale_evidence_replay`; a completion shutdown intent needs a completed run
+(`shutdown_not_applicable`); refreshed callers pass `run` (`--run`) to record-evidence /
+record-completion / request-shutdown (`run_mismatch` for an archived run); the owner-request ledger is
+reconciled before the version guard (exact retry with the original expected version is idempotent) and
+the fingerprint binds normalized description/kind/evidence_requirements; a checkpoint published before
+the current run opened is `predates_run` in `resume` (next action dropped, current scope/request
+surfaced) and the SessionStart context says so. Exported as build `coord.owner-followup.20260915.r2`.

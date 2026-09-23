@@ -713,3 +713,22 @@ def test_cli_and_mcp_make_identical_state():
         assert rec_cli["status"] == STATUS_ACTIVE
         assert rec_cli["usage"]["work_dispatches"] == 1
         assert rec_cli["backlog"][0]["actionable"] is False
+
+
+# --------------------------------------------------------------------------- expiry parsing (efficiency v2)
+def test_z_suffixed_expiry_is_parsed_on_every_supported_python():
+    """A 'Z' expiry written by one host (python 3.11+) must not fail closed as 'expired' when the
+    owned CLI runs on a python 3.9 host: the smoke of the local-job gate refused a live execution
+    with execution_expired for exactly this reason."""
+    from datetime import datetime, timedelta, timezone
+    from mycelium_coord.execution import _parse_ts
+
+    assert _parse_ts("2026-09-11T05:18:06Z") == datetime(2026, 9, 11, 5, 18, 6, tzinfo=timezone.utc)
+    assert _parse_ts("2026-09-11T05:18:06+00:00") == _parse_ts("2026-09-11T05:18:06Z")
+    assert _parse_ts("2026-09-11T05:18:06.5Z").microsecond == 500000
+    assert _parse_ts("2026-09-11T05:18:06.123+00:00").microsecond == 123000
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    past = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert ExecutionManager._expired({"limits": {"expires_at": future}}) is False
+    assert ExecutionManager._expired({"limits": {"expires_at": past}}) is True
+    assert ExecutionManager._expired({"limits": {"expires_at": "not-a-time"}}) is True  # still fails closed

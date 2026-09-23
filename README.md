@@ -68,6 +68,114 @@ supervise another with real, auditable limits** rather than two chat windows and
   `coordination/` and `bridge/` into one owned, self-verifying native Mycelium plugin candidate. Both
   are covered in detail under [Native install & setup](#native-install--setup-portable).
 
+## Efficient supervision
+
+The default is fewer model requests and less carried context: wait for meaningful events, restore
+one small working-state packet, fetch only decisive evidence, stop at the required outcome, and use
+low reasoning effort for routine operations where the host supports it. Detailed procedures are
+loaded on demand. Existing reviews and scientific checks retain their explicit quality requirements.
+
+The Mycelium CLI/MCP now defaults to compact `resume`, `inbox` and `wait` views. `resume` combines
+current execution/stop state, checkpoint identity, participant and pending message summaries; it
+replaces separate status/checkpoint/inbox reads. Fetch a selected full brief with
+`mycelium-coord read-message TASK PARTICIPANT MESSAGE_ID` or `coord_read_message`. Use `--full`
+(`compact=false` in MCP) when complete records are required. These views do not acknowledge messages,
+change message hashes, advance cursors or prove delivery. Existing Python callers retain full views
+unless they opt into `compact=True`.
+
+Waits return immediately on pause, draining, exhaustion, closure, completion or expiry with
+`stop_waiting=true`. An ordinary timeout is marked `unchanged=true`; it is not a reason for repeated
+model-driven status narration. Startup context gives current execution state precedence over stale
+checkpoint work. Waiting inside a tool is still a finite local poll, not a native wake-up or a hard
+limit on desktop reasoning. Respect the host's timeout limits; no new background scheduler is added.
+
+`codex_ask` keeps only three commit subjects in its automatic context and omits historical session
+narrative unless `CODEX_ASK_INCLUDE_LASTSESSION=1` is explicitly set. Full logs remain on disk. These
+changes reduce supplied context and unnecessary reads; they do not automatically shrink an already
+running conversation, change its model effort, or establish a measured percentage saving.
+
+**Efficiency v2 (scheduling, owned local jobs, compact evidence).** The coordination package now ships
+three small owned helpers, exposed as CLI subcommands and read-only MCP tools: `sched-plan` /
+`sched-verify` (a deterministic Eastern-time planner that emits the intended UTC instant plus one-shot
+submission data, and a read-only verifier that compares the *persisted* `next_run_at`/status with the
+intent — `match`, `mismatch` or `cannot_evaluate`; it never writes the scheduler's store), `job-run` /
+`job-join` / `job-status` / `job-list` / `job-output` / `job-cancel` (local work launched by the CLI from
+the host-authorized shell under one managed reservation, with an immutable request record, complete
+output on disk, and an in-tool join of at most 50 s that stops on the task deadline or a paused/closed
+execution — no MCP launch route), and a combined 4 KB batch budget for owned outputs with truthful
+`truncated` flags and offset/cursor retrieval of the full evidence. See `coordination/skill/SKILL.md`.
+
+**Request reduction v1 (explicit routine routing, one wait path, accounted housekeeping).** Six
+runtime fixes, all deterministic and none changing a global model default:
+
+- **Routine workers.** `worker-run` / `worker-result` (CLI only, managed like `job-run`) launch ONE
+  bounded codex worker with an explicitly selected profile — `routine` = `gpt-5.6-luna` at `low` — from
+  a compact fresh prompt file (<= 16 KiB, never a transcript), with delegation and hook-driven
+  housekeeping disabled and `MYCELIUM_ROUTINE_WORKER` / `MYCELIUM_NO_DELEGATE` /
+  `MYCELIUM_NO_HOUSEKEEPING` set. The request record stores the requested model/effort; `result.json`
+  stores the model actually reported by the banner (or `null`, never fabricated), output sha256 and a
+  deterministic validation. A failed or invalid result writes ONE `escalation.json` and is never
+  re-run with another model. Waiting, hashing, timestamps, retries and test execution use no model.
+  The owner's primary Astra model/effort and Claude ownership are untouched.
+- **One wait path.** `mycelium_coord/waitpath.py` is the single wait-budget adapter. The
+  preferred pattern is the one that already worked: a 50 s inner wait under an explicit 60 s outer
+  allowance — on Codex, a `functions.exec` async JS MODULE of exactly three lines:
+  `// @exec: {"yield_time_ms":60000}` / `const receipt = await tools.mcp__mycelium_coord__coord_wait({task_id:"TASK",participant_id:"PARTICIPANT",after_seq:0,timeout_s:50,host_yield_s:60});` / `text(receipt.structuredContent ?? receipt);`
+  (the `job_join` variant is `tools.mcp__mycelium_coord__job_join({job_id:"JOB",timeout_s:50,host_yield_s:60})`;
+  no top-level `return`, no `mycelium_coord` global, no `timeout_ms` argument; Codex `exec_command`'s
+  initial `yield_time_ms` cap of 30000 cannot hold a 50 s synchronous CLI wait); on Claude Code, the
+  Bash tool `{command: "mycelium-coord wait … --timeout 50", timeout: 60000}` — one model request
+  per 50 s of waiting. `wait-plan --preferred` / `wait_plan(preferred=true)`
+  prints that exact reusable call shape. Without a declared yield the MCP route falls back to a
+  truthful 25 s cap (two requests per 50 s: not a saving, only early-yield-safe). Every result
+  carries `wait_path` including `model_requests_per_50s`. No stored message wakes an idle host;
+  there is no recurring model monitor.
+- **Housekeeping attempt accounting.** The core health hook (shipped from the version-controlled
+  `core-overlay/`, exported by `scripts/export_coordination.py --overlay`) no longer dispatches the
+  knowledge audit / transfer worker from a stale success timestamp alone: a durable, atomic ledger
+  (`housekeeping_ledger.py`; in-flight / completed / failed / exhausted, attempt ids, bounded retries,
+  cooldown, one exhaustion notice) deduplicates startup/resume/compact re-runs and records failures.
+  Success timestamps are preserved; candidate extraction never promotes scientific knowledge by itself.
+- **Lifecycle lock contention.** A busy Stop lock emits exactly ONE actionable block (with the evidence
+  sentinel path) per unresolved condition; a repeat Stop under the same live owner is silent so the
+  host stops and the next SessionStart/Stop reconciles once the lock is free. Dead owners are
+  reclaimed, live owners are never force-unlocked, lineage is never discarded, failed finalization is
+  never marked successful.
+- **Combined receipts and the terminal rule.** `exec-receipt TASK [--after-version N]`
+  (`execution_receipt`) is the one bounded read between steps: status/usage/coverage, acceptance
+  pointers (path + sha256), latest settled checks, completion pointer, `stop`/`terminal`, and a
+  `state_version` cursor; an unchanged version returns `changed=false, suppressed=true` so unchanged
+  telemetry never re-enters a model turn. `exec-evidence` pages a recorded artifact with truthful
+  `truncated`/`next_offset`. Complete the required work, deliver the receipt, then stop — no follow-on
+  cleanup, audit, compaction or monitor. **Boundary:** these caps bound only this package's outputs;
+  they do not cap arbitrary host tools or the total model context.
+- **Owner-directed follow-up (owner-followup v1).** A completion receipt is historical evidence, never
+  a permanent prohibition on the task. A STOP on a completed / closed / paused / expired / exhausted
+  run means *that run cannot autonomously continue*, not that the conversation can do nothing:
+  read-only discussion and diagnosis stay possible, and a GENUINE NEW OWNER WORK INSTRUCTION in the
+  same task is sufficient authority for ONE atomic call — `exec-owner-request TASK --request-id ID
+  --authorization <owner instruction ref> --scope <new scope/acceptance ref> [--manifest JSON]
+  [--add-limits JSON] [--expires-at ISO]` (`execution_owner_request`) — which opens the next run of
+  the SAME execution (no new Codex or Mycelium task), archives the prior run with its receipt,
+  acceptance evidence, usage and limits immutably under `runs`, gives the new scope its own
+  acceptance state (old accepted criteria cannot satisfy it), adds only the bounded allowance the
+  owner gave (cumulative usage is never reset), requires a new `expires_at` when expired, is
+  idempotent by `--request-id` (a conflicting replay is refused), refuses while identified live work
+  or an automation's unreconciled shutdown could conflict, and lets an old receipt or shutdown
+  neither complete nor stop the new run. Questions, reviews, peer summaries, stale checkpoints or an
+  agent-authored reference never restart work; automatic completion, expiry, pause, bounded review
+  and no-self-renewal for background work are unchanged. Legacy records read as run 1.
+- **Owner-authorized recovery.** Owner approval recorded through `exec-change-limits` /
+  `exec-unpause` (`execution_change_limits` / `execution_unpause`, each requiring `--authorization`,
+  optional `--scope-amendment`) is sufficient for a paused/exhausted/expired run that continues in
+  place (`unpause` on a completed/closed run answers `not_paused` and names `exec-owner-request`): a fresh `exec-status` / `execution_read` / `resume`
+  showing `authorization.last_recovery` supersedes any older STOP snapshot and no second confirmation
+  is requested. The path never resets past usage, never rewrites frozen acceptance or accepted
+  evidence, and records an append-only `scope_amendments` entry. `unpause` is refused on an expired
+  execution (`execution_expired`; extend `expires_at` first) and reports `exhausted`, not `active`, when
+  the allowance is already spent. An agent never grants itself this authority; unauthorized or expired
+  work stays STOP.
+
 ## Bounded execution
 
 A supervised workflow is only meaningful if "supervised" is something the code enforces. A managed

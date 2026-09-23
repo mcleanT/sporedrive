@@ -129,6 +129,70 @@ context on every tool call:
   busy refusal stays pending until the executor's next turn. This is the same acceptance evidence as
   `references/bridge-mcp.md`; delivery/acknowledged/completed stay distinct.
 
+## Owned jobs, schedule verification and output budgets (efficiency v2)
+
+- The executor starts local work with the coordination CLI `job-run`, always with `--task --action-id
+  --dispatch-identity` naming the current brief's open work reservation and its binding (re-checked
+  at launch); a job started without them is unmanaged and no task limit, deadline or pause applies.
+  Read progress with the read-only MCP tools `job_status` / `job_list` / `job_output` or one
+  `job_join` (≤50 s in-tool wait; `stop_waiting` on task deadline, pause or closure). One join per
+  permitted interval; no clock or sleep loops around it; no join for synchronous reads. There is no
+  MCP launch route by design.
+- Scheduler canary: plan with `sched_plan` (Eastern by default; output carries `intended_utc` and
+  two one-shot UTC submission forms: `scheduler.immediate.rrule`, DTSTART-free with explicit
+  date/time/COUNT for the app's ordinary immediate create, which rejects DTSTART and schedules to
+  the minute; and `scheduler.anchored.rrule` with DTSTART for `mode=suggested_create` only), create
+  the automation with the official `automation_update` tool (`destination=thread` or a
+  `targetThreadId`), then `sched_verify` the persisted row (`~/.codex/sqlite/codex-dev.db`, `next_run_at` in epoch ms,
+  read-only) or the tool's returned record. Only `match` is success; `cannot_evaluate` (no
+  `next_run_at`, e.g. a PAUSED row) is not a verdict; `mismatch` on an ACTIVE row means pause/delete
+  through `automation_update` before anything else.
+- Owned job/list/status/verify outputs fit a combined 4 KB batch budget with truthful `truncated`
+  flags and cursors/offsets; full stdout/stderr stay on disk under the coordination state root.
+  Host-native `functions.exec` output is not capped by this package.
+
+## Owner-authorized recovery, routine workers, one wait path (request reduction v1)
+
+- A COMPLETED or CLOSED run is not a dead task: its STOP covers autonomous continuation of that run
+  only. On a genuine new owner work instruction in the same task, run ONE
+  `exec-owner-request TASK --request-id <id> --authorization <owner instruction ref> --scope <new
+  scope/acceptance ref> [--manifest JSON] [--add-limits '{"work_dispatches": N, ...}'] [--expires-at ISO]`
+  (MCP `execution_owner_request`): it opens the next run of the same execution (never a new Codex or
+  Mycelium task), archives the prior run/receipt/evidence immutably under `runs`, keeps cumulative
+  usage, gives the new scope its own acceptance state, and refuses live owned work, unreconciled
+  automation shutdowns and conflicting replays (an identical replay is idempotent). Old receipts and
+  shutdowns cannot complete or stop the new run. Questions/reviews alone never restart work; an
+  agent-authored reference never creates authority. Then ONE fresh `exec-status`/`resume` is the truth.
+- A paused / exhausted / expired execution that continues IN PLACE is reopened through the
+  owner-linked path, in this order: `exec-change-limits TASK --authorization <owner instruction ref> --scope-amendment "…"
+  --changes '{"expires_at": "...", "work_dispatches": N, ...}'` (when expired or the allowance is
+  spent), then `exec-unpause TASK --authorization <same ref>`. Both record an append-only
+  `scope_amendments` entry and never reset usage or frozen acceptance. `unpause` refuses an expired
+  execution (`execution_expired`) and reports `exhausted`, not `active`, when the allowance is spent.
+- After the change, ONE fresh `exec-status` / `resume` is the current truth: it shows
+  `execution.authorization.last_recovery` and supersedes any earlier STOP snapshot or startup notice.
+  Do not ask the owner to confirm again and do not compose authority from summaries. The supervisor
+  writes only the amendment brief; historical frozen criteria are not reinterpreted.
+- Routine work (bounded extraction, summarization, formatting, candidate preparation) goes to
+  `worker-run WORKER_ID --prompt FILE --task T --action-id RES --dispatch-identity ID --join 50`
+  (profile `routine` = `gpt-5.6-luna` at `low`, compact fresh context, no delegation/housekeeping)
+  followed by `worker-result WORKER_ID` (deterministic validation; one `escalation.json` on failure,
+  never an automatic Astra retry). Deterministic waits, hashes, timestamps and test execution use no
+  model. Global model defaults are never changed by this path.
+- Waits (preferred, one model request per 50 s): a `functions.exec` async JS MODULE, exactly:
+  `// @exec: {"yield_time_ms":60000}` / `const receipt = await tools.mcp__mycelium_coord__coord_wait({task_id:"TASK",participant_id:"PARTICIPANT",after_seq:0,timeout_s:50,host_yield_s:60});` / `text(receipt.structuredContent ?? receipt);`
+  (job variant `tools.mcp__mycelium_coord__job_join({job_id:"JOB",timeout_s:50,host_yield_s:60})`).
+  No top-level `return`, no `mycelium_coord` global, no `timeout_ms` argument; `exec_command`'s
+  initial `yield_time_ms` maximum of 30000 cannot hold a synchronous 50 s
+  `mycelium-coord wait … --timeout 50` in one call — that CLI form is Claude Code's Bash
+  `{command: …, timeout: 60000}`. `wait-plan --route cli --preferred --task T --participant P` prints the exact
+  reusable call once — no planning call per interval. Without a declared yield the MCP route falls
+  back to a 25 s cap, which costs two requests per 50 s (same as the broken 50 s wait plus its
+  follow-up) and is never reported as a saving. Results carry `wait_path`. A stored message never
+  wakes an idle host.
+- Between steps read ONE `exec-receipt TASK --after-version N`; `suppressed=true` means nothing
+  changed and no model turn is needed. When it reports `terminal`, deliver the receipt and stop.
+
 ## Authority and safe fallback
 
 The sole-executor rule and every ratified gate stand unchanged; Mycelium is talk + state. If the

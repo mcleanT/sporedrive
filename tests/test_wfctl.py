@@ -47,6 +47,7 @@ TMP_ROOTS: list[Path] = []
 SRC_FILES = {
     "src/claude/CLAUDE.md": "SRC: claude md v2\n",
     "src/claude/skills/codex-review/SKILL.md": "SRC: codex-review skill\n",
+    "src/claude/skills/codex-review/references/global-conventions.md": "SRC: optional conventions\n",
     "src/claude/tools/codex_ask.sh": "#!/bin/sh\necho 'SRC codex_ask'\n",
     "src/claude/tools/codex_launch.py": "#!/usr/bin/env python3\n# SRC codex_launch stub\n",
     "src/claude/tools/sporedrive_review_guard.py": (
@@ -109,6 +110,10 @@ SETTINGS_DOC = {
 FILE_TARGETS = [
     (".claude/CLAUDE.md", "src/claude/CLAUDE.md"),
     (".claude/skills/codex-review/SKILL.md", "src/claude/skills/codex-review/SKILL.md"),
+    (
+        ".claude/skills/codex-review/references/global-conventions.md",
+        "src/claude/skills/codex-review/references/global-conventions.md",
+    ),
     (".claude/tools/codex_ask.sh", "src/claude/tools/codex_ask.sh"),
     (".claude/tools/codex_launch.py", "src/claude/tools/codex_launch.py"),
     (
@@ -391,6 +396,7 @@ def test_t4_rollback_restores_only_owned(env: Env):
     assert "evidence-only (not restored)" in r.stdout
 
     assert env.dest_state() == {rel: text for rel, text in DEST_ORIG.items()}
+    assert not (env.home / ".claude/skills/codex-review/references/global-conventions.md").exists()
     out = env.settings()
     assert "offer-k-dense-web" not in out["skillOverrides"]  # absent, not null
     assert out["skillOverrides"]["other"] == "on"
@@ -404,8 +410,8 @@ def test_t4_rollback_restores_only_owned(env: Env):
     rec = json.loads(receipts[0].read_text())
     assert rec["force"] is False
     assert (
-        len(rec["restored"]) == 9
-    )  # 5 original targets + codex_launch.py + review guard + prompt-optimizer + run-pipeline-local dirs
+        len(rec["restored"]) == 10
+    )  # 5 original targets + codex_launch.py + review guard + prompt-optimizer + run-pipeline-local dirs + optional conventions
     assert any("cost-tracker.sh" in p for p in rec["skipped_evidence_only"])
     assert rec["settings_leaves"][0]["action"] == "delete"
 

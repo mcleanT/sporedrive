@@ -12,8 +12,12 @@ import sys
 
 from .coord import Coordinator
 from .execution import ExecutionManager
+from . import schedule, waitpath
+from .jobs import DEFAULT_DEADLINE_S, DEFAULT_TAIL_BYTES, JOIN_MAX_S, ON_STOP_POLICIES, JobManager
 from .model import ProtocolError
 from .store import CoordStore, StoreError
+from .views import BATCH_BUDGET_BYTES
+from .workers import DEFAULT_DEADLINE_S as WORKER_DEADLINE_S, EXPECT_KINDS, PROFILES, WorkerManager
 
 
 def _emit(obj) -> None:
@@ -50,6 +54,19 @@ def _load_json_arg(value: str | None):
     if value == "-":
         return json.load(sys.stdin)
     return json.loads(value)
+
+
+def _load_json_source(value: str | None):
+    """'-' = stdin, a JSON literal, or a file path holding JSON (a persisted automation record)."""
+    if value is None:
+        return None
+    if value == "-":
+        return json.load(sys.stdin)
+    vs = value.strip()
+    if vs[:1] in ("{", "["):
+        return json.loads(vs)
+    with open(value) as f:
+        return json.load(f)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -148,15 +165,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("task_id")
     p.add_argument("participant_id")
     p.add_argument("--after", type=int, default=0)
-    p.add_argument("--limit", type=int, default=100)
+    p.add_argument("--limit", type=int, default=10)
+    p.add_argument("--full", action="store_true", help="include full message bodies")
     p.add_argument("--kind", action="append", default=None, dest="kinds")
 
     p = sub.add_parser("wait")
     p.add_argument("task_id")
     p.add_argument("participant_id")
     p.add_argument("--after", type=int, default=0)
-    p.add_argument("--timeout", type=float, default=30.0)
+    p.add_argument("--timeout", type=float, default=30.0,
+                   help="in-tool wait (CLI route); give the shell call an outer allowance of timeout+10 s (60 s for 50)")
     p.add_argument("--kind", action="append", default=None, dest="kinds")
+    p.add_argument("--limit", type=int, default=10)
+    p.add_argument("--full", action="store_true", help="include full message bodies")
+
+    p = sub.add_parser("read-message", help="read one full addressed message, without acknowledging")
+    p.add_argument("task_id")
+    p.add_argument("participant_id")
+    p.add_argument("message_id")
 
     p = sub.add_parser("ack")
     p.add_argument("task_id")
@@ -188,7 +214,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("resume")
     p.add_argument("task_id")
     p.add_argument("participant_id")
-    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--limit", type=int, default=10)
+    p.add_argument("--full", action="store_true", help="include full checkpoint and message bodies")
+    p.add_argument("--after-checkpoint", type=int, default=None)
 
     p = sub.add_parser("select-session")
     p.add_argument("task_id")
@@ -246,6 +274,21 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("exec-status")
     p.add_argument("task_id")
 
+    p = sub.add_parser("exec-receipt", help="one combined bounded receipt: status/usage/coverage, acceptance pointers, latest checks, cursor; unchanged since --after-version is suppressed")
+    p.add_argument("task_id")
+    p.add_argument("--after-version", type=int, default=None, dest="after_version")
+    p.add_argument("--checks", type=int, default=8, dest="checks_limit")
+    p.add_argument("--budget", type=int, default=BATCH_BUDGET_BYTES)
+    p = sub.add_parser("exec-evidence", help="bounded offset/limit read of one artifact recorded in the execution record")
+    p.add_argument("task_id")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--criterion", default=None, dest="criterion_id")
+    g.add_argument("--action-id", default=None, dest="action_id")
+    g.add_argument("--completion", action="store_true")
+    p.add_argument("--offset", type=int, default=0)
+    p.add_argument("--limit", type=int, default=BATCH_BUDGET_BYTES)
+    p.add_argument("--tail", action="store_true", help="read the last --limit bytes")
+    p.add_argument("--budget", type=int, default=BATCH_BUDGET_BYTES, help="max bytes of the whole response (0 = only --limit applies)")
     p = sub.add_parser("exec-reserve")
     p.add_argument("task_id")
     p.add_argument("--action-id", required=True, dest="action_id")
@@ -277,6 +320,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("exec-record-evidence")
     p.add_argument("task_id")
+    p.add_argument("--run", type=int, default=None, help="the run this write is for (refused if not the current run)")
     p.add_argument("--criterion", required=True, dest="criterion_id")
     p.add_argument("--evidence", required=True, dest="evidence_ref")
     p.add_argument("--attestation", default=None)
@@ -340,16 +384,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--expected-version", type=int, default=None, dest="expected_state_version"
     )
 
-    p = sub.add_parser("exec-unpause")
+    p = sub.add_parser("exec-unpause", help="owner-authorized unpause; the recorded --authorization is sufficient approval (refused when expired)")
     p.add_argument("task_id")
     p.add_argument("--authorization", required=True, dest="authorization_ref")
+    p.add_argument("--scope-amendment", default=None, dest="scope_amendment", help="short owner scope amendment, recorded append-only")
     p.add_argument(
         "--expected-version", type=int, default=None, dest="expected_state_version"
     )
 
-    p = sub.add_parser("exec-change-limits")
+    p = sub.add_parser("exec-owner-request", help="owner-directed follow-up: open the NEXT RUN of this same execution from completed/closed/paused/expired/exhausted (or active) on an explicit owner work instruction; prior run archived immutably, usage never reset, idempotent by --request-id")
+    p.add_argument("task_id")
+    p.add_argument("--request-id", required=True, dest="request_id", help="idempotent owner-request id")
+    p.add_argument("--authorization", required=True, dest="authorization_ref", help="reference to the ACTUAL owner instruction (recorded, never a grant)")
+    p.add_argument("--scope", required=True, dest="scope_ref", help="scope/acceptance reference for the new run")
+    p.add_argument("--manifest", default=None, help="JSON {cid:{description,kind,...}} acceptance criteria for the new run, or - for stdin")
+    p.add_argument("--add-limits", default=None, dest="add_limits", help="JSON {work_dispatches|review_launches|technical_calls|acceptance_calls: N} ADDED to current limits")
+    p.add_argument("--expires-at", default=None, dest="expires_at", help="new deadline (required when the execution is expired)")
+    p.add_argument("--note", default=None)
+    p.add_argument("--expected-version", type=int, default=None, dest="expected_state_version")
+
+    p = sub.add_parser("exec-change-limits", help="owner-authorized limit/expiry change; never resets past usage or frozen acceptance")
     p.add_argument("task_id")
     p.add_argument("--authorization", required=True, dest="authorization_ref")
+    p.add_argument("--scope-amendment", default=None, dest="scope_amendment", help="short owner scope amendment, recorded append-only")
     p.add_argument(
         "--changes", required=True, help="JSON object of limit changes or - for stdin"
     )
@@ -411,6 +468,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("exec-record-completion")
     p.add_argument("task_id")
+    p.add_argument("--run", type=int, default=None, help="the run this write is for (refused if not the current run)")
     p.add_argument("--completion-ref", required=True, dest="completion_ref")
     p.add_argument("--by", required=True, dest="accepted_by")
     p.add_argument("--attestation", default=None)
@@ -420,6 +478,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("exec-request-shutdown")
     p.add_argument("task_id")
+    p.add_argument("--run", type=int, default=None, help="the run this write is for (refused if not the current run)")
     p.add_argument("--reason", default="expiry")
     p.add_argument(
         "--expected-version", type=int, default=None, dest="expected_state_version"
@@ -521,14 +580,115 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--timeout", type=float, default=12.0, dest="timeout_s")
 
+    # ------------------------------------------------------------ efficiency v2: scheduling + owned jobs
+    p = sub.add_parser("wait-plan", help="pure wait-budget check for a route (mcp: in-tool cap below the host yield; cli: required outer allowance); never waits")
+    p.add_argument("--route", required=True, choices=list(waitpath.ROUTES))
+    p.add_argument("--timeout", type=float, default=None, dest="timeout_s", help="requested inner wait seconds (omit with --preferred)")
+    p.add_argument("--preferred", action="store_true", help="print the reusable preferred 50 s inner / 60 s outer call shape for this route")
+    p.add_argument("--task", default="TASK", dest="task_id")
+    p.add_argument("--participant", default="PARTICIPANT", dest="participant_id")
+    p.add_argument("--job", default=None, dest="job_id")
+    p.add_argument("--outer", type=float, default=None, dest="outer_s", help="outer shell allowance you intend to pass (cli)")
+    p.add_argument("--host-yield", type=float, default=None, dest="host_yield_s", help="configured host tool-call yield (mcp)")
+    p = sub.add_parser("sched-plan", help="plan one intended instant (America/New_York by default); never submits")
+    p.add_argument("--at", default=None, help="local wall time 'YYYY-MM-DD HH:MM[:SS]' in --tz, or an ISO instant with its own offset")
+    p.add_argument("--in", dest="elapsed", default=None, help="elapsed delay from now, e.g. 90m, 1h30m, 45s, 2d")
+    p.add_argument("--tz", default=None, help="America/New_York (default) | UTC-05:00 (fixed, only when explicitly wanted) | UTC | IANA zone")
+    p.add_argument("--now", default=None, help="reference instant (ISO/epoch) for a reproducible plan; default real now")
+    p.add_argument("--ambiguous", default="reject", choices=list(schedule.AMBIGUOUS_POLICIES), help="fall-back overlap policy")
+    p.add_argument("--allow-past", action="store_true", dest="allow_past")
+
+    p = sub.add_parser("sched-verify", help="read-only: compare a persisted next_run_at/active flag with the intended instant")
+    p.add_argument("--intended-utc", required=True, dest="intended_utc")
+    p.add_argument("--persisted-json", default=None, dest="persisted_json", help="file path, '-' (stdin) or JSON literal of the persisted automation record")
+    p.add_argument("--next-run-at", default=None, dest="next_run_at")
+    p.add_argument("--active", default=None, help="true/false or a status word (active/paused)")
+    p.add_argument("--tolerance", type=float, default=schedule.DEFAULT_TOLERANCE_S, help="seconds")
+
+    p = sub.add_parser("job-run", help="start an owned local job by CLI (never over MCP): -- <command> [args]")
+    p.add_argument("job_id")
+    p.add_argument("--cwd", default=None)
+    p.add_argument("--deadline", type=float, default=DEFAULT_DEADLINE_S, dest="deadline_s", help="wall-clock seconds before the wrapper terminates its own child")
+    p.add_argument("--task", default=None, dest="task_id", help="managed task id (with --action-id)")
+    p.add_argument("--action-id", default=None, dest="action_id", help="open work reservation the job runs under")
+    p.add_argument("--dispatch-identity", default=None, dest="dispatch_identity", help="the dispatch the reservation is bound to")
+    p.add_argument("--on-stop", default="keep", choices=list(ON_STOP_POLICIES), dest="on_stop", help="what the wrapper does to its child when the execution stops")
+    p.add_argument("--label", default=None)
+    p.add_argument("--join", type=float, default=0.0, dest="join_s", help=f"also join inside this call for up to N s (max {JOIN_MAX_S:.0f})")
+    p.add_argument("--tail", type=int, default=DEFAULT_TAIL_BYTES, dest="tail_bytes")
+    p.add_argument("argv", nargs="*", default=[], help="everything after -- is the command and its arguments")
+
+    p = sub.add_parser("job-join", help=f"wait inside the tool (<= {JOIN_MAX_S:.0f}s) for change/terminal/stop; deterministic metadata")
+    p.add_argument("job_id")
+    p.add_argument("--timeout", type=float, default=JOIN_MAX_S, dest="timeout_s",
+                   help="in-tool wait <= %ss (CLI route); give the shell call an outer allowance of timeout+10 s" % int(JOIN_MAX_S))
+    p.add_argument("--after-version", type=int, default=None, dest="after_version")
+    p.add_argument("--tail", type=int, default=DEFAULT_TAIL_BYTES, dest="tail_bytes")
+
+    p = sub.add_parser("job-status", help="compact status of one owned job")
+    p.add_argument("job_id")
+    p.add_argument("--tail", type=int, default=0, dest="tail_bytes")
+
+    p = sub.add_parser("job-list", help="metadata-only listing within the combined byte budget")
+    p.add_argument("--task", default=None, dest="task_id")
+    p.add_argument("--status", default=None)
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--cursor", default=None)
+
+    p = sub.add_parser("job-output", help="bounded retrieval of retained stdout/stderr/supervisor output")
+    p.add_argument("job_id")
+    p.add_argument("--stream", default="stdout", choices=["stdout", "stderr", "supervisor"])
+    p.add_argument("--offset", type=int, default=0)
+    p.add_argument("--limit", type=int, default=4096)
+    p.add_argument("--tail", action="store_true", help="read the last --limit bytes")
+    p.add_argument("--budget", type=int, default=BATCH_BUDGET_BYTES, help=f"max bytes of this whole response as emitted (default {BATCH_BUDGET_BYTES}; 0 = only --limit applies, an explicit larger evidence read)")
+
+    p = sub.add_parser("job-cancel", help="terminate this wrapper's own child for one job")
+    p.add_argument("job_id")
+    p.add_argument("--reason", default="cancel_requested")
+
+    p = sub.add_parser("worker-run", help="start ONE bounded routine model worker (CLI-only): profile-selected model/effort (routine = gpt-5.6-luna @ low), compact prompt FILE on stdin, owned managed job, no delegation/housekeeping")
+    p.add_argument("worker_id")
+    p.add_argument("--prompt", required=True, dest="prompt_path", help="bounded prompt file (<= 16 KiB; a preamble is prepended; never a transcript)")
+    p.add_argument("--profile", default="routine", choices=sorted(PROFILES), help="routine = gpt-5.6-luna @ low (global defaults untouched)")
+    p.add_argument("--output", default=None, dest="output_path", help="codex -o target (default <root>/workers/<id>/output.json)")
+    p.add_argument("--expect", default="json", choices=list(EXPECT_KINDS))
+    p.add_argument("--require-key", action="append", default=[], dest="require_keys", help="required top-level JSON key (repeatable)")
+    p.add_argument("--task", default=None, dest="task_id")
+    p.add_argument("--action-id", default=None, dest="action_id")
+    p.add_argument("--dispatch-identity", default=None, dest="dispatch_identity")
+    p.add_argument("--deadline", type=float, default=WORKER_DEADLINE_S, dest="deadline_s")
+    p.add_argument("--label", default=None)
+    p.add_argument("--join", type=float, default=0.0, dest="join_s", help="also join inside this call (max %ss)" % int(JOIN_MAX_S))
+    p.add_argument("--tail", type=int, default=DEFAULT_TAIL_BYTES, dest="tail_bytes")
+    p.add_argument("--codex-bin", default="codex", dest="codex_bin")
+
+    p = sub.add_parser("worker-result", help="deterministically validate a finished worker's output and record provenance; ONE escalation.json on failure, never a retry")
+    p.add_argument("worker_id")
+
     return ap
 
 
+def _split_command(argv: list[str] | None):
+    """For ``job-run``, everything after the first ``--`` is the command verbatim (argparse must
+    never reinterpret the job's own flags). Returns (argv_for_argparse, command_or_None)."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "job-run" in argv and "--" in argv and argv.index("job-run") < argv.index("--"):
+        i = argv.index("--")
+        return argv[:i], argv[i + 1:]
+    return argv, None
+
+
 def run(argv: list[str] | None = None) -> int:
+    argv, command = _split_command(argv)
     args = build_parser().parse_args(argv)
+    if command is not None:
+        args.argv = command
     store = CoordStore(args.root)
     co = Coordinator(store)
     em = ExecutionManager(store)
+    jm = JobManager(store)
+    wm = WorkerManager(store, jm)
     op = args.op
     try:
         if op == "create-task":
@@ -609,6 +769,7 @@ def run(argv: list[str] | None = None) -> int:
                     after_seq=args.after,
                     limit=args.limit,
                     kinds=args.kinds,
+                    compact=not args.full,
                 )
             )
         elif op == "wait":
@@ -619,8 +780,24 @@ def run(argv: list[str] | None = None) -> int:
                     after_seq=args.after,
                     timeout_s=args.timeout,
                     kinds=args.kinds,
+                    limit=args.limit,
+                    compact=not args.full,
+                    route="cli",
                 )
             )
+        elif op == "wait-plan":
+            try:
+                if args.preferred or args.timeout_s is None:
+                    _emit(waitpath.preferred_pattern(args.route, task_id=args.task_id,
+                                                     participant_id=args.participant_id, job_id=args.job_id))
+                else:
+                    _emit(waitpath.check_wait(args.route, args.timeout_s, args.outer_s,
+                                              host_yield_s=args.host_yield_s))
+            except ValueError as e:
+                _emit({"ok": False, "error": "invalid_wait_plan", "detail": str(e)})
+                return 2
+        elif op == "read-message":
+            _emit(co.read_message(args.task_id, args.participant_id, args.message_id))
         elif op == "ack":
             _emit(
                 co.ack(
@@ -650,7 +827,8 @@ def run(argv: list[str] | None = None) -> int:
         elif op == "checkpoint-read":
             _emit(co.read_checkpoint(args.task_id, revision=args.revision))
         elif op == "resume":
-            _emit(co.resume(args.task_id, args.participant_id, limit=args.limit))
+            _emit(co.resume(args.task_id, args.participant_id, limit=args.limit,
+                            compact=not args.full, after_checkpoint_revision=args.after_checkpoint))
         elif op == "select-session":
             _emit(
                 co.select_session(
@@ -795,6 +973,13 @@ def run(argv: list[str] | None = None) -> int:
             _emit(em.read_execution(args.task_id))
         elif op == "exec-status":
             _emit(em.status(args.task_id))
+        elif op == "exec-receipt":
+            _emit(em.receipt(args.task_id, after_version=args.after_version,
+                             checks_limit=args.checks_limit, budget=args.budget))
+        elif op == "exec-evidence":
+            _emit(em.evidence(args.task_id, criterion_id=args.criterion_id, action_id=args.action_id,
+                              completion=args.completion, offset=args.offset, limit=args.limit,
+                              tail=args.tail, budget=args.budget))
         elif op == "exec-reserve":
             _emit(
                 em.reserve(
@@ -828,6 +1013,7 @@ def run(argv: list[str] | None = None) -> int:
                     attestation=args.attestation,
                     evidence_sha256=args.evidence_sha256,
                     accepted_by=args.accepted_by,
+                    run=args.run,
                     expected_state_version=args.expected_state_version,
                 )
             )
@@ -897,6 +1083,22 @@ def run(argv: list[str] | None = None) -> int:
                     args.task_id,
                     authorization_ref=args.authorization_ref,
                     expected_state_version=args.expected_state_version,
+                    scope_amendment=args.scope_amendment,
+                )
+            )
+        elif op == "exec-owner-request":
+            _emit(
+                em.owner_request(
+                    args.task_id,
+                    request_id=args.request_id,
+                    authorization_ref=args.authorization_ref,
+                    scope_ref=args.scope_ref,
+                    acceptance_manifest=_load_json_arg(args.manifest) if args.manifest else None,
+                    add_limits=_load_json_arg(args.add_limits) if args.add_limits else None,
+                    expires_at=args.expires_at,
+                    note=args.note,
+                    live_work=jm.live_job_ids(args.task_id),
+                    expected_state_version=args.expected_state_version,
                 )
             )
         elif op == "exec-change-limits":
@@ -906,6 +1108,7 @@ def run(argv: list[str] | None = None) -> int:
                     authorization_ref=args.authorization_ref,
                     changes=_load_json_arg(args.changes),
                     expected_state_version=args.expected_state_version,
+                    scope_amendment=args.scope_amendment,
                 )
             )
         elif op == "exec-set-phase":
@@ -954,6 +1157,7 @@ def run(argv: list[str] | None = None) -> int:
                     completion_ref=args.completion_ref,
                     accepted_by=args.accepted_by,
                     attestation=args.attestation,
+                    run=args.run,
                     expected_state_version=args.expected_state_version,
                 )
             )
@@ -962,6 +1166,7 @@ def run(argv: list[str] | None = None) -> int:
                 em.request_shutdown(
                     args.task_id,
                     reason=args.reason,
+                    run=args.run,
                     expected_state_version=args.expected_state_version,
                 )
             )
@@ -976,6 +1181,84 @@ def run(argv: list[str] | None = None) -> int:
                     expected_state_version=args.expected_state_version,
                 )
             )
+        elif op == "sched-plan":
+            _emit(
+                schedule.plan(
+                    at=args.at,
+                    elapsed=args.elapsed,
+                    tz=args.tz,
+                    now=args.now,
+                    ambiguous=args.ambiguous,
+                    allow_past=args.allow_past,
+                )
+            )
+        elif op == "sched-verify":
+            res = schedule.verify(
+                intended_utc=args.intended_utc,
+                persisted=_load_json_source(args.persisted_json),
+                next_run_at=args.next_run_at,
+                active=args.active,
+                tolerance_s=args.tolerance,
+            )
+            _emit(res)
+            return 0 if res.get("ok") else 3
+        elif op == "job-run":
+            res = jm.run(
+                args.job_id,
+                list(args.argv),
+                cwd=args.cwd,
+                deadline_s=args.deadline_s,
+                task_id=args.task_id,
+                action_id=args.action_id,
+                dispatch_identity=args.dispatch_identity,
+                on_stop=args.on_stop,
+                label=args.label,
+                join_s=args.join_s,
+                tail_bytes=args.tail_bytes,
+            )
+            _emit(res)
+            return 0 if res.get("effective_status") != "refused" else 3
+        elif op == "job-join":
+            _emit(
+                jm.join(
+                    args.job_id,
+                    timeout_s=args.timeout_s,
+                    after_version=args.after_version,
+                    tail_bytes=args.tail_bytes,
+                    route="cli",
+                )
+            )
+        elif op == "job-status":
+            _emit(jm.status(args.job_id, tail_bytes=args.tail_bytes))
+        elif op == "job-list":
+            _emit(jm.list(task_id=args.task_id, status=args.status, limit=args.limit, cursor=args.cursor))
+        elif op == "job-output":
+            _emit(
+                jm.output(
+                    args.job_id,
+                    stream=args.stream,
+                    offset=args.offset,
+                    limit=args.limit,
+                    tail=args.tail,
+                    budget=args.budget,
+                )
+            )
+        elif op == "job-cancel":
+            _emit(jm.cancel(args.job_id, reason=args.reason))
+        elif op == "worker-run":
+            res = wm.run(
+                args.worker_id, args.prompt_path, profile=args.profile, output_path=args.output_path,
+                require_keys=args.require_keys, expect=args.expect, task_id=args.task_id,
+                action_id=args.action_id, dispatch_identity=args.dispatch_identity,
+                deadline_s=args.deadline_s, label=args.label, join_s=args.join_s,
+                tail_bytes=args.tail_bytes, codex_bin=args.codex_bin,
+            )
+            _emit(res)
+            return 0 if res.get("effective_status") != "refused" else 3
+        elif op == "worker-result":
+            res = wm.result(args.worker_id)
+            _emit(res)
+            return 0 if not res.get("escalated") else 3
         else:  # pragma: no cover
             _emit({"error": "unknown_op", "op": op})
             return 2

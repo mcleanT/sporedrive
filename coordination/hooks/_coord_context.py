@@ -69,9 +69,59 @@ def main() -> int:
     body = (ck.get("checkpoint") or {}) if isinstance(ck, dict) else {}
     pend = r.get("pending_unacked") or []
     lines = [f"Mycelium coordination: attached to task {task} as {who}."]
-    if ck:
+    execution = r.get("execution") or {}
+    stopped = bool(r.get("stop_waiting"))
+    if execution:
+        lines.append(f"Current execution: {execution.get('status')}"
+                     f" (version {execution.get('state_version')}; expired={execution.get('expired')}).")
+        rec = (execution.get("authorization") or {}).get("last_recovery")
+        if rec:
+            lines.append(f"Owner-authorized recovery already recorded: {rec.get('via')} at {rec.get('at')} "
+                         f"(auth {rec.get('authorization_ref')}). Do not ask for that approval again; "
+                         "this fresh read supersedes any older STOP snapshot.")
+    if stopped:
+        st = execution.get("status") or "stopped"
+        state = f"expired{' and ' + st if st in ('paused', 'draining', 'exhausted', 'closed', 'completed') else ''}" \
+            if execution.get("expired") else st
+        run = execution.get("run") or 1
+        cref = execution.get("completion_ref")
+        # owner-followup v1: the STOP is scoped to AUTONOMOUS continuation of THIS run — it is not a
+        # statement that the conversation can do nothing. A completion receipt is historical
+        # evidence, never a permanent prohibition on the task.
+        lines.append(f"STOP (autonomous work): run {run} of this execution is {state}"
+                     f"{' (completion receipt ' + str(cref) + ')' if cref else ''}. "
+                     "Background/automatic work on that run is refused: do not resume its old checkpoint "
+                     "work, poll, compact or self-renew, and do not open a new Codex/Mycelium task to get "
+                     "around it. Only bounded reconciliation of that run is permitted.")
+        lines.append("STILL PERMITTED in this conversation: read-only discussion, diagnosis and questions "
+                     "about the completed work; and, on a GENUINE NEW OWNER WORK INSTRUCTION in this same "
+                     "task, opening the next run through the supported owner-request path (questions, "
+                     "reviews, peer summaries, stale checkpoints or an agent-authored reference never "
+                     "restart work).")
+        # R4 / owner-followup: the one permitted exception is explicit for EVERY stopped state — an
+        # already-owner-approved continuation is bounded administrative reconciliation the agent may
+        # perform itself, never a reason to ask the owner again.
+        lines.append("PERMITTED RECOVERY (only from the owner's actual instruction; no second confirmation): "
+                     "ONE call — exec-owner-request TASK --request-id ID --authorization <owner instruction "
+                     "ref> --scope <new scope/acceptance ref> [--manifest JSON] [--add-limits JSON] "
+                     "[--expires-at ISO] (MCP execution_owner_request) — opens run "
+                     f"{run + 1} from completed/closed/paused/expired/exhausted, archives run {run} and its "
+                     "receipt immutably, keeps cumulative usage, and gives the new scope its own "
+                     "acceptance state. A paused-only run may instead use exec-change-limits / exec-unpause "
+                     "with the same reference. Then read fresh exec-status/resume before any work; the "
+                     "fresh read supersedes this notice. An identical replay of the same request id never "
+                     "opens a second run; unauthorized or expired work without a new deadline stays STOP.")
+    if ck and not stopped:
         lines.append(f"Current checkpoint rev {ck.get('revision')} (auth {ck.get('authorization_ref')}).")
-        nxt = body.get("next_action") or body.get("next")
+        predates = ck.get("predates_run")
+        if predates:
+            # R3: the checkpoint belongs to an earlier owner run — history, not instructions
+            lines.append(f"That checkpoint predates owner run {predates}: its next action, STOP/review and "
+                         "continuation instructions are superseded and must not be resumed. Current owner "
+                         f"scope: {ck.get('current_scope_ref') or execution.get('scope_ref')}"
+                         f"{' (owner request ' + str(ck.get('current_owner_request')) + ')' if ck.get('current_owner_request') else ''}. "
+                         "Work from the owner's new instruction; publish a fresh checkpoint for this run.")
+        nxt = None if predates else (body.get("next_action") or body.get("next"))
         if nxt:
             lines.append(f"Next action: {str(nxt)[:300]}")
         refs = body.get("knowledge_refs") or body.get("knowledge") or []
@@ -79,21 +129,18 @@ def main() -> int:
             lines.append("Knowledge refs: " + ", ".join(str(x) for x in refs[:8]))
         # a bounded view of remaining checkpoint keys so a compacted session sees substance, not just
         # a revision number; the full record is resolvable via the read instruction below.
-        shown = {"next_action", "next", "knowledge_refs", "knowledge"}
-        extra = {k: v for k, v in body.items() if k not in shown}
-        if extra:
-            blob = json.dumps(extra, default=str)
-            lines.append("Checkpoint (bounded): " + (blob if len(blob) <= 600 else blob[:600] + " …"))
+        # Keep the header and next action; details are fetched only when they answer a live question.
         lines.append(f"Read full checkpoint: mycelium-coord checkpoint-read {task} --revision {ck.get('revision')}")
     lines.append(f"Pending unacknowledged messages: {r.get('pending_count', len(pend))}.")
-    for m in pend[:10]:
-        body = m.get("text") or m.get("artifact_ref") or ""
+    for m in pend[:5]:
+        body = m.get("preview") or m.get("text") or m.get("artifact_ref") or ""
         lines.append(
             f"  - {m.get('message_id')} [{m.get('kind')}] from {m.get('sender')} "
             f"rev {m.get('task_revision')}: {str(body)[:120]}"
         )
     lines.append(
-        "Read/ack via the mycelium-coord CLI or the coord_* MCP tools. This is coordination "
+        f"Fetch a selected full brief: mycelium-coord read-message {task} {who} MESSAGE_ID. "
+        "Summaries are incomplete; content_hash identifies the envelope, not a file. This is coordination "
         "state only; it does not change repository ownership or run analysis hooks."
     )
     _emit("SessionStart", lines)

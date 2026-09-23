@@ -310,11 +310,14 @@ cd "$REPO_ROOT" || { echo "[codex_ask] cannot cd to $REPO_ROOT" >&2; exit 70; }
 
 # --- Assemble the DYNAMIC session-context block ---------------------------------
 BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '(no git)')"
-COMMITS="$(git log --oneline -5 2>/dev/null || echo '(none)')"
+COMMITS="$(git log --oneline -3 2>/dev/null || echo '(none)')"
 LASTSESSION=""
-for f in ".living/last-session.md" ".living/log/last-session.md"; do
-  if [ -f "$f" ]; then LASTSESSION="$(tail -n 25 "$f")"; break; fi
-done
+# Historical narrative is opt-in; selected current evidence belongs in -f / the scoped brief.
+if [ "${CODEX_ASK_INCLUDE_LASTSESSION:-0}" = "1" ]; then
+  for f in ".living/last-session.md" ".living/log/last-session.md"; do
+    if [ -f "$f" ]; then LASTSESSION="$(tail -n 25 "$f")"; break; fi
+  done
+fi
 # Cap to keep the prompt focused — a long last-session entry can otherwise dominate the prompt
 # with low-signal noise. Keep the most-recent tail (the file is chronological, newest at the end).
 LS_CAP="${CODEX_ASK_LASTSESSION_CAP:-1600}"

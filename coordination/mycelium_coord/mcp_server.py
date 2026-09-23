@@ -16,8 +16,11 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
+from . import schedule
 from .coord import Coordinator
 from .execution import ExecutionManager
+from .jobs import DEFAULT_TAIL_BYTES, JOIN_MAX_S, JobManager
+from .waitpath import MCP_SAFE_WAIT_S, plan_wait, check_wait, preferred_pattern
 from .model import ProtocolError
 from .store import CoordStore, StoreError
 
@@ -48,6 +51,11 @@ def _co() -> Coordinator:
 @lru_cache(maxsize=1)
 def _em() -> ExecutionManager:
     return ExecutionManager(CoordStore(os.environ.get("MYCELIUM_COORD_DIR") or None))
+
+
+@lru_cache(maxsize=1)
+def _jm() -> JobManager:
+    return JobManager(CoordStore(os.environ.get("MYCELIUM_COORD_DIR") or None))
 
 
 def _fail(name: str, e: Exception) -> ToolError:
@@ -205,27 +213,40 @@ async def coord_inbox(
     task_id: str,
     participant_id: str,
     after_seq: int = 0,
-    limit: int = 100,
+    limit: int = 10,
     kinds: list | None = None,
+    compact: bool = True,
 ) -> dict:
     """Bounded read of messages addressed to this participant with seq > after_seq. Does NOT consume
-    and does NOT move the stored cursor. Returns messages + next_after_seq.
+    and does NOT move the stored cursor. Compact summaries are the default. Use coord_read_message
+    for a selected full body before acting; summaries are not complete briefs or acceptance evidence.
 
     Args:
         task_id: Task id.
         participant_id: The reading participant.
         after_seq: Return messages with seq greater than this.
-        limit: Max messages (default 100).
+        limit: Max messages (default 10; compact cap 20).
         kinds: Optional kind filter.
+        compact: False explicitly returns full message bodies (cap 200).
     """
     return await asyncio.to_thread(
         lambda: _wrap(
             "coord_inbox",
             lambda: _co().inbox(
-                task_id, participant_id, after_seq=after_seq, limit=limit, kinds=kinds
+                task_id, participant_id, after_seq=after_seq, limit=limit, kinds=kinds,
+                compact=compact,
             ),
         )
     )
+
+
+@mcp.tool(title="Coord Read Message", annotations=_READ)
+async def coord_read_message(task_id: str, participant_id: str, message_id: str) -> dict:
+    """Read ONE complete addressed message selected from a compact inbox/resume. No acknowledgment.
+    content_hash hashes the message envelope, not a referenced file. Verify file hashes separately.
+    """
+    return await asyncio.to_thread(lambda: _wrap(
+        "coord_read_message", lambda: _co().read_message(task_id, participant_id, message_id)))
 
 
 @mcp.tool(title="Coord Wait", annotations=_READ)
@@ -233,18 +254,31 @@ async def coord_wait(
     task_id: str,
     participant_id: str,
     after_seq: int = 0,
-    timeout_s: float = 30.0,
+    timeout_s: float = MCP_SAFE_WAIT_S,
     kinds: list | None = None,
+    limit: int = 10,
+    compact: bool = True,
+    host_yield_s: float | None = None,
 ) -> dict:
     """Bounded wait for new addressed messages after a cursor. Truthful: a finite-timeout poll, NOT a
-    host wake-up. Returns as soon as any qualifying message exists or timed_out=True at the deadline.
+    host wake-up (a stored message never wakes an idle host). The wait runs locally without model
+    polling inside it. Returns for a message, pause/closure/expiry/exhaustion, or timeout. Stop
+    reissuing when stop_waiting=True. An unchanged timeout is not progress and does not require a new
+    status read or narrated model turn. Choose one finite wait within the host's call limit and the
+    task deadline; do not add clock/sleep loops. THIS IS THE DIRECT MCP ROUTE: the in-tool wait is
+    capped at 25 s (host_yield_s 30 - 5 s margin) because the host yields a direct tool call at
+    about 30 s; a longer wait belongs on the CLI route (`mycelium-coord wait --timeout 50` inside a
+    shell call given a 60 s outer allowance). The result's wait_path reports what was applied.
 
     Args:
         task_id: Task id.
         participant_id: The waiting participant.
         after_seq: Wait for messages with seq greater than this.
-        timeout_s: Finite timeout seconds (max 600).
+        timeout_s: Requested in-tool wait; applied = min(timeout_s, host_yield_s - 5).
         kinds: Optional kind filter.
+        limit: Max messages returned (default 10).
+        compact: Summaries by default; fetch one full message with coord_read_message.
+        host_yield_s: Your host's configured tool-call yield, only if you set one (default 30).
     """
     return await asyncio.to_thread(
         lambda: _wrap(
@@ -255,9 +289,40 @@ async def coord_wait(
                 after_seq=after_seq,
                 timeout_s=timeout_s,
                 kinds=kinds,
+                limit=limit,
+                compact=compact,
+                route="mcp",
+                host_yield_s=host_yield_s,
             ),
         )
     )
+
+
+@mcp.tool(title="Wait Plan", annotations=_READ)
+async def wait_plan(route: str, timeout_s: float | None = None, outer_s: float | None = None,
+                    host_yield_s: float | None = None, preferred: bool = False) -> dict:
+    """Pure, clock-free wait-budget adapter (the one documented pattern for both routes). With
+    preferred=true (or no timeout_s) it returns the REUSABLE preferred call shape — inner 50 s under
+    an explicit 60 s outer allowance (cli: the shell call's timeout pragma; mcp: host_yield_s=60) —
+    which costs ONE model request per 50 s of waiting; use it directly, not a planning call per
+    interval. With timeout_s it checks a pair: route "mcp" reports the in-tool cap (host_yield_s - 5;
+    25 s fallback under the default 30 s yield), route "cli" the outer allowance required (inner +
+    10 s). The 25 s fallback costs two requests per 50 s and is never a request-count saving. No
+    waiting happens here.
+
+    Args:
+        route: mcp | cli.
+        timeout_s: Requested inner wait seconds (omit for the preferred pattern).
+        outer_s: The outer shell allowance you intend to pass (cli route).
+        host_yield_s: Configured host tool-call yield, if known (mcp route).
+        preferred: Return the preferred 50/60 pattern instead of checking a pair.
+    """
+    try:
+        if preferred or timeout_s is None:
+            return preferred_pattern(route)
+        return check_wait(route, timeout_s, outer_s, host_yield_s=host_yield_s)
+    except ValueError as e:
+        raise ToolError("invalid_wait_plan: %s" % e)
 
 
 @mcp.tool(title="Coord Ack", annotations=_WRITE)
@@ -370,18 +435,24 @@ async def coord_checkpoint_read(
 
 
 @mcp.tool(title="Coord Resume", annotations=_READ)
-async def coord_resume(task_id: str, participant_id: str, limit: int = 50) -> dict:
-    """Reattach after compaction/restart: current checkpoint + bounded UNACKNOWLEDGED messages +
-    revision/authorization. Does not re-inject transcripts.
+async def coord_resume(task_id: str, participant_id: str, limit: int = 10,
+                       compact: bool = True, after_checkpoint_revision: int | None = None) -> dict:
+    """ONE batched state read: execution/stop status, checkpoint identity, participant and pending
+    message summaries. Prefer this to separate status/checkpoint/inbox reads. Compact by default;
+    use coord_read_message or coord_checkpoint_read for selected full evidence. Current execution
+    state overrides stale checkpoint instructions. Never resume work from a summary alone.
 
     Args:
         task_id: Task id.
         participant_id: Resuming participant.
         limit: Max pending messages returned.
+        compact: False opts into full checkpoint and message bodies.
+        after_checkpoint_revision: Previously seen revision; omit unchanged checkpoint content.
     """
     return await asyncio.to_thread(
         lambda: _wrap(
-            "coord_resume", lambda: _co().resume(task_id, participant_id, limit=limit)
+            "coord_resume", lambda: _co().resume(task_id, participant_id, limit=limit,
+                compact=compact, after_checkpoint_revision=after_checkpoint_revision)
         )
     )
 
@@ -673,6 +744,58 @@ async def execution_status(task_id: str) -> dict | None:
     )
 
 
+@mcp.tool(title="Execution Receipt", annotations=_READ)
+async def execution_receipt(task_id: str, after_version: int | None = None, checks_limit: int = 8,
+                            budget: int = 4096) -> dict | None:
+    """ONE combined bounded operation receipt (<= `budget` bytes serialized): status/phase, usage vs
+    limits, coverage, acceptance pointers (evidence path + sha256 per accepted criterion, pending
+    criteria), latest settled check outcomes (newest first), completion pointer, `stop`/`terminal`,
+    and a `state_version` cursor. Pass the last seen `after_version`: when nothing changed the reply
+    is `changed=false, suppressed=true` with only identity + cursor, so unchanged telemetry never
+    reaches a model turn. `truncated`/`next_cursor` are truthful; full artifacts stay on disk (use
+    execution_evidence). Read-only. Once `terminal` is true: deliver the receipt and stop — no
+    follow-on cleanup, audit, compaction or monitor. This budget caps only this tool's output, never
+    a host-native tool or the total model context.
+
+    Args:
+        task_id: Task id.
+        after_version: Previously seen state_version; suppresses an unchanged receipt.
+        checks_limit: Max latest settled reservations listed (newest first).
+        budget: Max bytes of the whole serialized response (default 4096).
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap("execution_receipt", lambda: _em().receipt(
+            task_id, after_version=after_version, checks_limit=checks_limit, budget=budget))
+    )
+
+
+@mcp.tool(title="Execution Evidence", annotations=_READ)
+async def execution_evidence(task_id: str, criterion_id: str | None = None, action_id: str | None = None,
+                             completion: bool = False, offset: int = 0, limit: int = 4096,
+                             tail: bool = False, budget: int = 4096) -> dict:
+    """Bounded offset/limit retrieval of ONE artifact already recorded in the execution record —
+    an accepted criterion's evidence, a settled reservation's evidence/response ref, or the
+    completion ref; never an arbitrary path. Carries recorded_sha256 / sha256 (whole file) /
+    sha256_match, bytes_total, next_offset and a truthful `truncated` flag; pages concatenate
+    losslessly. Read-only.
+
+    Args:
+        task_id: Task id.
+        criterion_id: Accepted criterion whose evidence to read (exactly one selector).
+        action_id: Settled reservation whose evidence/response ref to read.
+        completion: Read the final completion_ref.
+        offset: Byte offset to start from.
+        limit: Max raw bytes to read (<= 65536).
+        tail: Read the last `limit` bytes instead.
+        budget: Max bytes of the whole serialized response (0 = only `limit` applies).
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap("execution_evidence", lambda: _em().evidence(
+            task_id, criterion_id=criterion_id, action_id=action_id, completion=completion,
+            offset=offset, limit=limit, tail=tail, budget=budget))
+    )
+
+
 @mcp.tool(title="Execution Reserve", annotations=_WRITE)
 async def execution_reserve(
     task_id: str,
@@ -761,6 +884,7 @@ async def execution_record_evidence(
     evidence_sha256: str | None = None,
     accepted_by: str | None = None,
     expected_state_version: int | None = None,
+    run: int | None = None,
 ) -> dict:
     """Record accepted evidence for a FROZEN acceptance criterion. Missing/unknown evidence is never a
     pass. On each settlement coverage is recomputed; once every criterion is accepted the record
@@ -785,6 +909,7 @@ async def execution_record_evidence(
                 attestation=attestation,
                 evidence_sha256=evidence_sha256,
                 accepted_by=accepted_by,
+                run=run,
                 expected_state_version=expected_state_version,
             ),
         )
@@ -987,14 +1112,23 @@ async def execution_pause(
 
 @mcp.tool(title="Execution Unpause", annotations=_WRITE)
 async def execution_unpause(
-    task_id: str, authorization_ref: str, expected_state_version: int | None = None
+    task_id: str, authorization_ref: str, expected_state_version: int | None = None,
+    scope_amendment: str | None = None,
 ) -> dict:
-    """User-authorized unpause back to active.
+    """Owner-authorized unpause. The recorded authorization_ref RECORDS authority that the real
+    owner instruction established (an agent-authored reference never creates authority): an agent
+    that sees `authorization.last_recovery` in a fresh execution_read/execution_status/coord_resume
+    continues without asking the owner again, and that fresh read supersedes any older STOP
+    snapshot. Refused with execution_expired on an expired execution (extend expires_at via
+    execution_change_limits first). Past usage is unchanged (status is `exhausted`, not `active`,
+    when the allowance is already spent); frozen acceptance history is untouched. An agent never
+    grants itself this authority.
 
     Args:
         task_id: Task id.
         authorization_ref: The user instruction reference (required).
         expected_state_version: Optimistic-concurrency guard.
+        scope_amendment: Optional short text of the owner's scope amendment, recorded append-only.
     """
     return await asyncio.to_thread(
         lambda: _wrap(
@@ -1003,9 +1137,58 @@ async def execution_unpause(
                 task_id,
                 authorization_ref=authorization_ref,
                 expected_state_version=expected_state_version,
+                scope_amendment=scope_amendment,
             ),
         )
     )
+
+
+@mcp.tool(title="Execution Owner Request", annotations=_WRITE)
+async def execution_owner_request(
+    task_id: str,
+    request_id: str,
+    authorization_ref: str,
+    scope_ref: str,
+    acceptance_manifest: dict | None = None,
+    add_limits: dict | None = None,
+    expires_at: str | None = None,
+    note: str | None = None,
+    expected_state_version: int | None = None,
+) -> dict:
+    """Owner-directed follow-up (owner-followup v1): ONE atomic operation that opens the NEXT RUN of
+    this same execution from ANY stopped state — completed, closed, paused, exhausted or expired —
+    on an explicit NEW OWNER WORK INSTRUCTION. A completion receipt is historical evidence, never a
+    permanent prohibition: the prior run (closure, receipt, acceptance evidence, usage/limits at
+    end) is archived immutably under `runs`; the new run gets fresh acceptance state for its own
+    scope (old accepted criteria cannot satisfy it); cumulative usage is never reset; `add_limits`
+    ADD bounded allowance (recorded); `expires_at` is required when the execution is expired. The
+    agent performs this from the owner's existing explicit approval — no owner shell command, no
+    repeated confirmation. Background events, stale checkpoints, a peer's summary or an
+    agent-authored reference never create authority (the reference only records it). Idempotent by
+    request_id (an identical replay never opens a second run or charges); a same-id different
+    content replay is refused (owner_request_conflict). Refused while identified owned jobs are
+    still running (owner_request_live_work) or an automation's shutdown is unreconciled — owners
+    are never force-unlocked. Questions/reviews alone never restart work: only call this for a
+    genuine owner work instruction.
+
+    Args:
+        task_id: Task id.
+        request_id: Idempotent owner-request id.
+        authorization_ref: Reference to the ACTUAL owner instruction (required).
+        scope_ref: Scope/acceptance reference for the new run (required).
+        acceptance_manifest: {criterion_id: {description, kind, evidence_requirements}} for the new run.
+        add_limits: {work_dispatches|review_launches|technical_calls|acceptance_calls: N} added.
+        expires_at: New ISO-8601 UTC deadline (required when expired).
+        note: Short note recorded with the request.
+        expected_state_version: Optimistic-concurrency guard.
+    """
+    def _run():
+        live = _jm().live_job_ids(task_id)
+        return _em().owner_request(
+            task_id, request_id=request_id, authorization_ref=authorization_ref, scope_ref=scope_ref,
+            acceptance_manifest=acceptance_manifest, add_limits=add_limits, expires_at=expires_at,
+            note=note, live_work=live, expected_state_version=expected_state_version)
+    return await asyncio.to_thread(lambda: _wrap("execution_owner_request", _run))
 
 
 @mcp.tool(title="Execution Change Limits", annotations=_WRITE_NI)
@@ -1014,9 +1197,12 @@ async def execution_change_limits(
     authorization_ref: str,
     changes: dict,
     expected_state_version: int | None = None,
+    scope_amendment: str | None = None,
 ) -> dict:
     """The ONLY path that may raise/extend a limit. Append-only and authorization-linked; PAST USAGE
-    is unchanged. An authorized raise can lift an exhausted state.
+    is unchanged. An authorized raise can lift an exhausted state. Records a scope_amendments entry;
+    never resets usage or rewrites accepted criteria. A fresh execution_read/execution_status after
+    this call supersedes any older snapshot or STOP notice — no second owner confirmation.
 
     Args:
         task_id: Task id.
@@ -1024,6 +1210,7 @@ async def execution_change_limits(
         changes: {limit_field: new_value} (work_dispatches, review_launches, review_deadline_seconds,
             technical_calls, acceptance_calls, expires_at).
         expected_state_version: Optimistic-concurrency guard.
+        scope_amendment: Optional short text of the owner's scope amendment, recorded append-only.
     """
     return await asyncio.to_thread(
         lambda: _wrap(
@@ -1033,6 +1220,7 @@ async def execution_change_limits(
                 authorization_ref=authorization_ref,
                 changes=changes,
                 expected_state_version=expected_state_version,
+                scope_amendment=scope_amendment,
             ),
         )
     )
@@ -1171,6 +1359,7 @@ async def execution_record_completion(
     accepted_by: str,
     attestation: str | None = None,
     expected_state_version: int | None = None,
+    run: int | None = None,
 ) -> dict:
     """Record the explicit FINAL completion receipt: closure -> terminal completed (review R4).
     Requires coverage complete (closed) and an attributable receipt. Terminal thereafter: no mutation
@@ -1191,6 +1380,7 @@ async def execution_record_completion(
                 completion_ref=completion_ref,
                 accepted_by=accepted_by,
                 attestation=attestation,
+                run=run,
                 expected_state_version=expected_state_version,
             ),
         )
@@ -1202,6 +1392,7 @@ async def execution_request_shutdown(
     task_id: str,
     reason: str = "expiry",
     expected_state_version: int | None = None,
+    run: int | None = None,
 ) -> dict:
     """Record a durable pending shutdown intent (review R5). Idempotent. A host adapter later pauses
     the named automation and reconciles.
@@ -1215,7 +1406,8 @@ async def execution_request_shutdown(
         lambda: _wrap(
             "execution_request_shutdown",
             lambda: _em().request_shutdown(
-                task_id, reason=reason, expected_state_version=expected_state_version
+                task_id, reason=reason, run=run,
+                expected_state_version=expected_state_version
             ),
         )
     )
@@ -1485,6 +1677,180 @@ async def coord_boundary_inbox(
                 limit=min(max(0, limit), 200),
                 max_bytes=min(max(0, max_bytes), 20000),
             ),
+        )
+    )
+
+
+# ---------------------------------------------------------------- efficiency v2: read-only routes
+@mcp.tool(title="Sched Plan", annotations=_READ)
+async def sched_plan(
+    at: str | None = None,
+    elapsed: str | None = None,
+    tz: str | None = None,
+    now: str | None = None,
+    ambiguous: str = "reject",
+    allow_past: bool = False,
+) -> dict:
+    """Deterministic scheduling plan: ONE intended instant from an absolute local wall time or an
+    elapsed delay, in America/New_York by default (EST/EDT handled), emitting the intended UTC
+    instant, the Eastern display and one-shot scheduler submission data. Pure and read-only: it never
+    creates, updates or pauses an automation — use the host's official automation tool, then confirm
+    the persisted next_run_at with sched_verify. A fixed UTC-05:00 clock is honored only when
+    explicitly requested (tz="UTC-05:00"). Refuses nonexistent (spring-forward) and unresolved
+    ambiguous (fall-back) local times with a distinct error code.
+
+    Args:
+        at: Local wall time 'YYYY-MM-DD HH:MM[:SS]' in tz, or an ISO instant with its own offset.
+        elapsed: Delay from now such as 90m, 1h30m, 45s, 2d (give at OR elapsed).
+        tz: America/New_York (default), UTC-05:00 (fixed), UTC, or an IANA zone.
+        now: Reference instant (ISO/epoch) for a reproducible plan; default real now.
+        ambiguous: reject (default) | earlier | later for a fall-back overlap.
+        allow_past: Permit an instant before now (default refuses with past_instant).
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap(
+            "sched_plan",
+            lambda: schedule.plan(at=at, elapsed=elapsed, tz=tz, now=now, ambiguous=ambiguous,
+                                  allow_past=allow_past),
+        )
+    )
+
+
+@mcp.tool(title="Sched Verify", annotations=_READ)
+async def sched_verify(
+    intended_utc: str,
+    persisted: dict | None = None,
+    next_run_at: str | None = None,
+    active: str | None = None,
+    tolerance_s: float = schedule.DEFAULT_TOLERANCE_S,
+) -> dict:
+    """Read-only verification of a persisted schedule against the intended instant: pass the record
+    the host automation tool returned (persisted) or the bare next_run_at/active values. Verdict is
+    match | mismatch | cannot_evaluate — an absent or unparseable record is never a pass or a fail.
+    Only match backs a success claim; requires_native_pause=True means an ACTIVE automation sits at
+    the wrong instant and must be paused/deleted through the official tool. Both UTC and Eastern
+    renderings are returned.
+
+    Args:
+        intended_utc: The planned instant (sched_plan.intended_utc).
+        persisted: The persisted automation record (any shape carrying next_run_at and a status).
+        next_run_at: Persisted next_run_at when not passing a record.
+        active: Persisted active flag / status word when not passing a record.
+        tolerance_s: Allowed difference in seconds (default 60).
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap(
+            "sched_verify",
+            lambda: schedule.verify(intended_utc=intended_utc, persisted=persisted,
+                                    next_run_at=next_run_at, active=active,
+                                    tolerance_s=tolerance_s),
+        )
+    )
+
+
+@mcp.tool(title="Job Status", annotations=_READ)
+async def job_status(job_id: str, tail_bytes: int = 0) -> dict:
+    """Compact status of one owned local job (started by the owned CLI `job-run`; there is no MCP
+    launch route). Field-selected, fits the 4 KB budget, references retained output by path;
+    a job whose supervisor vanished reads as effective_status=unknown without rewriting the record.
+
+    Args:
+        job_id: Job id.
+        tail_bytes: Inline tail of stdout/stderr to include (0 = references only).
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap("job_status", lambda: _jm().status(job_id, tail_bytes=tail_bytes))
+    )
+
+
+@mcp.tool(title="Job Join", annotations=_READ)
+async def job_join(
+    job_id: str,
+    timeout_s: float = MCP_SAFE_WAIT_S,
+    after_version: int | None = None,
+    tail_bytes: int = DEFAULT_TAIL_BYTES,
+    host_yield_s: float | None = None,
+) -> dict:
+    """Wait INSIDE the tool for the job to finish or its status to change past after_version,
+    stopping early at the task deadline or a paused/closed/expired/completed execution
+    (stop_waiting=True). Returns deterministic changed / timed_out / stop_waiting / status / exit
+    metadata with bounded tails; the full output stays on disk (job_output). One join per permitted
+    interval is the whole protocol: do not add host wait/sleep loops around it, and do not join at
+    all for synchronous or batched reads. THIS IS THE DIRECT MCP ROUTE: the in-tool wait is capped
+    at 25 s (host yield 30 s - 5 s margin); a 50 s join belongs on the CLI route
+    (`mycelium-coord job-join --timeout 50` inside a shell call with a 60 s outer allowance). The
+    result's wait_path reports the timeout actually applied.
+
+    Args:
+        job_id: Job id.
+        timeout_s: Requested in-tool wait; applied = min(timeout_s, host_yield_s - 5, 50).
+        after_version: Last seen state_version; a newer version returns changed=True immediately.
+        tail_bytes: Inline tail of stdout/stderr once terminal.
+        host_yield_s: Your host's configured tool-call yield, only if you set one (default 30).
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap(
+            "job_join",
+            lambda: _jm().join(job_id, timeout_s=timeout_s, after_version=after_version,
+                               tail_bytes=tail_bytes, route="mcp", host_yield_s=host_yield_s),
+        )
+    )
+
+
+@mcp.tool(title="Job List", annotations=_READ)
+async def job_list(
+    task_id: str | None = None,
+    status: str | None = None,
+    limit: int = 20,
+    cursor: str | None = None,
+) -> dict:
+    """Metadata-only listing of owned jobs, newest first, bounded by count AND by the combined 4 KB
+    batch budget; truncated=True with next_cursor when either bound cut the list.
+
+    Args:
+        task_id: Only jobs under this managed task.
+        status: Only jobs with this effective status.
+        limit: Max rows (default 20).
+        cursor: Continue below this job id (from next_cursor).
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap(
+            "job_list",
+            lambda: _jm().list(task_id=task_id, status=status, limit=limit, cursor=cursor),
+        )
+    )
+
+
+@mcp.tool(title="Job Output", annotations=_READ)
+async def job_output(
+    job_id: str,
+    stream: str = "stdout",
+    offset: int = 0,
+    limit: int = 4096,
+    tail: bool = False,
+    budget: int = 4096,
+) -> dict:
+    """Bounded retrieval of a job's retained stdout / stderr / supervisor log by offset+limit
+    (tail=True reads the last `limit` bytes). The RESPONSE itself is bounded by `budget` bytes as
+    serialized (escaping and envelope included), pages are cut on character boundaries so they
+    concatenate losslessly, and `lossy` says when bytes were not valid UTF-8. Carries bytes_total,
+    next_offset and a truthful truncated flag so the complete evidence remains reachable in further
+    bounded reads.
+
+    Args:
+        job_id: Job id.
+        stream: stdout | stderr | supervisor.
+        offset: Byte offset to start from.
+        limit: Max raw bytes to read (<= 65536).
+        tail: Read the last `limit` bytes instead.
+        budget: Max bytes of the whole serialized response (default 4096; 0 = only `limit` applies,
+            an explicit larger evidence read).
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap(
+            "job_output",
+            lambda: _jm().output(job_id, stream=stream, offset=offset, limit=limit, tail=tail,
+                                 budget=budget),
         )
     )
 
