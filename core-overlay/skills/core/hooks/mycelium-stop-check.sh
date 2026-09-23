@@ -271,7 +271,7 @@ if [[ "$ACTIVE_MARKER_VALID" == true ]]; then
       "$LOG_REPO"/*) ACTIVE_LOG_REL="${LOG_PATH#"$LOG_REPO"/}" ;;
     esac
     if [ -f "$SESSION_CHANGES_SCRIPT" ]; then
-      _CHANGE_ARGS=(collect --repo-root "$LOG_REPO" --baseline "$SESSION_BASELINE_FILE" --activity-file "$ACTIVITY_FILE_CHECK")
+      _CHANGE_ARGS=(collect --repo-root "$LOG_REPO" --baseline "$SESSION_BASELINE_FILE" --cache "$STATE_DIR/mycelium-fingerprint-cache.json" --activity-file "$ACTIVITY_FILE_CHECK")
       if [ -n "$START_TS" ] && [ "$START_TS" -gt 0 ] 2>/dev/null; then
         _CHANGE_ARGS+=(--start-ts "$START_TS")
       fi

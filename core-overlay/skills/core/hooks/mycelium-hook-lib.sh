@@ -247,6 +247,23 @@ mycelium_payload_owns_active_session() {
   [[ "$host_identified" == true && "$host_session_id" == "$owner_id" ]]
 }
 
+mycelium_active_transaction_present() {
+  # True iff some session currently owns a LIVE transaction in this worktree,
+  # i.e. a valid active-session marker exists. Unlike
+  # mycelium_payload_owns_active_session this deliberately does NOT require the
+  # calling payload to be that owner: a genuine concurrent FOREIGN writer must
+  # still have its per-edit provenance recorded while a transaction is live
+  # (the Stop hook later resolves the true last writer of each path). It rejects
+  # only the late/delayed event that arrives when NO transaction is active at
+  # all -- a completed or superseded task whose marker is already gone. The
+  # marker is validated safely (symlinks and out-of-tree log paths rejected) by
+  # mycelium_read_active_log_marker. Requires STATE_DIR to be set by a prior
+  # mycelium_prepare_state_dir call.
+  local repo_root="$1"
+  mycelium_read_active_log_marker \
+    "$repo_root" "$STATE_DIR/active-session-log.tmp" >/dev/null 2>&1
+}
+
 mycelium_prepare_post_tool_state() {
   local repo_root="$1"
   local input="$2"
@@ -728,14 +745,18 @@ PY
 mycelium_record_provenance() {
   # Append genuine per-edit provenance to the shared, append-only ledger:
   # "<session_id> <relative-path>" per line, one line per touched path, in
-  # call order. Runs for every root session regardless of active-transaction
-  # ownership -- provenance is "who actually wrote this path, when", not an
-  # ownership verdict, so gating it on ownership would (as the prior
-  # foreign-only ledger did) leave a non-owner's write completely
-  # unattributed. The Stop hook resolves, for each changed path, the LAST
-  # recorded writer (append order = chronological order), so a later genuine
-  # edit by a different session naturally reclaims that path instead of
-  # being permanently excluded by an earlier touch.
+  # call order. Runs for every root session that writes while a transaction is
+  # LIVE, regardless of which session OWNS that transaction -- provenance is
+  # "who actually wrote this path, when", not an ownership verdict, so gating it
+  # on ownership would (as the prior foreign-only ledger did) leave a non-owner's
+  # write completely unattributed. It IS gated on a live transaction existing at
+  # all: a host-identified event with no active owner is a delayed event from a
+  # completed/superseded task and must not create or mutate any .mycelium state
+  # (the late-event gate below runs before any directory/baseline/cache/ledger
+  # write). The Stop hook resolves, for each changed path, the LAST recorded
+  # writer (append order = chronological order), so a later genuine edit by a
+  # different session naturally reclaims that path instead of being permanently
+  # excluded by an earlier touch.
   #
   # Usage:
   #   mycelium_record_provenance REPO_ROOT SESSION_ID PATH...
@@ -751,6 +772,25 @@ mycelium_record_provenance() {
   shift 2
 
   [[ -n "$session_id" && "$session_id" =~ ^[A-Za-z0-9._-]+$ ]] || return 0
+
+  # Late-event gate (must run BEFORE any state creation): a host-identified
+  # PostToolUse event with no active transaction is a delayed event from a
+  # completed or superseded task, and must not create or mutate ANY .mycelium
+  # state -- not the state directory, and not the baseline/cache/ledger. Probe
+  # the existing transaction WITHOUT creating state first (read-only prepare
+  # never mkdirs), then require a live transaction before proceeding. A live
+  # transaction owned by a DIFFERENT (foreign) session still records here:
+  # provenance is "who actually wrote this path", so a genuine concurrent
+  # foreign writer is attributed, not dropped -- only the no-live-owner late
+  # event is rejected. (Regression: test_late_host_post_tool_use_cannot_mutate_
+  # without_an_active_transaction; positive neighbors: the active foreign-owner
+  # probes in test_observer_writer_attribution.sh and
+  # test_active_transaction_records_foreign_writer_provenance.)
+  mycelium_prepare_state_dir "$repo_root" read-only >/dev/null 2>&1 || return 0
+  mycelium_active_transaction_present "$repo_root" || return 0
+
+  # A live transaction is present; prepare in write mode to fold in this
+  # event's provenance rows.
   mycelium_prepare_state_dir "$repo_root" >/dev/null 2>&1 || return 0
   local ledger="$STATE_DIR/mycelium-foreign-activity.tmp"
   if [[ -e "$ledger" && ( ! -f "$ledger" || -L "$ledger" ) ]]; then
@@ -761,27 +801,50 @@ mycelium_record_provenance() {
     local helper="$2"
     [[ -n "$helper" && -f "$helper" ]] || return 0
     local baseline="$STATE_DIR/mycelium-provenance-baseline.json"
-    if [[ ! -f "$baseline" ]]; then
-      # First observation for this session lifecycle: nothing to attribute
-      # yet -- only establish a starting point so the NEXT scan's delta is
-      # meaningful, rather than attributing the whole pre-existing tree.
-      python3 "$helper" snapshot --repo-root "$repo_root" --output "$baseline" >/dev/null 2>&1 || true
-      return 0
-    fi
-    local changed=""
-    changed=$(python3 "$helper" collect --repo-root "$repo_root" --baseline "$baseline" 2>/dev/null || true)
-    python3 "$helper" snapshot --repo-root "$repo_root" --output "$baseline" >/dev/null 2>&1 || true
-    [[ -n "$changed" ]] || return 0
-    while IFS= read -r _prov_path; do
-      [[ -z "$_prov_path" ]] && continue
-      printf '%s %s\n' "$session_id" "$_prov_path" >> "$ledger"
-    done <<< "$changed"
+    local cache="$STATE_DIR/mycelium-fingerprint-cache.json"
+    # Single-pass rolling scan (r2 provenance-latency fix): `scan` computes the
+    # delta since the last baseline AND rewrites the shared baseline + private
+    # fingerprint cache from ONE worktree read, reusing an unchanged path's
+    # cached fingerprint instead of re-hashing. This replaces the prior
+    # collect+snapshot pair, which content-hashed the whole dirty tree TWICE on
+    # every Bash tool call (minutes on a large untracked data tree). `scan` also
+    # appends this observing session's provenance rows to the shared ledger
+    # INSIDE its locked baseline transaction (seq90), so a read-only observer
+    # can never overtake a genuine explicit writer for a path -- the shell no
+    # longer appends here. With no baseline yet, `scan` only establishes a
+    # starting point and attributes nothing, so a first observation never
+    # attributes the pre-existing tree to this session.
+    python3 "$helper" scan \
+      --repo-root "$repo_root" \
+      --baseline "$baseline" \
+      --cache "$cache" \
+      --ledger "$ledger" \
+      --session-id "$session_id" >/dev/null 2>&1 || true
   else
-    local _prov_path
-    for _prov_path in "$@"; do
-      [[ -z "$_prov_path" ]] && continue
-      printf '%s %s\n' "$session_id" "$_prov_path" >> "$ledger"
-    done
+    # Explicitly-attributed writes (Edit/Write/apply_patch): advance-baseline
+    # appends this writer's provenance rows to the shared ledger AND folds the
+    # paths into the shared baseline + private cache INSIDE one locked
+    # transaction (seq90). The shell no longer appends the ledger itself: doing
+    # it outside the lock let a concurrent read-only observer scan interleave and
+    # become the last recorded writer for a path this session created. The append
+    # happens even before a baseline exists (so a pre-baseline write is still
+    # attributed); the baseline/cache fold is a no-op until the first --scan
+    # establishes a baseline. A genuine LATER writer still reclaims the path (its
+    # scan/advance appends last). Best-effort; never blocks the caller.
+    local _sfc_helper="${MYCELIUM_SESSION_CHANGES_HELPER:-${BASH_SOURCE[0]%/*}/../scripts/session_file_changes.py}"
+    local _prov_baseline="$STATE_DIR/mycelium-provenance-baseline.json"
+    local _prov_cache="$STATE_DIR/mycelium-fingerprint-cache.json"
+    if [[ -f "$_sfc_helper" ]]; then
+      local _adv_args=(advance-baseline --repo-root "$repo_root" \
+        --baseline "$_prov_baseline" --cache "$_prov_cache" \
+        --ledger "$ledger" --session-id "$session_id")
+      local _prov_path
+      for _prov_path in "$@"; do
+        [[ -z "$_prov_path" ]] && continue
+        _adv_args+=(--path "$_prov_path")
+      done
+      python3 "$_sfc_helper" "${_adv_args[@]}" >/dev/null 2>&1 || true
+    fi
   fi
 }
 

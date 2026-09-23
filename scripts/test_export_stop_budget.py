@@ -7,6 +7,7 @@ canonical overlay and drive the exported hooks.
 """
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -93,6 +94,22 @@ def test_exported_stop_hook_caps_retains_and_clears(exported, tmp_path):
     (tmp_path / ".living/learnings.md").write_text("# Repaired\n")
     assert _stop(exported, tmp_path).get("decision") != "block"
     assert not list(state.glob("stop-retry-*.json"))
+
+
+def _functions(text):
+    return set(re.findall(r"^([A-Za-z_][A-Za-z0-9_]*)\(\) \{", text, re.M))
+
+
+def test_overlay_does_not_drop_current_source_hook_behavior(exported):
+    """A stale overlay silently masks current source behavior (the Stop budget, the
+    late-event transaction gate). Every source function must survive in the export."""
+    src = ROOT / "mycelium-source/skills/core/hooks"
+    for overlay in (ROOT / "core-overlay/skills/core/hooks").glob("*.sh"):
+        missing = _functions((src / overlay.name).read_text()) - _functions(
+            (exported / "hooks" / overlay.name).read_text())
+        assert not missing, (overlay.name, sorted(missing))
+    lib = (exported / "hooks/mycelium-hook-lib.sh").read_text()
+    assert "mycelium_active_transaction_present \"$repo_root\" || return 0" in lib
 
 
 if __name__ == "__main__":
