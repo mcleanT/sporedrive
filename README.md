@@ -383,7 +383,7 @@ actions, and Claude and Codex differ in what initialization does for hooks (from
   register Claude hooks in a project you haven't initialized this way.
 - **Codex:** hooks are bundled once with the plugin in `hooks/hooks.json` and dispatched via
   `PLUGIN_ROOT` -- there is no per-repository hook-registration step. Trust them once via `/hooks` (all
-  six in this integrated export, five in upstream Mycelium -- see the health check's hooks item
+  seven registrations of six scripts in this integrated export, five in upstream Mycelium -- see the health check's hooks item
   below). They are then available in every Codex session where the plugin is enabled, but the Mycelium
   dispatcher **no-ops outside a Mycelium (initialized) repository** (bundled source
   `mycelium-source/README.md`), so the target project must still be initialized as a living project for
@@ -477,13 +477,14 @@ codex plugin marketplace add <native-mycelium-plugin-dir>    # LOCAL path, not a
 codex plugin add mycelium@mycelium
 ```
 Before the first task, launch a current Codex CLI (not the desktop app), open `/hooks`, and trust
-**all SIX** command hooks this integrated build registers -- upstream Mycelium alone ships five
-(`mycelium-health.sh`, `mycelium-post-action.sh`, `mycelium-activity-tracker.sh`,
-`mycelium-data-tracker.sh`, `mycelium-stop-check.sh`); the exporter's `merge_hooks()` step adds a
-sixth SessionStart entry, `mycelium-coord-attach.sh` (the coordination auto-attach hook), without
-dropping any of the five. Confirmed by actually exporting a candidate into an isolated scratch
-directory and counting the SessionStart/PostToolUse/Stop hook entries in its `hooks/hooks.json`: six
-total, matching six distinct scripts. Run `codex update` first if `/hooks` isn't exposed. Fully exit
+**all SEVEN** command hook registrations this integrated build ships -- upstream Mycelium alone ships
+five (`mycelium-health.sh`, `mycelium-post-action.sh`, `mycelium-activity-tracker.sh`,
+`mycelium-data-tracker.sh`, `mycelium-stop-check.sh`); the exporter's `merge_hooks()` step registers
+a sixth script, `mycelium-coord-attach.sh` (the coordination auto-attach adapter), twice -- once on
+SessionStart and once on PostToolUse / `Bash` -- without dropping any of the five. Confirmed by
+actually exporting a candidate into an isolated scratch directory and counting the
+SessionStart/PostToolUse/Stop hook entries in its `hooks/hooks.json`: seven registrations of six
+distinct scripts. Run `codex update` first if `/hooks` isn't exposed. Fully exit
 and restart Codex afterward so the approved `SessionStart` hooks are present from process startup --
 Codex deliberately skips untrusted command hooks.
 
@@ -515,18 +516,21 @@ required]` (only observable from inside an actual Claude Code or Codex session).
    pass, it only reads the task registry and creates nothing) and confirm it returns rather than
    erroring.
 
-4. **Six trusted hooks, enumerated from this candidate's own `hooks/hooks.json`, checked separately
-   from (1)-(3).** Five are inherited unchanged from `mycelium-source/hooks/hooks.json`; the exporter's
-   `merge_hooks()` step adds a sixth:
+4. **Seven trusted hook registrations (six distinct scripts), enumerated from this candidate's own
+   `hooks/hooks.json`, checked separately from (1)-(3).** Five are inherited unchanged from
+   `mycelium-source/hooks/hooks.json`; the exporter's `merge_hooks()` step registers the sixth script,
+   the coordination adapter, on two boundaries:
    - SessionStart: `mycelium-health.sh` (inherited)
    - PostToolUse / `Bash`: `mycelium-post-action.sh`, `mycelium-data-tracker.sh` (inherited)
    - PostToolUse / `apply_patch`: `mycelium-activity-tracker.sh` (inherited)
    - Stop: `mycelium-stop-check.sh` (inherited)
    - SessionStart: `mycelium-coord-attach.sh` (added by the exporter -- the coordination auto-attach hook)
+   - PostToolUse / `Bash`: `mycelium-coord-attach.sh` (added by the exporter -- the same adapter at the
+     active boundary)
 
-   **[shell-verifiable]** count six hook-script references across `SessionStart`/`PostToolUse`/`Stop`
-   in the exported candidate's `hooks/hooks.json`. **[LIVE host session required, Codex only]** open
-   `/hooks` in a current Codex CLI session and confirm all six show as trusted -- Codex will not
+   **[shell-verifiable]** count seven hook-script references (six distinct scripts) across
+   `SessionStart`/`PostToolUse`/`Stop` in the exported candidate's `hooks/hooks.json`. **[LIVE host session required, Codex only]** open
+   `/hooks` in a current Codex CLI session and confirm all seven show as trusted -- Codex will not
    dispatch an untrusted command hook. Claude Code has no separate hook-trust step: its **core
    lifecycle hooks are registered in the project's settings by `init_repo.py`** (per repository,
    step 0), while the coordination auto-attach hook is plugin-provided.

@@ -281,6 +281,14 @@ print(html.escape(" ".join(value.split()), quote=True).replace("|", "&#124;"))
 mycelium_emit_stop_block() {
   local reason="$1"
   local escaped_reason=""
+  local helper="${BASH_SOURCE[0]%/*}/../scripts/stop_retry_budget.py"
+  MYCELIUM_STOP_BLOCKED=true
+  # The cap spans changing reasons and does not trust stop_hook_active. Hooks
+  # are bookkeeping, and unresolved bookkeeping must not buy endless turns.
+  if ! python3 "$helper" "$STATE_DIR" "${HOST_SESSION_ID:-legacy}" claim "$reason"; then
+    return 0
+  fi
+  reason="$reason Automatic Stop prompts are limited to two per session; unresolved state is retained in .mycelium/stop-retry-*.json for repair."
   escaped_reason=$(printf '%s' "$reason" | python3 -c \
     'import json, sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null) || return 1
   printf '{"decision": "block", "reason": %s}\n' "$escaped_reason"
