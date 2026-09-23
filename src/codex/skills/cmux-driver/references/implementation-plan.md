@@ -41,6 +41,7 @@ Before the first implementation dispatch, the plan or a linked handoff addendum 
    early integration smoke result where applicable. Mark independent authorized work that may
    continue while a response is pending. Changed assumptions, repeated failures or unexpected cost
    trigger an additional scoped checkpoint within remaining authorized capacity, never a timer.
+   Every substantive milestone also carries a work order ([below](#milestone-work-orders)).
 6. **Allowances and stop rules:** bounded shared dispatch/review/repair capacity for initial missing
    consultations, each named checkpoint, targeted verification and smoke calls, with owned reviewer
    deadlines and task expiry where applicable. Astra review launches consume review AND work
@@ -52,12 +53,49 @@ Before the first implementation dispatch, the plan or a linked handoff addendum 
    disagreements. Obtain owner input only for decisions outside authority; in-scope agreed repairs
    and remaining work continue. Finish after required checks and authorized release, then stop.
 
+## Milestone work orders
+
+Each substantive milestone gives Sol a compact work order to relay. That order, plus the exact
+versioned references it cites (plan version/hash, file paths, receipts, message ids), must be
+enough to resolve the active milestone without reconstructing a transcript. Link shared requirements
+(authority, acceptance, allowances, gates) instead of copying the plan. No fixed prose format or
+step count; a field may be an exact reference.
+
+1. **Outcome and surface:** the observable result and the components/interfaces it touches.
+2. **Decisions:** fixed decisions and invariants, and the choices explicitly delegated to Opus.
+3. **Ordering:** prerequisites, the critical order, and work that is independent and may proceed.
+4. **Verification:** the concrete checks, their expected results and the evidence to retain.
+5. **Continuation:** conditions to continue, to repair in scope, to hold, or to consult
+   Astra/Fable (the declared dual checkpoint).
+
+Name the next milestone and the hold that depends on this one's evidence, where applicable.
+
+**Proportionality.** Specify finer ordering only at boundaries where an error invalidates later
+work or wastes allowance: architecture choices, scientific definitions/gates, destructive or
+external actions (publishing, deletion, remote writes) and scarce calls (canaries, paid or
+rate-limited runs). Elsewhere, do not prescribe command scripts, file-by-file edits, per-step
+timeboxes or a review at every coding step; ordinary local implementation choices stay with Opus.
+This adds no panel, approval stage, runtime schema, router or budget; routine well-scoped tasks
+stay lightweight, and the dual consultations, frozen acceptance, scientific gates and shared
+allowances above are unchanged.
+
+**Example (already-authorized configuration transition).** Order: establish the required session
+state and commit the setting, then spend the reserved canary call, then use that call's response to
+confirm the effective runtime behavior before advancing. The setting's requested and UI-applied
+evidence is recorded first; runtime confirmation can only come from the call that produces it, so it
+is not demanded before that call, and the milestone does not advance until it arrives.
+
 ## Adoption check
 
-The planning lead checks these items locally before declaring a plan execution-ready. Reuse an
+The planning lead checks these items locally before declaring a plan execution-ready. Every
+substantive milestone must have the five work-order fields (or exact references to them), and any
+unresolved prerequisite must be stated explicitly. Reuse an
 already agreed owner/Astra/Fable plan and its consultation evidence. If an older plan lacks a role,
 route, allowance or a required consultation, add a compact execution addendum and obtain only the
-missing scoped feedback; do not restart planning or rewrite frozen acceptance. Missing required
+missing scoped feedback; do not restart planning or rewrite frozen acceptance. The same applies to
+missing milestone work-order fields: a compact versioned addendum supplies only the missing material
+and preserves frozen acceptance, prior evidence and allowances. Completed plans are not rewritten,
+and a finished run gains no retroactive requirements. Missing required
 decisions or capacity blocks the dependent phase, never silently removes a checkpoint. Report
 unavailable counterparts as pending, not consulted.
 

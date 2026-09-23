@@ -7,6 +7,9 @@ Task: [observable desired outcome]
 Context: [only facts needed for this work; exact input/spec/revision references; paths instead of full history]
 Constraints: [hard boundaries and applicable authorization; preserve unrelated work]
 Execution plan: [versioned contract; Sol supervisor / Opus executor; Astra + Fable milestone routes, holds and shared allowances; omit for routine work]
+Milestone: [active milestone id + its work order or exact versioned reference (plan vN/hash#milestone):
+           outcome/interfaces, fixed vs delegated decisions, ordering, checks+evidence, continue/repair/hold/consult;
+           next milestone and its dependent hold; omit for routine work]
 Done when: [behavior plus the exact test/build/check, or ask Claude to identify the
            repository's canonical check if it is not yet known]
 Autonomy: Make routine in-scope decisions and complete the authorized work.
@@ -73,6 +76,12 @@ target:
   worktree_realpath: <path>
   bound_at: <timestamp>
 objective: <current requested outcome>
+active_milestone:            # substantial plans only; omit for routine work
+  id: <milestone id>
+  work_order_ref: <plan version/hash + section, or relayed work-order message id>
+  next_milestone: <id or none>
+  dependent_hold: <what waits on this milestone's evidence / checkpoint, or none>
+  unresolved_prerequisites: [<explicit list, or empty>]
 accepted_scope: <current boundaries, including exact user corrections>
 authorization:
   source: <user message or retained ratification reference>

@@ -165,7 +165,11 @@ require this panel; explicit owner choices and ratified project gates take prece
 
 **Before execution.** Use [the implementation-plan contract](implementation-plan.md) to record the
 versioned plan, fixed acceptance, role/model/effort handoff, milestone evidence, consultation routes,
-dependent holds and bounded allowances. An already agreed plan is reused: retain its decisions and
+dependent holds and bounded allowances, with a work order for every substantive milestone
+([Milestone work orders](implementation-plan.md#milestone-work-orders)). Relay the active milestone's
+work order with exact versioned references in the brief's `Milestone:` line and the checkpoint's
+`active_milestone`; after a dual checkpoint, the reconciled work order for the next milestone is the
+one relayed order. An already agreed plan is reused: retain its decisions and
 consultation evidence, and get only missing scoped feedback. The owner can switch the same Codex
 task from Astra to Sol, carrying a compact handoff. Select and verify the actual model and effort;
 prose saying "act as Sol" is not a model switch. Do not silently change saved global defaults.
