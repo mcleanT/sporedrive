@@ -1,4 +1,4 @@
-# Two communication modes for the triangle — design v1.1 (2026-11-23, not built)
+# Two communication modes for the triangle — design v1.2 (2026-11-23, owner approved build: "go ahead - handle it")
 
 Owner requirement (verbatim, 2026-11-23): "we need to have 2 different modes of communication. in one, we create a
 transient, headless session for the respective calls, this is especailly relevant for reviews. in the other, we have a
@@ -45,6 +45,12 @@ v1 applies those findings and an advisor check. v0 + review: scratchpad `twomode
   refused (the adapters clear their output path at start, claude_ask.sh:39-41, agy_ask.py:153-160).
 - `--post-to` posts exactly one `report` from the CLI process itself, using the caller's `--cap-file` capability
   (answer as `artifact_ref`, receipt sha256 as evidence). Deterministic code posts; the target never does.
+- **v1.2: MCP `consult_post(task_id, sender, reply_to, call_dir, message_id?)`** for callers attached through MCP. Their
+  capability lives only in their MCP server process (sendcap.py:10-13: MCP tools never return it), so they have nothing
+  to put in `--cap-file`. The tool launches nothing: it reads the finished call directory's `receipt.json` (and
+  `answer.md` when ANSWERED), checks the receipt's recorded sha256 of the answer, and sends exactly one `report` from
+  the server process. A non-ANSWERED call posts a `report` that states the outcome (CANNOT-EVALUATE), never an empty
+  answer. Not in `ADVISORY_ALLOWED_TOOLS`.
 - **Antigravity does not start calls in this build** (it has no shell route and is advisory). It can still ask Claude or
   Codex through the board (`consult_request`), as in the 9/9 app test. Letting it start calls later needs a fixed-argv,
   non-authority launch path — an owner decision.
@@ -52,7 +58,7 @@ v1 applies those findings and an advisor check. v0 + review: scratchpad `twomode
 ### 2.2 Launch per target host
 | | Codex | Claude Code | Antigravity |
 |---|---|---|---|
-| Command | NEW `src/consult/codex_call.sh`: `/opt/homebrew/bin/codex exec --ignore-user-config --ephemeral --sandbox read-only --disable hooks --json -C <cwd> -m M -c model_reasoning_effort=E -o <last> -` (direct binary, not the cmux shim) | `src/consult/claude_ask.sh` as is | `src/consult/agy_ask.py` as is (ACP, fresh `--gemini-dir`, `mcpServers: []`) |
+| Command | NEW `src/consult/codex_call.sh`: `/opt/homebrew/bin/codex exec --ignore-user-config --ephemeral --skip-git-repo-check --sandbox read-only --disable hooks --json -C <cwd> -m M -c model_reasoning_effort=E -o <last> -` (direct binary, not the cmux shim; `--skip-git-repo-check` needed outside a git/trusted dir, probe) | `src/consult/claude_ask.sh` as is | `src/consult/agy_ask.py` as is (ACP, fresh `--gemini-dir`, `mcpServers: []`) |
 | Answer evidence | non-empty `-o` file + exit 0 + `turn.completed` in the JSON stream | `result` success, not `is_error` (claude_ask.sh:100) | `stopReason == end_turn`, non-empty (agy_ask.py:293-305) |
 | Files read | lower-bound heuristic from `command_execution` events (cat/sed/head/rg on a named path, inside `/bin/zsh -lc '…'`); misses directory-wide rg, python reads etc. → `coverage_source: "codex-commands"` | tool events → `"tool-events"` | permission/tool events → `"tool-events"` |
 
@@ -60,7 +66,9 @@ All targets: cwd = the packet's `scope.repo_realpath` (`$HOME` and host config d
 connection and no coordination MCP server (Codex keeps its built-in `codex_apps`, evidence m5-probes Q2).
 
 **Environment** (fixes jobs.py:430, which copies the whole environment): the dispatcher launches the target with an
-allowlist — PATH, HOME, USER, LANG, TMPDIR plus the host's auth variables (exact list fixed by the M2 smoke) — strips
+allowlist — PATH=`~/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin` (real binaries, never the cmux shims),
+HOME, USER, LOGNAME, LANG, TMPDIR; no auth variables are needed (v1.2 probe: all three hosts ANSWERED under exactly
+this list, evidence/two-modes-probe/README.txt; HOME is required) — strips
 every other `MYCELIUM_*` variable, and sets three explicitly: `MYCELIUM_COORD_ADVISORY=1` (any coordination CLI the
 target runs is adviser-limited), `MYCELIUM_COORD_DIR=<empty per-call dir>` (it cannot fall back to the default live
 store, store.py:74-75) and `MYCELIUM_CONSULT_TARGET=1` (`consult call` refuses to run inside a target: no recursion).
@@ -166,15 +174,18 @@ Member role `observer`; sends limited to `ADVISORY_ALLOWED_SEND_KINDS` (model.py
     `MYCELIUM_*` keys; Codex: read extraction lists the named file (else the smoke fails, not "coverage 0");
     no-recursion: a target told to run `mycelium-coord consult call` is refused (`MYCELIUM_CONSULT_TARGET`). A "sentinel in an unnamed
     file is absent" check tests model restraint, not confinement, and is labelled so.
-  - Link: Claude ↔ headless Codex (send, wake, ack in store); headless wake does not stale the link; Antigravity App
-    observer link (poll, reply on next turn); rebind to another session → `link_stale`.
+  - Link: Claude ↔ headless Codex (send, wake, ack in store); headless wake does not stale the link (≤3 attempts;
+    a run where Codex never reaches the board counts as UNMEASURED, not a link failure; the server side is recorded
+    with the wire recorder); Antigravity observer link driven over ACP with the board server passed per session
+    (`session/new` mcpServers, as evidence/m7-drill/acp_drive.py) — no host-config edit; the App's own board access is
+    already shown by the 9/9 app test; rebind to another session → `link_stale`.
 
 ## 6. Milestones (token estimates) and owner decisions
 | # | Deliverable | Check | Est. |
 |---|---|---|---|
 | M1 | consult.py core + fake-host tests | Betty unit pass | ~200k |
 | M2 | three adapters live (codex_call new) | per-host call smoke from receipts | ~200k |
-| M3 | CLI front end + owned-job use + post | one posted report with correct reply_to on the scratch store | ~100k |
+| M3 | CLI front end + owned-job use + post (`--post-to` and MCP `consult_post`) | one report posted by an MCP-attached caller via `consult_post`, correct reply_to, on the scratch store | ~100k |
 | M4 | links + unit tests | Betty unit pass incl. legacy byte-identical | ~250k |
 | M5 | link live smokes; one scoped Codex review of M1-M5 + one repair verification | smoke evidence + review disposition | ~200k |
 
@@ -185,3 +196,7 @@ sharing — whole task (no filter).
 Review trail: v0 review (6 blocking) → v1 → one targeted repair verification (wf_3ef486c2-c4b): B1, B2, B4, A1, A4, A5
 closed; B3, B5, B6, A2, A3 partly closed and one new defect (MCP launch vs jobs.py CLI-only rule) — all addressed in
 this revision (v1.1) by the edits in §1, §2.1, §2.2, §2.4, §3.2, §5. No further review run.
+
+v1.2 (after owner approval): pre-build probe (evidence/two-modes-probe) fixed the environment list and added
+`--skip-git-repo-check`; restored a post-only MCP tool (`consult_post`) because MCP-attached callers cannot supply a
+`--cap-file`; Antigravity link member over ACP with per-session MCP (no host-config edit); bounded headless-Codex smoke.
