@@ -24,6 +24,8 @@ from __future__ import annotations
 import json
 from typing import Optional
 
+from .model import HOST_KINDS
+
 MCP_HOST_YIELD_S = 30.0  # observed DEFAULT host yield for a direct MCP tool call (fallback only)
 MCP_SAFE_MARGIN_S = 5.0  # headroom so the tool returns before the host yields
 MCP_SAFE_WAIT_S = MCP_HOST_YIELD_S - MCP_SAFE_MARGIN_S  # 25 s: the truthful short FALLBACK
@@ -127,8 +129,41 @@ def model_requests(horizon_s: float, inner_s: float) -> int:
     return n + (1 if h - n * inner > 1e-9 else 0)
 
 
+HOSTS = HOST_KINDS
+ANTIGRAVITY_NOTE = ("antigravity: no measured outer-allowance mechanism for either route; use the MCP "
+                    "in-tool route at the 25 s default cap (host yield 30 s). Its shell route is "
+                    "UNMEASURED, so no 50 s shell wait is promised")
+
+
+def _antigravity_pattern(task_id, participant_id, after_seq, job_id) -> dict:
+    tool = "job_join" if job_id else "coord_wait"
+    args = ({"job_id": job_id} if job_id else
+            {"task_id": task_id, "participant_id": participant_id, "after_seq": int(after_seq)})
+    args["timeout_s"] = int(MCP_SAFE_WAIT_S)
+    plan = plan_wait("mcp", MCP_SAFE_WAIT_S)
+    return {
+        "route": "mcp", "host": "antigravity", "inner_s": MCP_SAFE_WAIT_S, "outer_s": MCP_HOST_YIELD_S,
+        "call": {"tool": tool, "args": args, "note": ANTIGRAVITY_NOTE},
+        "plan": plan, "shell_route": "unmeasured",
+        "model_requests_per_50s": model_requests(50.0, MCP_SAFE_WAIT_S),
+        "fallback_inner_s": MCP_SAFE_WAIT_S,
+        "fallback_model_requests_per_50s": model_requests(50.0, MCP_SAFE_WAIT_S),
+        "preferred": False,
+    }
+
+
+def _check_host(host: Optional[str]) -> Optional[str]:
+    if host is None:
+        return None
+    host = str(host).strip().lower()
+    if host not in HOSTS:
+        raise ValueError("unknown host %r (expected one of %s)" % (host, ", ".join(HOSTS)))
+    return host
+
+
 def preferred_pattern(route: str, *, task_id: str = "TASK", participant_id: str = "PARTICIPANT",
-                      after_seq: int = 0, job_id: Optional[str] = None) -> dict:
+                      after_seq: int = 0, job_id: Optional[str] = None,
+                      host: Optional[str] = None) -> dict:
     """The reusable exact pattern for a long wait on ``route`` (no per-interval planning call):
     inner 50 s / outer 60 s, with the literal host call shape and the request count it costs over
     a 50 s horizon (1) versus the 25 s fallback (2). The outer allowance in ``call`` is the real
@@ -137,6 +172,8 @@ def preferred_pattern(route: str, *, task_id: str = "TASK", participant_id: str 
     route = str(route or "").strip().lower()
     if route not in ROUTES:
         raise ValueError("unknown wait route %r (expected one of %s)" % (route, ", ".join(ROUTES)))
+    if _check_host(host) == "antigravity":
+        return _antigravity_pattern(task_id, participant_id, after_seq, job_id)
     inner, outer = PREFERRED_INNER_S, PREFERRED_OUTER_S
     if route == "cli":
         cmd = ("mycelium-coord job-join %s --timeout %d" % (job_id, int(inner)) if job_id else
@@ -233,14 +270,26 @@ def plan_wait(
 
 
 def check_wait(route: str, inner_s: float, outer_s: Optional[float] = None, *,
-               host_yield_s: Optional[float] = None) -> dict:
+               host_yield_s: Optional[float] = None, host: Optional[str] = None) -> dict:
     """Check a caller's chosen inner/outer pair against the plan. ``ok`` is True only when the
     inner wait is within the safe cap (mcp) or the outer allowance covers inner + margin (cli).
     Never raises for an unsafe pair — it reports it, with the corrected plan attached."""
-    plan = plan_wait(route, inner_s, host_yield_s=host_yield_s)
+    if _check_host(host) == "antigravity" and str(route or "").strip().lower() == "cli":
+        plan = plan_wait("cli", inner_s)
+        return {"ok": False, "host": "antigravity", "shell_route": "unmeasured", "plan": plan,
+                "problem": ANTIGRAVITY_NOTE}
+    ag = _check_host(host) == "antigravity"
+    # antigravity: a caller-supplied host_yield_s never raises the cap (25 s default applies)
+    # a caller may only LOWER the antigravity yield: effective = min(host_yield_s, MCP_HOST_YIELD_S)
+    hy = host_yield_s
+    if ag and hy is not None:
+        hy = min(float(hy), MCP_HOST_YIELD_S)
+    plan = plan_wait(route, inner_s, host_yield_s=hy)
     inner = float(inner_s)
     if plan["route"] == "mcp":
         ok = inner <= plan["applied_s"]
+        if ag:
+            ok = ok and inner <= 25.0
         problem = None if ok else (
             "inner wait %.1fs exceeds the safe MCP cap %.1fs (host yield %.1fs - %.1fs margin)"
             % (inner, plan["applied_s"], plan["host_yield_s"], plan["safe_margin_s"]))
@@ -253,4 +302,9 @@ def check_wait(route: str, inner_s: float, outer_s: Optional[float] = None, *,
             problem = None if ok else (
                 "outer allowance %.1fs is below inner %.1fs + %.1fs margin"
                 % (float(outer_s), inner, CLI_OUTER_MARGIN_S))
-    return {"ok": ok, "problem": problem, "plan": plan}
+    res = {"ok": ok, "problem": problem, "plan": plan}
+    if ag:
+        if not ok and problem is None:
+            res["problem"] = "inner wait %.1fs exceeds the antigravity 25 s cap" % inner
+        res.update({"host": "antigravity", "shell_route": "unmeasured", "note": ANTIGRAVITY_NOTE})
+    return res

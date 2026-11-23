@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .model import REPLY_EXPECTED_KINDS
+
 BATCH_BUDGET_BYTES = 4096
 MAX_READ_BYTES = 65536
 
@@ -24,9 +26,12 @@ def preview(value, limit=240):
 def message_view(message):
     keys = ("message_id", "seq", "kind", "sender", "recipient", "task_revision",
             "reply_to", "correlation_id", "content_hash", "actionable")
-    return {**{k: message[k] for k in keys if k in message},
+    view = {**{k: message[k] for k in keys if k in message},
             "preview": preview(message.get("text") or message.get("artifact_ref") or ""),
             "summary_only": True}
+    if message.get("kind") in REPLY_EXPECTED_KINDS:
+        view["reply_expected"] = True  # derived, not stored: answer with kind report, reply_to this id
+    return view
 
 
 def checkpoint_predates_run(checkpoint, status) -> bool:

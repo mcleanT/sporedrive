@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .execution import ExecutionManager
-from .model import ProtocolError, utcnow
+from .model import ProtocolError, authority_op, utcnow
 from .store import CoordStore, StoreError, require_id, valid_id
 from .views import encoded_size, BATCH_BUDGET_BYTES, execution_view, fit_batch, read_bounded, stops_wait
 
@@ -332,6 +332,7 @@ class JobManager:
                             envelope={"job_id": job_id, "stream": stream})
 
     # ------------------------------------------------------------------ run (CLI-only)
+    @authority_op("job-run")
     def run(self, job_id: str, argv: list, *, cwd=None, deadline_s: float = DEFAULT_DEADLINE_S,
             task_id=None, action_id=None, dispatch_identity=None, on_stop: str = "keep",
             label=None, join_s: float = 0.0, tail_bytes: int = DEFAULT_TAIL_BYTES) -> dict:
@@ -552,6 +553,7 @@ class JobManager:
             self._write_status(job_id, cur)
             return cur
 
+    @authority_op("job-cancel")
     def cancel(self, job_id: str, *, reason: str = "cancel_requested") -> dict:
         """Ask the owning supervisor to terminate ITS child (``requested`` = recorded for the
         supervisor to act on; join to see the outcome). When the supervisor is gone, recover with

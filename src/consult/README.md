@@ -1,0 +1,38 @@
+# consult adapters (M5, repair round 2)
+
+Off-bus, read-only second opinions. Neither adapter attaches to the coordination store, sends bus messages, or touches installed copies.
+
+**A `no_successful_read: true` answer is not a review.** The outcome stays `ANSWERED`, but the model never completed a read/search tool call, so it answered without looking. Callers must check the flag (receipt field) before treating the text as a review.
+
+## agy_ask.py (Antigravity, stdlib only)
+`echo PROMPT | agy_ask.py --out FILE [--cwd DIR] [--timeout 600] [--keep]`
+- Runs `agy acp --gemini-dir <fresh dir> --app-data-dir appdata`. The dir is always `mkdtemp` under the fixed base `/private/tmp/agy_ask-<uid>/` (never `$TMPDIR`; env `AGY_ASK_BASE` is a test seam). The base and the created dir are checked with a case-insensitive prefix test plus an `os.path.samefile` parent walk against `~/.gemini`; on refusal any created dir is removed and the run exits 6. Env `AGY_BIN` overrides the binary.
+- Permission policy (allowlist by ACP kind only): grant `session/request_permission` only when kind is `read` or `search` AND no deny word (write, edit, modify, replace, patch, save, create, delete, move, rename, send, execute, run, command) appears as a whole word in the title (titles are split on non-alphanumerics, so `apply_patch` and `send_message` are hit; `review`/`preview`/`global` are not). Kind `other`, empty, `execute`, `edit`, `delete`, `move`, `fetch`, `think` or anything unknown is rejected. Deny words win over kind. `allow_always` is never used. Unsure means reject.
+- Completion: ANSWERED only for `stopReason == end_turn` with a non-empty answer; any other stopReason exits 5 CANNOT-EVALUATE (recorded in `stop_reason`).
+- Host config: `~/.gemini/config/*.json` hashed before/after. Change on an otherwise ANSWERED run = exit 4 (answer kept, flagged). On exit 2/3/5/6 the code and CANNOT-EVALUATE are kept; `host_config_unchanged=false`, `host_config_changed_files` and `host_config_diff` are recorded.
+- Live finding (L1, 2026-11-22): an edit request to agy produced `session/request_permission` with kind `edit`; the adapter rejected it and the file stayed byte-identical. Tool titles are of the form `File <relative path>`, not tool names, so kind is the only usable signal.
+- Limits: read-only is enforced at the permission prompt only. agy may read any path the host allows, not only `--cwd`, and it can use tools that need no prompt.
+
+## claude_ask.sh (Claude Code 2.1.330)
+`echo PROMPT | claude_ask.sh --out FILE [--cwd DIR] [--timeout 600] [--model opus] [--effort high] [--keep]` (env `CLAUDE_BIN`, `CLAUDE_ASK_MODEL`, `CLAUDE_ASK_EFFORT`). `--model` and `--effort` are always passed. `--timeout` must be a positive integer (anything else is refused before launch with exit 5 and a CANNOT-EVALUATE receipt). `--keep` is accepted for symmetry with agy_ask; the Claude adapter always keeps its side files.
+- Flags: `-p --output-format stream-json --verbose --include-hook-events --safe-mode --restricted --strict-mcp-config --mcp-config '{"mcpServers":{}}' --tools Read,Grep,Glob --allowedTools Read,Grep,Glob --permission-mode default --no-session-persistence --disable-slash-commands`. Never `--bare` (skips keychain reads) and never a dangerous-permission flag.
+- Isolation: `--safe-mode` disables plugins, hooks, MCP, CLAUDE.md, skills; `--restricted` ignores user/project/local settings and confines file tools to the working directory. This prevents (rather than only detects) a reviewed repo's project settings from re-enabling plugins or hooks. Live check L3/L4: a project SessionStart hook fires under plain `--setting-sources project` and does not fire under claude_ask in the same directory.
+- Completion: exit 0 / ANSWERED needs a `result` event with subtype `success`, `is_error` false AND process rc 0. The answer comes only from `result.result`, never from narration. Otherwise exit 5 (exit 2 on SIGALRM), CANNOT-EVALUATE; narration text goes to `<out>.partial`.
+- Breach flags (exit 4 on an otherwise ANSWERED run, answer kept): non-empty `mcp_servers`, tools not exactly Read/Grep/Glob, any non-builtin plugin at init, any hook event in the stream, changed `~/.claude/settings(.local).json`.
+- Receipt records `effort_requested`, `model_requested`, `plugins_at_init`, `messaging_socket_path` (null under `--safe-mode` in the live run; a non-null value is the local inter-session socket, an open off-bus item), `hook_events_seen`.
+- Limits: the claude run may still create `~/.claude/projects/<cwd>/memory` despite `--no-session-persistence` (observed earlier, not re-measured under `--safe-mode`).
+
+## Output hygiene (both)
+At start `<out>`, `<out>.receipt.json` and `<out>.partial` are deleted. `<out>` is written only when ANSWERED; partial text goes to `<out>.partial`. A CANNOT-EVALUATE receipt is written on every exit path once `--out` is known, including argument errors and unsafe dirs.
+
+## Side files (claude_ask.sh)
+Next to `<out>` the script always leaves `<out>.stream.jsonl` (the raw stream-json run, kept as evidence), `<out>.stderr` and `<out>.receipt.json`; `<out>.partial` appears when there is narration but no complete answer. They are never removed by the script (a rerun with the same `--out` deletes `<out>`, the receipt and the partial first). Count the output directory accordingly. agy_ask.py writes its receipt and partial only, and removes its fresh gemini dir unless `--keep`.
+
+## Exit codes (both)
+0 ANSWERED; 2 timeout; 3 empty answer; 4 breach / host config change on an otherwise ANSWERED run (answer kept); 5 protocol, spawn, incomplete run, stopReason other than end_turn, or argument error; 6 refused unsafe dir; 7 the answer could not be written to `<out>` (outcome `ANSWER-WRITE-FAILED`, no answer file exists, receipt written). No complete answer never exits 0. Outcome is `ANSWERED` or `CANNOT-EVALUATE`, except `ANSWER-WRITE-FAILED` with exit 7.
+
+## Receipt (`<out>.receipt.json`)
+adapter, host, agy_version | claude_version, model_reported, session_id, started_at, ended_at, duration_s, outcome, reason, answer_chars, stop_reason (agy), tool_calls[{kind,title,status,paths}], files_read[] (only kind read/search with status completed), no_successful_read, permissions_rejected[{kind,title}], permissions_granted[], host_config_unchanged, gemini_dir, kept. Claude adds mcp_servers_at_init, tools_at_init, plugins_at_init, messaging_socket_path, hook_events_seen, model_requested, effort_requested, cwd, stream.
+
+## Tests
+`coordination/tests/test_consult_adapters.py` with fake agy / fake claude fixtures (fake_claude logs argv; the tests assert the isolation flags). Uses a throwaway HOME, never the real `~/.gemini`. Run on Betty only (never on this Mac). Recorded results: the 33 consult-adapter ids passed in the round-2 full suite (402 passed, 1 known flake, 3 skipped; docs/triangle/evidence/betty/round2-full-suite.txt), with 1 consult test skipped on Linux by design (macOS fixed-base check), and they pass again in the M7 lock-fix suite (docs/triangle/evidence/betty/m7-lockfix2-full-suite.txt, 695 passed). The review repairs (docs/triangle/evidence/betty/review-repair-full-suite.txt) add the answer-write-failure and `--timeout` tests (`coordination/tests/test_review_repairs.py`).

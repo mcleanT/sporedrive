@@ -79,6 +79,8 @@ async def coord_create_task(
     authorization_ref: str | None = None,
     revision: int = 0,
     title: str = "",
+    protocol_features: list[str] | None = None,
+    message_budget: dict | None = None,
 ) -> dict:
     """Create-or-return an authorized coordination task. Idempotent; never resets an existing task.
 
@@ -89,6 +91,11 @@ async def coord_create_task(
         authorization_ref: Owner authorization reference (recorded, never a grant).
         revision: Initial task revision.
         title: Human title.
+        protocol_features: Opt-in features: "triangle-kinds" allows review_request/consult_request/report
+            messages (without it those kinds are refused with kind_requires_feature); "codex-exec-wake"
+            allows the headless Codex wake route (only for a Codex participant attached with wake=headless).
+        message_budget: Opt-in reply budget {"per_correlation": N, "per_sender": M}; sends beyond it
+            are refused with message_budget_exceeded (supervisors exempt from per_correlation).
     """
     return await asyncio.to_thread(
         lambda: _wrap(
@@ -100,6 +107,8 @@ async def coord_create_task(
                 authorization_ref=authorization_ref,
                 revision=revision,
                 title=title,
+                protocol_features=protocol_features,
+                message_budget=message_budget,
             ),
         )
     )
@@ -125,7 +134,10 @@ async def coord_attach(
         participant_id: Stable participant id.
         role: supervisor | executor | observer.
         worktree_realpath: Participant's canonical worktree (executor must match the task's).
-        host: Native identity object: {host: claude|codex|..., session: <id>, native_id: <id>}.
+        host: Native identity object: {host: claude|codex|antigravity, session: <id>, native_id: <id>}.
+            Add "wake": "headless" to a Codex participant that is a machine-only headless thread, so
+            `codex exec resume` may wake it (needs the codex-exec-wake task feature); any other value or
+            no marker means the participant is never woken.
         allow_transition: Permit a controlled rebind to a new identity/role.
     """
     return await asyncio.to_thread(
@@ -170,7 +182,10 @@ async def coord_send(
         message_id: Idempotency key ([A-Za-z0-9._:-], <=120).
         sender: Attached sender participant id.
         recipient: A participant id, a role, or 'all' (this task only).
-        kind: task|amendment|review_finding|progress|blocker|question|checkpoint_request|checkpoint_ready|completion_receipt|acknowledgment.
+        kind: task|amendment|review_finding|progress|blocker|question|checkpoint_request|checkpoint_ready|completion_receipt|acknowledgment,
+            plus the triangle kinds review_request|consult_request|report. The triangle kinds are accepted only on a
+            task created with protocol_features ["triangle-kinds"], otherwise the send is refused (kind_requires_feature).
+            A review_request or consult_request expects an answer: reply with kind report and reply_to that request.
         task_revision: Task revision this message pertains to.
         text: Bounded inline body (<=8000 chars) — or use artifact_ref.
         artifact_ref: Immutable artifact reference instead of inline text.
@@ -220,6 +235,8 @@ async def coord_inbox(
     """Bounded read of messages addressed to this participant with seq > after_seq. Does NOT consume
     and does NOT move the stored cursor. Compact summaries are the default. Use coord_read_message
     for a selected full body before acting; summaries are not complete briefs or acceptance evidence.
+    A message of kind review_request or consult_request carries reply_expected=true (derived, not
+    stored): answer it with a message of kind report whose reply_to is that request's message_id.
 
     Args:
         task_id: Task id.
@@ -244,6 +261,8 @@ async def coord_inbox(
 async def coord_read_message(task_id: str, participant_id: str, message_id: str) -> dict:
     """Read ONE complete addressed message selected from a compact inbox/resume. No acknowledgment.
     content_hash hashes the message envelope, not a referenced file. Verify file hashes separately.
+    A review_request or consult_request carries reply_expected=true: reply with kind report, reply_to
+    this message_id.
     """
     return await asyncio.to_thread(lambda: _wrap(
         "coord_read_message", lambda: _co().read_message(task_id, participant_id, message_id)))
@@ -300,7 +319,8 @@ async def coord_wait(
 
 @mcp.tool(title="Wait Plan", annotations=_READ)
 async def wait_plan(route: str, timeout_s: float | None = None, outer_s: float | None = None,
-                    host_yield_s: float | None = None, preferred: bool = False) -> dict:
+                    host_yield_s: float | None = None, preferred: bool = False,
+                    host: str | None = None) -> dict:
     """Pure, clock-free wait-budget adapter (the one documented pattern for both routes). With
     preferred=true (or no timeout_s) it returns the REUSABLE preferred call shape — inner 50 s under
     an explicit 60 s outer allowance (cli: the shell call's timeout pragma; mcp: host_yield_s=60) —
@@ -316,11 +336,13 @@ async def wait_plan(route: str, timeout_s: float | None = None, outer_s: float |
         outer_s: The outer shell allowance you intend to pass (cli route).
         host_yield_s: Configured host tool-call yield, if known (mcp route).
         preferred: Return the preferred 50/60 pattern instead of checking a pair.
+        host: claude | codex | antigravity. antigravity returns the MCP in-tool 25 s fallback and
+            reports its shell route as unmeasured.
     """
     try:
         if preferred or timeout_s is None:
-            return preferred_pattern(route)
-        return check_wait(route, timeout_s, outer_s, host_yield_s=host_yield_s)
+            return preferred_pattern(route, host=host)
+        return check_wait(route, timeout_s, outer_s, host_yield_s=host_yield_s, host=host)
     except ValueError as e:
         raise ToolError("invalid_wait_plan: %s" % e)
 
@@ -606,6 +628,59 @@ async def coord_notify_via_bridge(
                 expected_revision=expected_revision,
                 accept_timeout_s=accept_timeout_s,
                 execution_action_id=execution_action_id,
+            ),
+        )
+    )
+
+
+@mcp.tool(title="Coord Wake", annotations=_WRITE)
+async def coord_wake(
+    task_id: str,
+    message_id: str,
+    sender: str,
+    binding_id: str | None = None,
+    controller_id: str | None = None,
+    expected_revision: int | None = None,
+    accept_timeout_s: float = 12.0,
+    execution_action_id: str | None = None,
+    timeout_s: float | None = None,
+) -> dict:
+    """Wake the ONE recipient of a stored message through its host route; the target comes only from the
+    recipient's stored participant record. Outcome: accepted | uncertain | unavailable | not_supported |
+    refused:<reason>; only accepted is a delivery, and an accepted/uncertain receipt is never re-run (a
+    retry is a billed model turn). Claude recipients use the cmux bridge (pass the bridge arguments);
+    Codex recipients use `codex exec resume` only when the task opted in (codex-exec-wake) and the
+    participant is marked wake=headless; Antigravity is next-turn inbox only (not_supported). Refused in
+    an advisory process.
+
+    Args:
+        task_id: Task id.
+        message_id: Message to wake the recipient for (single concrete recipient; kinds task,
+            review_request, consult_request).
+        sender: The attached participant requesting the wake.
+        binding_id: Claude route only: bridge writer binding for the recipient.
+        controller_id: Claude route only: stable controller id.
+        expected_revision: Claude route only: last observed bridge binding revision.
+        accept_timeout_s: Claude route only: seconds to wait for bridge correlation.
+        execution_action_id: Claude route only: managed dispatch reservation.
+        timeout_s: Codex route only: run timeout in seconds, finite in (0, 900] (default 240); anything else is rejected before any side effect.
+    """
+    from .wake import wake_recipient
+
+    return await asyncio.to_thread(
+        lambda: _wrap(
+            "coord_wake",
+            lambda: wake_recipient(
+                _co(),
+                task_id,
+                message_id,
+                sender=sender,
+                binding_id=binding_id,
+                controller_id=controller_id,
+                expected_revision=expected_revision,
+                accept_timeout_s=accept_timeout_s,
+                execution_action_id=execution_action_id,
+                timeout_s=timeout_s,
             ),
         )
     )
@@ -1575,6 +1650,47 @@ async def job_output(
                                  budget=budget),
         )
     )
+
+
+# Advisory allowlist: the ONLY tools an advisory process exposes. The core gate is the real control.
+ADVISORY_ALLOWED_TOOLS = frozenset((
+    "coord_create_task", "coord_attach", "coord_send", "coord_inbox", "coord_read_message", "coord_wait",
+    "wait_plan", "coord_ack", "coord_message_state", "coord_set_cursor", "coord_checkpoint_read",
+    "coord_resume", "coord_participants", "coord_list_tasks", "coord_find_recipients",
+    "coord_list_sessions", "coord_detach", "execution_read", "execution_status", "execution_receipt",
+    "execution_evidence", "sched_plan", "sched_verify", "job_status", "job_join",
+    "job_list", "job_output",
+))
+
+
+def _hide_authority_tools() -> list[str]:
+    """In an advisory process, drop the authority/drive tools from the tool list. The core gate
+    (model.require_authority) still refuses them if called by any other path."""
+    from .model import advisory_process
+
+    removed: list[str] = []
+    if not advisory_process():
+        return removed
+    try:
+        listed = [getattr(t, "name", t) for t in asyncio.run(mcp.list_tools())]
+    except Exception:
+        listed = []
+    for name in [n for n in listed if n not in ADVISORY_ALLOWED_TOOLS]:
+        # FastMCP 2.x: mcp.remove_tool; 3.x/4.x: mcp.local_provider.remove_tool.
+        for owner in (mcp, getattr(mcp, "local_provider", None)):
+            fn = getattr(owner, "remove_tool", None)
+            if fn is None:
+                continue
+            try:
+                fn(name)
+                removed.append(name)
+                break
+            except Exception:
+                continue  # not removable here: stays listed but refused by the core gate
+    return removed
+
+
+_hide_authority_tools()
 
 
 def main() -> None:

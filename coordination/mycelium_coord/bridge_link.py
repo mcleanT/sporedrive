@@ -27,7 +27,7 @@ from .execution import (
     STATUS_COMPLETED,
     STATUS_CLOSED,
 )
-from .model import ProtocolError, utcnow
+from .model import ProtocolError, authority_op, utcnow
 from .store import ID_RE
 
 BRIDGE_ACCEPTED = ("accepted", "completed")
@@ -93,17 +93,21 @@ def _same_path(a, b) -> bool:
         return str(a) == str(b)
 
 
-def _norm_session(s: str) -> str:
+def _norm_session(s: str, host_kind: str | None = None) -> str:
+    """Lowercase; strip the documented "claude-" prefix ONLY for a claude host (others exact)."""
     s = str(s or "").strip().lower()
-    return s[len("claude-") :] if s.startswith("claude-") else s
+    if host_kind == "claude" and s.startswith("claude-"):
+        return s[len("claude-") :]
+    return s
 
 
 def _session_match(binding_session, host: dict) -> bool:
     """EXACT match of the full native session id (after documented host-prefix normalization).
     An abbreviated/prefix id or the PID (native_id) is NOT authority to route to a live pane
     (adapter identity follow-up)."""
-    b = _norm_session(binding_session)
-    s = _norm_session(host.get("session"))
+    kind = host.get("host")
+    b = _norm_session(binding_session, kind)
+    s = _norm_session(host.get("session"), kind)
     return bool(b and s and b == s)
 
 
@@ -203,6 +207,7 @@ def _notification_line(task_id: str, msg: dict) -> str:
     return line if len(line) <= _SINGLE_LINE_MAX else line[:_SINGLE_LINE_MAX]
 
 
+@authority_op("coord_notify_via_bridge")
 def notify_via_bridge(
     co,
     *,

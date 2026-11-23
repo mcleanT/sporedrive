@@ -52,7 +52,7 @@ import json
 import re
 import os
 
-from .model import ProtocolError
+from .model import ProtocolError, authority_op
 from .store import CoordStore, require_id, utcnow
 
 EXEC_SCHEMA_VERSION = "1.0.0"
@@ -518,6 +518,7 @@ class ExecutionManager:
             return {"ok": False, "reason": "execution_not_found"}
         return self._dispatchable(rec, action_id, dispatch_identity, expected_purpose)
 
+    @authority_op("exec.claim_dispatch")
     def claim_dispatch(
         self,
         task_id: str,
@@ -792,6 +793,7 @@ class ExecutionManager:
         return out
 
     # ------------------------------------------------------------------ open (idempotent)
+    @authority_op("execution_open")
     def open_execution(
         self,
         task_id: str,
@@ -995,6 +997,7 @@ class ExecutionManager:
         usage["work_dispatches"] = usage.get("work_dispatches", 0) + 1
 
     # ------------------------------------------------------------------ reserve / settle (work)
+    @authority_op("exec.reserve")
     def reserve(
         self,
         task_id: str,
@@ -1055,6 +1058,7 @@ class ExecutionManager:
                 "execution": self._summary(rec),
             }
 
+    @authority_op("exec.settle")
     def settle(
         self,
         task_id: str,
@@ -1096,6 +1100,7 @@ class ExecutionManager:
             return {"reservation": res, "execution": self._summary(rec)}
 
     # ------------------------------------------------------------------ managed reviewer launch
+    @authority_op("exec.claim_review")
     def claim_review(
         self,
         task_id: str,
@@ -1228,6 +1233,7 @@ class ExecutionManager:
             return None
         return min(vals) if vals else None
 
+    @authority_op("exec.settle_review")
     def settle_review(
         self,
         task_id: str,
@@ -1319,6 +1325,7 @@ class ExecutionManager:
             )
         return None
 
+    @authority_op("exec.record_evidence")
     def record_evidence(
         self,
         task_id: str,
@@ -1430,6 +1437,7 @@ class ExecutionManager:
             return True
         return False
 
+    @authority_op("exec.record_completion")
     def record_completion(
         self,
         task_id: str,
@@ -1507,6 +1515,7 @@ class ExecutionManager:
             return {"idempotent": False, "execution": self._summary(rec)}
 
     # ------------------------------------------------------------------ blockers / backlog
+    @authority_op("exec.open_blocker")
     def open_blocker(
         self,
         task_id: str,
@@ -1595,6 +1604,7 @@ class ExecutionManager:
                 "execution": self._summary(rec),
             }
 
+    @authority_op("exec.resolve_blocker")
     def resolve_blocker(
         self,
         task_id: str,
@@ -1623,6 +1633,7 @@ class ExecutionManager:
             self._audit(task_id, "resolve_blocker", {"blocker_id": blocker_id})
             return {"blocker": found, "execution": self._summary(rec)}
 
+    @authority_op("exec.add_backlog")  # writes state_version: refused in advisory processes
     def add_backlog(
         self, task_id: str, *, item: str, source=None, expected_state_version=None
     ) -> dict:
@@ -1662,6 +1673,7 @@ class ExecutionManager:
                 rec.get("accepted_evidence", {}).pop(cid, None)
         rec["acceptance_freeze"] = None
 
+    @authority_op("exec.reserve_call")
     def reserve_call(
         self,
         task_id: str,
@@ -1756,6 +1768,7 @@ class ExecutionManager:
                 "execution": self._summary(rec),
             }
 
+    @authority_op("exec.settle_call")
     def settle_call(
         self,
         task_id: str,
@@ -1824,6 +1837,7 @@ class ExecutionManager:
             "requested_at": utcnow(),
         }
 
+    @authority_op("exec.request_shutdown")
     def request_shutdown(
         self, task_id: str, *, reason: str = "expiry", expected_state_version=None, run=None
     ) -> dict:
@@ -1845,6 +1859,7 @@ class ExecutionManager:
             self._audit(task_id, "request_shutdown", {"reason": reason})
             return {"execution": self._summary(rec), "shutdown": rec.get("shutdown")}
 
+    @authority_op("exec.note_expiry_shutdown")
     def note_expiry_shutdown(self, task_id: str) -> dict:
         """If the execution is expired and has no reconciled/pending shutdown yet, record a pending
         expiry shutdown intent. A no-op (no write) when not expired or already recorded — safe to call
@@ -1863,6 +1878,7 @@ class ExecutionManager:
             self._audit(task_id, "request_shutdown", {"reason": "expiry"})
             return {"noted": True, "shutdown": rec.get("shutdown")}
 
+    @authority_op("exec.reconcile_shutdown")
     def reconcile_shutdown(
         self,
         task_id: str,
@@ -1892,6 +1908,7 @@ class ExecutionManager:
             return {"idempotent": False, "execution": self._summary(rec)}
 
     # ------------------------------------------------------------------ pause / limits / phase
+    @authority_op("exec.pause")
     def pause(
         self,
         task_id: str,
@@ -1956,6 +1973,7 @@ class ExecutionManager:
         }
         return entry
 
+    @authority_op("execution_unpause")
     def unpause(
         self, task_id: str, *, authorization_ref: str, expected_state_version=None,
         scope_amendment=None,
@@ -2000,6 +2018,7 @@ class ExecutionManager:
                                              "scope_amendment": bool(scope_amendment)})
             return {"execution": self._summary(rec)}
 
+    @authority_op("execution_change_limits")
     def change_limits(
         self,
         task_id: str,
@@ -2080,6 +2099,7 @@ class ExecutionManager:
         }
         return hashlib.sha256(json.dumps(body, sort_keys=True).encode("utf-8")).hexdigest()
 
+    @authority_op("execution_owner_request")
     def owner_request(
         self,
         task_id: str,
@@ -2269,6 +2289,7 @@ class ExecutionManager:
             return {"idempotent": False, "run": new_no, "prior_run": prior_no, "request": entry,
                     "execution": self._summary(rec)}
 
+    @authority_op("exec.set_phase")
     def set_phase(
         self, task_id: str, *, phase: str, expected_state_version=None
     ) -> dict:

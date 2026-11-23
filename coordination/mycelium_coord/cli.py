@@ -85,6 +85,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--title", default="")
     p.add_argument("--revision", type=int, default=0)
     p.add_argument("--authorization", default=None)
+    p.add_argument("--feature", action="append", default=None, dest="protocol_features",
+                   help="opt-in protocol feature (repeatable): triangle-kinds enables review_request/consult_request/report (otherwise refused with kind_requires_feature); codex-exec-wake enables the headless Codex wake route")
+    p.add_argument("--message-budget", default=None, dest="message_budget",
+                   help='opt-in reply budget JSON, e.g. {"per_correlation":3,"per_sender":40}')
 
     p = sub.add_parser("task")
     p.add_argument("task_id")
@@ -120,7 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--host",
         action="append",
         default=[],
-        help="native identity k=v (host=, session=, native_id=)",
+        help="native identity k=v (host=claude|codex|antigravity, session=, native_id=; wake=headless marks a machine-only Codex thread that `wake` may resume, needs the codex-exec-wake task feature)",
     )
     p.add_argument("--allow-transition", action="store_true")
 
@@ -135,7 +139,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--id", required=True, dest="message_id")
     p.add_argument("--from", required=True, dest="sender")
     p.add_argument("--to", required=True, dest="recipient")
-    p.add_argument("--kind", required=True)
+    p.add_argument("--kind", required=True,
+                   help="task|amendment|review_finding|progress|blocker|question|checkpoint_request|checkpoint_ready|completion_receipt|acknowledgment, or review_request|consult_request|report (these three need the triangle-kinds task feature); answer a review/consult request with kind report and --reply-to it")
     p.add_argument("--revision", type=int, required=True)
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--text")
@@ -243,6 +248,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--expected-revision", type=int, required=True)
     p.add_argument("--accept-timeout", type=float, default=12.0)
     p.add_argument("--execution-action", default=None, dest="execution_action_id")
+
+    p = sub.add_parser("wake", help="wake the single recipient of a message through its host route (claude bridge, codex exec-resume, else not_supported); every outcome is recorded")
+    p.add_argument("task_id")
+    p.add_argument("message_id")
+    p.add_argument("--sender", required=True)
+    p.add_argument("--binding-id", default=None, dest="binding_id", help="claude route: bridge writer binding")
+    p.add_argument("--controller-id", default=None, dest="controller_id")
+    p.add_argument("--expected-revision", type=int, default=None, dest="expected_revision")
+    p.add_argument("--accept-timeout", type=float, default=12.0)
+    p.add_argument("--execution-action", default=None, dest="execution_action_id")
+    p.add_argument("--timeout", type=float, default=None, dest="timeout_s", help="codex route: run timeout seconds, finite in (0, 900] (default 240)")
 
     # ---- execution record (SporeDrive stopping/permission layer; same core as MCP) ----
     p = sub.add_parser("exec-open")
@@ -505,6 +521,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--job", default=None, dest="job_id")
     p.add_argument("--outer", type=float, default=None, dest="outer_s", help="outer shell allowance you intend to pass (cli)")
     p.add_argument("--host-yield", type=float, default=None, dest="host_yield_s", help="configured host tool-call yield (mcp)")
+    p.add_argument("--host", default=None, choices=list(waitpath.HOSTS), help="host shape (antigravity: MCP 25 s fallback; shell route unmeasured)")
     p = sub.add_parser("sched-plan", help="plan one intended instant (America/New_York by default); never submits")
     p.add_argument("--at", default=None, help="local wall time 'YYYY-MM-DD HH:MM[:SS]' in --tz, or an ISO instant with its own offset")
     p.add_argument("--in", dest="elapsed", default=None, help="elapsed delay from now, e.g. 90m, 1h30m, 45s, 2d")
@@ -615,6 +632,8 @@ def run(argv: list[str] | None = None) -> int:
                     title=args.title,
                     revision=args.revision,
                     authorization_ref=args.authorization,
+                    protocol_features=args.protocol_features,
+                    message_budget=(json.loads(args.message_budget) if args.message_budget else None),
                 )
             )
         elif op == "task":
@@ -704,10 +723,11 @@ def run(argv: list[str] | None = None) -> int:
             try:
                 if args.preferred or args.timeout_s is None:
                     _emit(waitpath.preferred_pattern(args.route, task_id=args.task_id,
-                                                     participant_id=args.participant_id, job_id=args.job_id))
+                                                     participant_id=args.participant_id, job_id=args.job_id,
+                                                     host=args.host))
                 else:
                     _emit(waitpath.check_wait(args.route, args.timeout_s, args.outer_s,
-                                              host_yield_s=args.host_yield_s))
+                                              host_yield_s=args.host_yield_s, host=args.host))
             except ValueError as e:
                 _emit({"ok": False, "error": "invalid_wait_plan", "detail": str(e)})
                 return 2
@@ -781,6 +801,23 @@ def run(argv: list[str] | None = None) -> int:
                     expected_revision=args.expected_revision,
                     accept_timeout_s=args.accept_timeout,
                     execution_action_id=args.execution_action_id,
+                )
+            )
+        elif op == "wake":
+            from .wake import wake_recipient
+
+            _emit(
+                wake_recipient(
+                    co,
+                    args.task_id,
+                    args.message_id,
+                    sender=args.sender,
+                    binding_id=args.binding_id,
+                    controller_id=args.controller_id,
+                    expected_revision=args.expected_revision,
+                    accept_timeout_s=args.accept_timeout,
+                    execution_action_id=args.execution_action_id,
+                    timeout_s=args.timeout_s,
                 )
             )
         elif op == "exec-open":

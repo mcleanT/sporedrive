@@ -1,0 +1,17 @@
+{
+ "session_id": "d39b5bc2-9bdc-4ddb-85b7-c452f9981b6e",
+ "transcript_path": "/home/user/.claude/projects/-private-tmp-claude-502--proj/d39b5bc2-9bdc-4ddb-85b7-c452f9981b6e.jsonl",
+ "cwd": "/work/proj",
+ "prompt_id": "cf399579-c0a5-4fc0-9e3b-be82a2df86ff",
+ "permission_mode": "acceptEdits",
+ "effort": {
+  "level": "low"
+ },
+ "hook_event_name": "PreToolUse",
+ "tool_name": "Write",
+ "tool_input": {
+  "file_path": "/work/proj/a.txt",
+  "content": "hello"
+ },
+ "tool_use_id": "toolu_01CEAptmso9jUb9vjfBAdi8j"
+}

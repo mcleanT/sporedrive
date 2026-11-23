@@ -1,0 +1,23 @@
+{
+ "artifactDirectoryPath": "/home/user/.gemini/antigravity-cli/brain/401b8209-6de7-4c7f-be4e-d8acfb9b0939",
+ "conversationId": "401b8209-6de7-4c7f-be4e-d8acfb9b0939",
+ "cwd": "/work/proj",
+ "error": "",
+ "hookEventName": "PostToolUse",
+ "lastUserInput": "Do these in order using your tools: 1) read the file /work/proj/readme.txt with your read tool; 2) list the directory /work/proj/sub with your directory listing tool; 3) write a file /work/proj/out1.txt containing hello. Then say done.",
+ "modelName": "gemini-4-neon-low",
+ "stepIdx": 7,
+ "toolCall": {
+  "args": {
+   "Content": "hello",
+   "Overwrite": true,
+   "Path": "/work/proj/out1.txt"
+  },
+  "id": "call_12107930354290645819",
+  "name": "write_file"
+ },
+ "transcriptPath": "/home/user/.gemini/antigravity-cli/brain/401b8209-6de7-4c7f-be4e-d8acfb9b0939/.system_generated/logs/transcript_full.jsonl",
+ "workspacePaths": [
+  "/work/proj"
+ ]
+}
