@@ -7,12 +7,13 @@ per invocation: state lives entirely in the CoordStore.
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import sys
 
 from .coord import Coordinator
 from .execution import ExecutionManager
-from . import schedule, waitpath
+from . import schedule, sendcap, waitpath
 from .jobs import DEFAULT_DEADLINE_S, DEFAULT_TAIL_BYTES, JOIN_MAX_S, ON_STOP_POLICIES, JobManager
 from .model import ProtocolError
 from .store import CoordStore, StoreError
@@ -76,6 +77,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="coordination state root (default MYCELIUM_COORD_DIR or ~/.local/state/mycelium/coordination)",
     )
+    ap.add_argument(
+        "--cap-file",
+        default=None,
+        help="send-capability file (default MYCELIUM_COORD_CAP_FILE): `attach` stores the participant's "
+        "capability here (mode 0600) and every other op loads it, so a later CLI call can act as a "
+        "participant on a send-capability task. Keep it private; it is never printed.",
+    )
     sub = ap.add_subparsers(dest="op", required=True)
 
     p = sub.add_parser("create-task")
@@ -86,7 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--revision", type=int, default=0)
     p.add_argument("--authorization", default=None)
     p.add_argument("--feature", action="append", default=None, dest="protocol_features",
-                   help="opt-in protocol feature (repeatable): triangle-kinds enables review_request/consult_request/report (otherwise refused with kind_requires_feature); codex-exec-wake enables the headless Codex wake route")
+                   help="opt-in protocol feature (repeatable): triangle-kinds enables review_request/consult_request/report (otherwise refused with kind_requires_feature); codex-exec-wake enables the headless Codex wake route; send-capability binds each participant to the process that attached it (CLI: keep it with --cap-file)")
     p.add_argument("--message-budget", default=None, dest="message_budget",
                    help='opt-in reply budget JSON, e.g. {"per_correlation":3,"per_sender":40}')
 
@@ -617,6 +625,13 @@ def run(argv: list[str] | None = None) -> int:
     if command is not None:
         args.argv = command
     store = CoordStore(args.root)
+    cap_file = args.cap_file or os.environ.get(sendcap.CAP_FILE_ENV) or None
+    if cap_file:
+        try:
+            sendcap.load_file(cap_file, store)
+        except StoreError as e:
+            _emit({"error": e.code, "message": e.message, "path": getattr(e, "path", "")})
+            return 3
     co = Coordinator(store)
     em = ExecutionManager(store)
     jm = JobManager(store)
@@ -662,18 +677,23 @@ def run(argv: list[str] | None = None) -> int:
                 )
             )
         elif op == "attach":
-            _emit(
-                co.attach(
-                    args.task_id,
-                    args.participant_id,
-                    role=args.role,
-                    worktree_realpath=args.worktree,
-                    host=_kv(args.host),
-                    allow_transition=args.allow_transition,
-                )
+            rec = co.attach(
+                args.task_id,
+                args.participant_id,
+                role=args.role,
+                worktree_realpath=args.worktree,
+                host=_kv(args.host),
+                allow_transition=args.allow_transition,
             )
+            kept = bool(cap_file) and sendcap.save_to_file(
+                cap_file, store, args.task_id, args.participant_id
+            )
+            _emit({**rec, "capability_file": os.path.abspath(cap_file) if kept else None})
         elif op == "detach":
-            _emit(co.detach(args.task_id, args.participant_id))
+            rec = co.detach(args.task_id, args.participant_id)
+            if cap_file:
+                sendcap.remove_from_file(cap_file, store, args.task_id, args.participant_id)
+            _emit(rec)
         elif op == "participants":
             _emit(co.list_participants(args.task_id))
         elif op == "send":

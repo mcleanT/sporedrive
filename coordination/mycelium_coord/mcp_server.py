@@ -93,7 +93,11 @@ async def coord_create_task(
         title: Human title.
         protocol_features: Opt-in features: "triangle-kinds" allows review_request/consult_request/report
             messages (without it those kinds are refused with kind_requires_feature); "codex-exec-wake"
-            allows the headless Codex wake route (only for a Codex participant attached with wake=headless).
+            allows the headless Codex wake route (only for a Codex participant attached with wake=headless);
+            "send-capability" binds each participant to the process that attached it: send, ack, set_cursor,
+            checkpoint publish, detach, wake and bridge notify from any other process are refused
+            (send_capability_required / send_capability_stale), and attaching an id whose holder process is
+            still running is refused (participant_held).
         message_budget: Opt-in reply budget {"per_correlation": N, "per_sender": M}; sends beyond it
             are refused with message_budget_exceeded (supervisors exempt from per_correlation).
     """
@@ -138,7 +142,15 @@ async def coord_attach(
             Add "wake": "headless" to a Codex participant that is a machine-only headless thread, so
             `codex exec resume` may wake it (needs the codex-exec-wake task feature); any other value or
             no marker means the participant is never woken.
-        allow_transition: Permit a controlled rebind to a new identity/role.
+        allow_transition: Permit a controlled rebind to a new identity/role. On a send-capability task it
+            also takes over an id whose holder process is still running (audited); refused in an advisory
+            process.
+
+    This server PROCESS keeps the participant's send capability in memory; it is never returned. On a
+    task with the send-capability feature (and always in an advisory process) only calls made through this
+    same server process can act as the participant; after a restart, attach again with the same identity
+    first. Sessions that share one server process (for example several Antigravity App conversations
+    served by one MCP process) share its capabilities: the binding is per process, not per conversation.
     """
     return await asyncio.to_thread(
         lambda: _wrap(

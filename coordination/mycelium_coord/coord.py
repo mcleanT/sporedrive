@@ -12,7 +12,7 @@ import json
 import os
 import time
 
-from . import model
+from . import model, sendcap
 from .model import (
     ProtocolError,
     RECIPIENT_ALL,
@@ -22,6 +22,7 @@ from .model import (
     STATE_COMPLETION_CLAIMED,
     STATE_DELIVERED,
     STATE_PERSISTED,
+    FEATURE_SEND_CAPABILITY,
     FEATURE_TRIANGLE_KINDS,
     PROTOCOL_FEATURES,
     TRIANGLE_KINDS,
@@ -651,6 +652,33 @@ class Coordinator:
                         "worktree_realpath": prev.get("worktree_realpath"),
                         "at": utcnow(),
                     }
+            # Send capability (proposal step 3): keep this process's capability when it already holds
+            # the current one; otherwise mint a new one. On an enforced task a participant whose holder
+            # process is still alive (or cannot be checked) is not taken over, except by an explicit
+            # allow_transition from a non-advisory process (audited).
+            cap_event = "minted"
+            if prev and not prev.get("detached") and sendcap.holds_current(
+                self.store, task_id, participant_id, prev
+            ):
+                p["send_cap"] = prev["send_cap"]
+                cap_event = "kept"
+            else:
+                if prev and not prev.get("detached") and self._cap_enforced(task):
+                    state = sendcap.holder_state((prev.get("send_cap") or {}).get("holder"))
+                    if state != sendcap.DEAD:
+                        if not allow_transition:
+                            raise ProtocolError(
+                                "participant_held"
+                                if state == sendcap.ALIVE
+                                else "participant_holder_unknown",
+                                participant_id,
+                                f"{participant_id} is held by another process that is "
+                                + ("still running" if state == sendcap.ALIVE else "not checkable")
+                                + "; attach under your own participant id (a non-advisory process may "
+                                "take it over with allow_transition, which is audited)",
+                            )
+                        cap_event = "takeover"
+                p["send_cap"] = sendcap.mint(self.store, task_id, participant_id)
             self.store.write(rel, p)
             # Bind the selection to this native session so startup/compaction resolve to the
             # right participant even with two sessions in one worktree (native-routing review 1).
@@ -666,10 +694,10 @@ class Coordinator:
             self.store.append_receipt(
                 f"{_task_root(task_id)}/audit.jsonl",
                 "attach",
-                {"participant_id": participant_id, "role": role},
+                {"participant_id": participant_id, "role": role, "send_cap": cap_event},
                 lock_name=task_id,
             )
-            return p
+            return sendcap.public(p)
 
     def detach(self, task_id: str, participant_id: str) -> dict:
         """Detach WITHOUT terminating the peer. Records detach; leaves messages/acks intact."""
@@ -684,23 +712,26 @@ class Coordinator:
                 "detach", p.get("role") == "observer",
                 "only an observer participant may be detached",
             )
+            self._require_cap(task_id, participant_id, "detach")
             p["detached"] = True
             p["detached_at"] = utcnow()
+            p.pop("send_cap", None)  # revoke: no capability matches a detached record (review 4)
             self.store.write(rel, p)
+            sendcap.forget(self.store, task_id, participant_id)
             self.store.append_receipt(
                 f"{_task_root(task_id)}/audit.jsonl",
                 "detach",
                 {"participant_id": participant_id},
                 lock_name=task_id,
             )
-            return p
+            return sendcap.public(p)
 
     def list_participants(self, task_id: str) -> list[dict]:
         out = []
         for path in self.store.listdir(f"{_task_root(task_id)}/participants"):
             rec = self.store.read(f"{_task_root(task_id)}/participants/{path.name}")
             if rec:
-                out.append(rec)
+                out.append(sendcap.public(rec))
         return sorted(out, key=lambda r: r.get("attached_at", ""))
 
     def _require_advisory_observer(self, task_id: str, participant_id: str, op: str) -> None:
@@ -714,6 +745,46 @@ class Coordinator:
             op,
             bool(p) and not p.get("detached") and p.get("role") == "observer",
             f"{participant_id} is not an attached observer; an advisory process may only act as one",
+        )
+
+    @staticmethod
+    def _cap_enforced(task: dict | None) -> bool:
+        """Send capability applies on a task with the send-capability feature, and always in an
+        advisory process."""
+        return model.advisory_process() or FEATURE_SEND_CAPABILITY in (
+            (task or {}).get("protocol_features") or []
+        )
+
+    def _require_cap(
+        self, task_id: str, participant_id: str, op: str, *, task=None, must_exist: bool = True
+    ) -> None:
+        """Refuse an identity-bearing write unless this process holds the participant's current
+        capability (enforced tasks and advisory processes only). On an enforced task the participant
+        must be attached and not detached (review 3); ``must_exist=False`` (bridge controller ids,
+        which need not be participants) skips ids with no record."""
+        task = task if task is not None else self.get_task(task_id)
+        if not self._cap_enforced(task):
+            return
+        p = self.store.read(f"{_task_root(task_id)}/participants/{participant_id}.json")
+        if not p and not must_exist:
+            return
+        if must_exist or p:
+            self._participant(task_id, participant_id)  # unknown_participant / participant_detached
+        if sendcap.holds_current(self.store, task_id, participant_id, p):
+            return
+        if sendcap.held(self.store, task_id, participant_id):
+            raise ProtocolError(
+                "send_capability_stale",
+                participant_id,
+                f"{op} refused: {participant_id} was attached again by another process after this one; "
+                "attach it here again (same identity) to act as it",
+            )
+        raise ProtocolError(
+            "send_capability_required",
+            participant_id,
+            f"{op} refused: this process did not attach {participant_id} and the task requires the "
+            "send capability. Attach it from this process with the same identity (coord_attach), or "
+            "attach and act under your own participant id. The CLI keeps capabilities in --cap-file.",
         )
 
     def _participant(self, task_id: str, participant_id: str) -> dict:
@@ -806,6 +877,7 @@ class Coordinator:
         with self._lock(task_id):
             task = self._require_task(task_id)
             sender_p = self._participant(task_id, sender)  # sender must be attached
+            self._require_cap(task_id, sender, "send", task=task)
             # Idempotency keyed by the DURABLE body, not a pre-written index. The message file is
             # the single authoritative publication (atomic temp+rename); the index is a rebuildable
             # accelerator. A crash that loses the index is recovered by locating the durable body by
@@ -1041,6 +1113,7 @@ class Coordinator:
         so a reminder failure never loses a message (contract §Delivery). It is monotonic."""
         self._require_advisory_observer(task_id, participant_id, "set_cursor")
         with self._lock(task_id):
+            self._require_cap(task_id, participant_id, "set_cursor")
             rel = f"{_task_root(task_id)}/cursors/{participant_id}.json"
             cur = self.store.read(rel) or {"after_seq": 0}
             new = max(int(cur.get("after_seq", 0)), int(after_seq))
@@ -1122,6 +1195,7 @@ class Coordinator:
         self._require_advisory_observer(task_id, participant_id, "ack")
         with self._lock(task_id):
             p = self._participant(task_id, participant_id)
+            self._require_cap(task_id, participant_id, "ack")
             msg = self.get_message(task_id, message_id)
             if not msg:
                 raise ProtocolError(
@@ -1250,6 +1324,7 @@ class Coordinator:
         with self._lock(task_id):
             self._require_task(task_id)
             self._participant(task_id, participant_id)
+            self._require_cap(task_id, participant_id, "checkpoint_publish")
             prev = self.store.read(rel)
             if prev:
                 if prev.get("content_hash") == body_hash:
@@ -1392,7 +1467,7 @@ class Coordinator:
         messages addressed to this participant + the current revision/authorization. Large transcripts
         are NOT re-injected — only pending items and the checkpoint."""
         task = self._require_task(task_id)
-        p = self._participant(task_id, participant_id)
+        p = sendcap.public(self._participant(task_id, participant_id))
         from .execution import ExecutionManager
         from .views import checkpoint_view, execution_view, message_view, stops_wait
 

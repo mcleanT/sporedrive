@@ -59,7 +59,11 @@ def with_reply_expected(message: dict) -> dict:
     return message
 # Opt-in for the Codex exec-resume wake route (every wake is a billed model turn); see wake.py.
 FEATURE_CODEX_EXEC_WAKE = "codex-exec-wake"
-PROTOCOL_FEATURES = (FEATURE_TRIANGLE_KINDS, FEATURE_CODEX_EXEC_WAKE)
+# Opt-in: every identity-bearing write (send, ack, set_cursor, checkpoint publish, detach, wake, bridge
+# notify) must come from the process that attached that participant (proposal step 3, "send binding").
+# An advisory process is always held to this rule, on every task. See coord.py "Send capability".
+FEATURE_SEND_CAPABILITY = "send-capability"
+PROTOCOL_FEATURES = (FEATURE_TRIANGLE_KINDS, FEATURE_CODEX_EXEC_WAKE, FEATURE_SEND_CAPABILITY)
 
 # Advisory (consult/review/Antigravity) processes may read, attach as observer and send
 # non-actionable messages, but never exercise owner authority or drive other sessions.

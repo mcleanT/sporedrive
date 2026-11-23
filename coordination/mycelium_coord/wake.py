@@ -29,7 +29,7 @@ import sqlite3
 import subprocess
 import time
 
-from . import bridge_link
+from . import bridge_link, sendcap
 from .store import StoreError
 from .execution import (
     ExecutionManager,
@@ -84,10 +84,29 @@ WAKE_PROMPT = (
     "(task {tid}, participant {pid}), acknowledge it with coord_ack (task {tid}, participant {pid}, "
     "message {mid}), then act within your role."
 )
+# On a send-capability task the woken turn is a new process: it must attach as the participant (same
+# identity, taken from the stored record) before it can ack. The earlier holder has exited, so this
+# same-identity attach mints a new capability for the woken process.
+WAKE_ATTACH_PREFIX = (
+    "This turn is a new process: first attach as {pid} with coord_attach using exactly task_id={tid}, "
+    "participant_id={pid}, role={role}, worktree_realpath={wt}, host={host}. "
+)
 
 
-def wake_prompt(task_id: str, message_id: str, participant_id: str) -> str:
-    return WAKE_PROMPT.format(mid=message_id, tid=task_id, pid=participant_id)
+def wake_prompt(task_id: str, message_id: str, participant_id: str, attach: dict | None = None) -> str:
+    """The fixed wake prompt. ``attach`` (the recipient's stored record) adds the re-attach step that
+    a send-capability task needs."""
+    body = WAKE_PROMPT.format(mid=message_id, tid=task_id, pid=participant_id)
+    if not attach:
+        return body
+    host = {k: v for k, v in (attach.get("host") or {}).items() if isinstance(v, str)}
+    return WAKE_ATTACH_PREFIX.format(
+        tid=task_id,
+        pid=participant_id,
+        role=attach.get("role"),
+        wt=attach.get("worktree_realpath"),
+        host=json.dumps(host, sort_keys=True),
+    ) + body
 
 
 def validate_timeout(timeout_s) -> float:
@@ -369,7 +388,12 @@ def _codex_locked(ctx, thread: str) -> tuple[str, dict]:
         return _refused("queue_unknown"), {"queue": {"state": qs, "detail": qd}}
     extra = _extra_codex_args()
     pid = recip["participant_id"]
-    prompt = wake_prompt(task_id, msg["message_id"], pid)
+    prompt = wake_prompt(
+        task_id,
+        msg["message_id"],
+        pid,
+        attach=recip if co._cap_enforced(ctx["task"]) else None,
+    )
     cmd = [
         os.environ.get(ENV_CODEX_BIN) or "codex",
         "exec",
@@ -410,6 +434,17 @@ def _codex_locked(ctx, thread: str) -> tuple[str, dict]:
                 and fh.get(WAKE_HEADLESS_MARKER[0]) == WAKE_HEADLESS_MARKER[1]
             ):
                 return _refused("recipient_changed"), {}
+            if co._cap_enforced(ctx["task"]):
+                # Send capability, under the same lock as attach (review 1, 7): the sender must still
+                # hold its capability, and the recipient's holder must have exited, or the woken
+                # process could not attach and ack (a billed turn with no possible evidence).
+                try:
+                    co._require_cap(task_id, ctx["sender"], "wake", task=ctx["task"])
+                except ProtocolError as e:
+                    return _refused("sender_" + e.code), {}
+                hs = sendcap.holder_state((fresh.get("send_cap") or {}).get("holder"))
+                if hs != sendcap.DEAD:
+                    return _refused("recipient_held"), {"holder": hs}
             t0 = time.monotonic()
             try:
                 proc = subprocess.Popen(
@@ -497,6 +532,7 @@ def wake_recipient(
     co._participant(
         task_id, sender
     )  # sender must be an attached, non-detached participant
+    co._require_cap(task_id, sender, "wake")  # send capability (enforced tasks / advisory processes)
     rel = _receipt_rel(task_id, message_id)
     prior = co.store.read(rel)
     if prior and prior.get("outcome") in (ACCEPTED, UNCERTAIN):

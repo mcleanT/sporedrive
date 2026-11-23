@@ -346,3 +346,37 @@ Probe evidence: evidence/m2-probes.json (Claude 6 runs, Codex 6, agy 5).
   - P2 visible-TUI probe: not run;
   - live Antigravity registration: no, because the proposal's step-3 send capability token is not built;
   - live install: not this pass. It needs a merge into ~/tools/sporedrive-release, owner trust approval of each new Codex hook (hooks.state), and a per-tool Codex approval for wake (a server-wide `approve` would open the limit/unpause tools to every Codex session).
+
+## [2026-11-23] Send capability (proposal step 3) — owner: "go ahead and fix the issue"
+- Built `coordination/mycelium_coord/sendcap.py` + gates (send, ack, set_cursor, checkpoint publish, detach, wake, bridge
+  notify) behind task feature `send-capability`; always on in advisory processes. Spec: FEATURES.md "Send capability".
+- Tests: coordination/tests/test_send_capability.py (29). Betty full suite **806 passed, 3 skipped, 0 failed**, 0 ids lost
+  (evidence/betty/sendcap-repair-full-suite.txt; first pass 795, evidence/betty/sendcap-full-suite.txt).
+- Codex scoped review (gpt-5.6-sol high): 9 findings, 7 fixed, 1 accepted limit (shared MCP process = shared capability),
+  1 test gap fixed; one targeted verification: 7 CLOSED, 0 regressions; the two open items were documented (per-process
+  binding wording; bridge check-to-Enter window, same as the execution gate). evidence/sendcap-review/.
+- Live smoke (scratch store, evidence/sendcap-smoke/): two real MCP server processes — B refused to send as A's
+  participant (send_capability_required) and to re-attach it while A ran (participant_held); after A exited B attached
+  and sent. Real Codex headless wake on an enforced task: accepted; the woken turn re-attached (new holder pid), acked,
+  and replied with a report. Host config hashes unchanged. Codex runs: 2.
+- Not committed (owner asked for no commit in this pass); not pushed.
+
+## [2026-11-23] CLI ↔ app test on a scratch board — owner: "make sure the CLIs can communicate with the apps across all services"
+- Owner choices: test board first (no live install); Claude drives one new conversation per app.
+- Board t-apps (triangle-kinds + send-capability), participants cli-/app- × claude/codex/agy. Each CLI sent a nonce consult_request
+  to each app; each app attached from its own process, replied with a report carrying the nonce, and acked; each CLI read + acked.
+- Grid from the board alone (evidence/app-smoke/grid.py → grid.md): **9/9 PASS**.
+  - Server lineage: Codex app = child of ChatGPT.app's bundled codex app-server; Antigravity app = child of its language_server
+    (advisory, "No Project" conversation); Claude app = child of Claude Desktop's bundled claude-code 2.1.330 (Code session on ws).
+- Finding (cause NOT established): Codex CLI reached the board in 10 of 15 runs. 4 misses = model answered "server
+  unavailable" with no tool call; 1 = turn stalled after turn.started (server was up, 51 tools listed). A 30 s startup wait did not
+  prevent misses (1 of 3). 7 runs recorded at the server: always initialized + listed; no miss reproduced. Server start is slow on a
+  loaded Mac (7-8 s; ~2 s is fastmcp's update check). Wake/consult already count delivery only on a store ack, so a miss shows as
+  uncertain, not as success. 4 parallel runs as one participant: 1 attached, 3 refused participant_held (as designed).
+- Cleanup: Antigravity entry removed, mcp_config.json restored to its original 0 bytes; 3 app-side test servers stopped; no
+  scratch-store server left. Host hashes: Antigravity files unchanged; Codex config differs only by the approved folder trust;
+  ~/.claude/settings.json changed at 16:07:54 during the test (about 90 s after the first Claude app launch); I did not edit it;
+  byte check: the ONLY change is model "opus"->"opus[1m]"; cause not established; reported to owner, not reverted.
+  Codex config byte check: the ONLY change is the approved ws trust block. ~/.claude.json and Claude Desktop config not hashed.
+- UI notes: `claude --desktop` must bypass the cmux shim and needs a TTY; Antigravity composer needs type_text x,y; Return sends
+  in all three apps. Leak scan clean (thinking-block signatures redacted).

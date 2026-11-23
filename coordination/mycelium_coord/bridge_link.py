@@ -226,6 +226,9 @@ def notify_via_bridge(
             message_id,
             "cannot notify for a message that does not exist",
         )
+    # Send capability: when controller_id is a participant of an enforced task, only the process that
+    # attached it may notify as it.
+    co._require_cap(task_id, controller_id, "notify_via_bridge", must_exist=False)
     req_id = _bridge_request_id(task_id, message_id)
     corr_rel = f"tasks/{task_id}/correlations/{message_id}.json"
 
@@ -360,6 +363,19 @@ def notify_via_bridge(
                     execution_status=g.get("status"),
                     bound_to=g.get("bound_to"),
                 )
+
+    # Send capability re-check at the Enter boundary (review 1): a takeover that lands during staging
+    # withholds the keystroke, like the execution gate.
+    if co._cap_enforced(co.get_task(task_id)):
+        exec_gate = pre_enter_gate
+
+        def pre_enter_gate():
+            if exec_gate is not None:
+                exec_gate()
+            try:
+                co._require_cap(task_id, controller_id, "notify_via_bridge", must_exist=False)
+            except ProtocolError as e:
+                raise BridgeError("refused_" + e.code, e.message)
 
     try:
         res = Bridge().submit(

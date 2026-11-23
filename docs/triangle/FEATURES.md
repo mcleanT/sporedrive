@@ -121,3 +121,34 @@
   call the coord tools (`coord_inbox`, `coord_ack`) without a prompt, e.g. a per-server `default_tools_approval_mode =
   "approve"` for mycelium-coord, and must point at the intended store. P3 proved this with per-run `-c` overrides; a
   production setup needs the same in its own Codex config. This build changes no host config.
+
+## Send capability (proposal step 3, 2026-11-23)
+- Opt-in task feature `send-capability` (`create-task --feature send-capability`, MCP `protocol_features`). An advisory
+  process (`MYCELIUM_COORD_ADVISORY=1`) is held to it on every task.
+- Every attach mints a random capability that the attaching PROCESS keeps in memory (module `sendcap.py`). The
+  participant record stores only its sha256 and the holder process (pid, ps start time, machine). Neither the
+  capability nor the hash is ever returned by attach, participants, the MCP tools or the CLI.
+- Enforced writes: send (sender), ack, set_cursor, checkpoint publish, detach, wake (sender), bridge notify
+  (controller_id when it is a participant). Without the current capability: `send_capability_required` (this process
+  never attached it) or `send_capability_stale` (another process attached it since). Nothing is written. An idempotent
+  replay is refused too. Reads (inbox, read_message, resume, wait, participants) are not gated.
+- Attach of an attached id: the holder keeps its capability. Another process gets `participant_held` while the holder
+  process is still running (`participant_holder_unknown` when it cannot be checked); once the holder has exited, a
+  same-identity attach mints a new capability (a restarted session, a woken headless Codex turn). A non-advisory process
+  may take over a live-held id with `allow_transition` (audit `send_cap: takeover`); the old holder is then stale.
+- CLI: each call is a new process, so `--cap-file PATH` (or `MYCELIUM_COORD_CAP_FILE`) keeps capabilities in a 0600
+  JSON file; `attach` writes it (output `capability_file`), every other op loads the entries for its store root.
+- Wake: on an enforced task the Codex wake prompt starts with a `coord_attach` step carrying the recipient's stored
+  identity, so the woken process can ack. A woken turn that skips it cannot ack, so the wake stays `uncertain`.
+- Limits: containment, not authentication (a shell can edit the store); execution_* tools carry no participant identity
+  and stay covered by the advisory authority gate; processes still running older code ignore the feature until they
+  are restarted with this code.
+- The binding is per server PROCESS, not per conversation: sessions served by one MCP process (the Antigravity App runs
+  one coord server for all its conversations) share capabilities, so one App conversation can act as an observer that
+  another App conversation attached. Both are advisory observers with the same powers. No host passes a caller
+  identity to the server, so a finer binding is not available.
+- Bridge (Claude) wake: the controller capability is re-checked immediately before the Enter keystroke, outside the task
+  lock, so a takeover landing in the moment between that check and the keystroke is not excluded (the same window the
+  execution pause gate has). The Codex route re-checks under the task lock held through launch.
+- Review: Codex scoped review (9 findings: 7 fixed, 1 accepted limit, 1 test gap fixed) and one targeted verification
+  (7 closed; the two items above documented). Evidence: evidence/sendcap-review/, live smoke evidence/sendcap-smoke/.
