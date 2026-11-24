@@ -2043,6 +2043,9 @@ class Coordinator:
             "after_seq": after,
             "unread": trimmed,
             "unread_count": len(trimmed),
-            "next_after_seq": res.get("next_after_seq", after),
+            # The cursor may only move past what is actually returned: inbox() pages up to 100
+            # messages, but this boundary shows at most `limit` / `max_bytes` of them, so the page's
+            # next_after_seq would mark the unshown remainder as delivered.
+            "next_after_seq": trimmed[-1]["seq"] if trimmed else after,
             "truncated_for_boundary": len(trimmed) < len(msgs),
         }

@@ -1,8 +1,8 @@
 """Owned local jobs (efficiency v2, criterion 2): a small run/join path for work launched through
 the host-authorized shell.
 
-* ``run`` is CLI-only. The command is started by the owned CLI so its processes inherit the host
-  shell's permissions; nothing here exposes arbitrary command execution over MCP.
+* ``run`` is reached from the CLI and from exactly one fixed-argv MCP route (``consult_start``,
+  consult.start_call); no caller-chosen argv is ever exposed over MCP.
 * Every job has an immutable request record (identity, argv, cwd, deadline, stop policy, and the
   managed execution reservation it runs under) and a mutable status record. Output is retained
   complete on disk (``stdout.log`` / ``stderr.log`` / ``supervisor.log``) under the coordination
@@ -84,6 +84,18 @@ def _pid_alive(pid) -> bool:
     except PermissionError:
         return True
     return True
+
+
+# Supervisors this process spawned, by pid. A long-lived parent (the MCP server) must reap its own supervisor: a
+# supervisor killed before it recorded an outcome is otherwise a zombie, and kill(pid, 0) succeeds on a zombie.
+_SUPERVISORS: dict = {}
+
+
+def _supervisor_alive(pid) -> bool:
+    proc = _SUPERVISORS.get(int(pid))
+    if proc is not None:
+        return proc.poll() is None  # reaps our own child; once reaped it stays reported dead
+    return _pid_alive(pid)
 
 
 def _proc_start(pid):
@@ -216,7 +228,7 @@ class JobManager:
         the retained attempt stays visible."""
         out = dict(st)
         sup = st.get("supervisor_pid")
-        alive = _pid_alive(sup) if sup else False
+        alive = _supervisor_alive(sup) if sup else False
         out["supervisor_alive"] = alive
         status = st.get("status")
         if status in TERMINAL:
@@ -331,7 +343,7 @@ class JobManager:
         return read_bounded(p, offset=offset, limit=limit, tail=tail, budget=budget or None,
                             envelope={"job_id": job_id, "stream": stream})
 
-    # ------------------------------------------------------------------ run (CLI-only)
+    # ------------------------------------------------------------------ run (CLI, and MCP consult_start's fixed argv)
     @authority_op("job-run")
     def run(self, job_id: str, argv: list, *, cwd=None, deadline_s: float = DEFAULT_DEADLINE_S,
             task_id=None, action_id=None, dispatch_identity=None, on_stop: str = "keep",
@@ -440,6 +452,10 @@ class JobManager:
             )
         finally:
             log.close()
+        for pid, p in list(_SUPERVISORS.items()):  # reap finished ones, as subprocess would for a dropped Popen
+            if p.poll() is not None:
+                _SUPERVISORS.pop(pid, None)
+        _SUPERVISORS[proc.pid] = proc
         return proc.pid
 
     # ------------------------------------------------------------------ join (bounded, in-tool)

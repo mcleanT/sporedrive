@@ -104,8 +104,11 @@ mycelium-coord sched-verify --intended-utc ISO (--persisted-json FILE|- | --next
 
 MCP (both hosts) exposes only the read-only routes: `job_status`, `job_join` (25 s cap on this
 route), `job_list`, `job_output`, `wait_plan`, `execution_receipt`, `execution_evidence`, `sched_plan`,
-`sched_verify`. There is no MCP launch route: a job is started by the owned CLI from the
-host-authorized shell so its processes inherit that shell's permissions. A managed job runs under one
+`sched_verify`. There is no MCP launch route for jobs, apart from `consult_start`'s one fixed consult
+job (below): a job is started by the owned CLI from the
+host-authorized shell so its processes inherit that shell's permissions. The `consult_start` job is the
+exception: the MCP server spawns it, so it runs with the server's permissions, outside the host shell's
+sandbox and approval policy, and host approval of the `consult_start` tool call is the only host control. A managed job runs under one
 open work reservation (re-checked immediately before the actual launch), keeps an immutable request
 record (identity, argv, cwd, deadline, reservation) and complete stdout/stderr on disk under the state
 root; a replayed `job-run` with the same id and content never launches twice, and a different content
@@ -264,8 +267,10 @@ in the sporedrive repository (not shipped inside the plugin).
   refused `kind_requires_feature`.
 - **Call mode** (one transient headless session per request, e.g. a review): `mycelium-coord consult call
   --target codex|claude|antigravity --packet P [--post-task T --post-reply-to M --sender S --cap-file F]`
-  from the caller's shell; `consult post` (or MCP `consult_post`) posts a finished answer later. MCP never
-  launches a call.
+  from the caller's shell; `consult post` (or MCP `consult_post`) posts a finished answer later.
+- **Call mode over MCP** (unrestricted connections only): `consult_start(target, packet)` starts the call as a
+  background job and returns its `call_id`; `consult_result(call_id, wait_s=25)` collects it (call again while
+  `state` is `running`; only `usable: true` is an answer); post with `consult_post(..., call_dir)`.
 - **Link mode** (`session-links`, needs `send-capability`): `link propose|confirm|end|get` (MCP
   `coord_link_*`) pins two attached participants to their native sessions. `send --link ID --to PARTNER`
   and `wake --link ID` reach only the pinned session; a role or `all` is refused

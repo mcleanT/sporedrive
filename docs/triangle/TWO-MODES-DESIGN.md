@@ -45,6 +45,7 @@ v1 applies those findings and an advisor check.
 - **No MCP launch tool.** jobs.py keeps its rule that process launch is CLI-only and never exposed over MCP
   (jobs.py:4-5; `run` is `@authority_op("job-run")`, jobs.py:334-335, refused in advisory processes by
   `require_authority`, model.py:77-85). jobs.py and execution.py are untouched; no new usage limit.
+- **2026-11-24:** this v1.1 "No MCP launch tool" rule (and "Antigravity does not start calls" below) is superseded by owner direction 2026-11-24: one fixed-argv MCP route, `consult_start` + `consult_result` (FEATURES.md, Call mode).
 - Output goes to a fresh per-call directory the dispatcher creates under the job/scratch dir; an existing directory is
   refused (the adapters clear their output path at start, claude_ask.sh:39-41, agy_ask.py:153-160).
 - `--post-to TASK:MSG` (split at the first `:`) or `--post-task T --post-reply-to M` (for ids containing `:`; mixing the two is

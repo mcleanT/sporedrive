@@ -4,7 +4,8 @@ SporeDrive connects **Claude Code, Codex and Antigravity** through
 **[Mycelium](https://github.com/arjunrajlaboratory/mycelium)** so they can work with each other
 directly. Each host can take part from its CLI or its desktop app. A session in any of them can:
 
-- ask another for a second opinion or a review;
+- ask another for a second opinion or a review, including as a one-off headless call that any of
+  the three can start, over MCP (`consult_start`) or from the CLI;
 - send a question or a report to one specific session;
 - keep an ongoing, linked conversation with one partner session;
 - find which sessions are live and which task each one is bound to.
@@ -64,13 +65,14 @@ switched on in its own place:
   created without them behaves as before.
 - **Per process (optional):** restricted mode.
 - **Per host, once installed:** the stale-write guard.
-- **No task needed:** call mode is a CLI command.
+- **No task needed:** call mode, started with the MCP tool `consult_start` or the CLI command
+  `mycelium-coord consult call`.
 
-| Host | Labels it can join a task with | Reviews | How an idle session is reached |
-|---|---|---|---|
-| Claude Code | supervisor, executor or observer | gives them through call mode or review messages | the cmux bridge types into the one bound session |
-| Codex | supervisor, executor or observer | gives them through call mode or review messages | `codex exec resume` on the stored thread, only on tasks with `codex-exec-wake` and a participant attached with `wake=headless` |
-| Antigravity | supervisor, executor or observer | gives them through call mode or review messages | no wake route; it reads its inbox on its next turn |
+| Host | Labels it can join a task with | Starts a call | Reviews | How an idle session is reached |
+|---|---|---|---|---|
+| Claude Code | supervisor, executor or observer | MCP `consult_start` or the CLI | gives them through call mode or review messages | the cmux bridge types into the one bound session |
+| Codex | supervisor, executor or observer | MCP `consult_start` or the CLI | gives them through call mode or review messages | `codex exec resume` on the stored thread, only on tasks with `codex-exec-wake` and a participant attached with `wake=headless` |
+| Antigravity | supervisor, executor or observer | MCP `consult_start`, once its coordination server is registered | gives them through call mode or review messages | no wake route; it reads its inbox on its next turn |
 
 Sessions find each other through the same record:
 
@@ -84,8 +86,26 @@ Sessions find each other through the same record:
 
 Each also has an MCP tool. There are two ways to talk:
 
-- **Call mode (one-off, headless).** `mycelium-coord consult call --target codex|claude|antigravity`
-  starts a brand-new session of the target.
+- **Call mode (one-off, headless).** Any of the three apps can start a call to any of the three:
+  over MCP with `consult_start` (collected with `consult_result`), or from a shell with
+  `mycelium-coord consult call --target codex|claude|antigravity`. Either starts a brand-new
+  session of the target.
+  - Over MCP the call runs as a background job. In tests it kept running when the server process
+    was killed; whether it survives quitting each app is not yet proven. `consult_result` waits 25 s
+    per call by default (the host's tool yield minus 5 s, never more than 50 s); call it again
+    while the call runs. There is no cancel over MCP: the
+    packet's deadline ends the call.
+  - A restricted connection cannot start calls. A called session is launched without a coordination
+    MCP server, which is meant to stop it starting another call (not yet confirmed live for Codex
+    and Antigravity targets); the refusals of a restricted or called
+    session are a backstop that depends on the host passing its environment to the server.
+  - The call job runs with the MCP server's own permissions, not the app's shell sandbox or shell
+    approval policy. Approving the `consult_start` tool call is the control; hosts can require it.
+  - One call at a time per caller and target, shared by every server and CLI on one coordination
+    store. Call files live in a directory that must be private to the user, or the call is not
+    started.
+  - The MCP route is covered by unit tests with stand-in hosts. Live runs from each app are still
+    pending.
   - The session gets one written packet, answers once and is discarded.
   - It is read-only. For Antigravity this is enforced only at its permission prompt.
   - Every call reports one outcome: `ANSWERED`, `NOT_STARTED`, `REFUSED`, `UNAVAILABLE` or
@@ -336,8 +356,9 @@ Cloning installs nothing. Setup is four distinct steps; details and exact comman
 Two optional steps are manual, and the installer does neither:
 
 - **Connecting Antigravity.** Register the coordination MCP server with Antigravity
-  (`agy mcp add`). It then takes part like the other two apps. Add `MYCELIUM_COORD_ADVISORY=1` to
-  the server's environment only if you want its connection restricted.
+  (`agy mcp add`). It then takes part like the other two apps, and an unrestricted connection can
+  start calls with `consult_start`. Add `MYCELIUM_COORD_ADVISORY=1` to the server's environment
+  only if you want its connection restricted; a restricted connection cannot start calls.
   - `agy mcp add` writes `~/.gemini/config/mcp_config.json`, which the CLI and the desktop app
     both read. It therefore applies to every Antigravity run on the machine, including scripted
     `agy -p` runs.
