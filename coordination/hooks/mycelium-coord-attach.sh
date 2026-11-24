@@ -27,23 +27,36 @@ CLI="$(cd "$HERE/../bin" && pwd)/mycelium-coord"
 [ -x "$CLI" ] || exit 0
 
 if [[ -n "${CLAUDE_PROJECT_DIR:-}" ]]; then HOST=claude; else HOST="${MYCELIUM_HOOK_HOST:-codex}"; fi
-SESSION_ID="$(printf '%s' "$INPUT" | python3 -c 'import json,sys
+# ONE python start parses all three hook fields (this runs on every Bash call on both hosts);
+# fields are joined by the ASCII unit separator so an empty field is preserved.
+PARSED="$(printf '%s' "$INPUT" | python3 -c 'import json,sys
 try: v=json.load(sys.stdin)
 except Exception: v={}
-print(v.get("session_id") or v.get("session") or "")' 2>/dev/null || true)"
-SOURCE_EVENT="$(printf '%s' "$INPUT" | python3 -c 'import json,sys
-try: v=json.load(sys.stdin)
-except Exception: v={}
-print(v.get("source") or "")' 2>/dev/null || true)"
-EVENT="$(printf '%s' "$INPUT" | python3 -c 'import json,sys
-try: v=json.load(sys.stdin)
-except Exception: v={}
-print(v.get("hook_event_name") or v.get("hookEventName") or "")' 2>/dev/null || true)"
+if not isinstance(v,dict): v={}
+print("%s\x1f%s\x1f%s" % (v.get("session_id") or v.get("session") or "", v.get("source") or "", v.get("hook_event_name") or v.get("hookEventName") or ""), end="")' 2>/dev/null || true)"
+US=$'\037'
+SESSION_ID="${PARSED%%"$US"*}"; PARSED="${PARSED#*"$US"}"
+SOURCE_EVENT="${PARSED%%"$US"*}"; EVENT="${PARSED#*"$US"}"
 # host env override (a Codex adapter that cannot set hook_event_name may pass MYCELIUM_HOOK_EVENT)
 [ -z "$EVENT" ] && EVENT="${MYCELIUM_HOOK_EVENT:-SessionStart}"
 
 TASK=""; PARTICIPANT=""; FROM_ENV=0
-if [ -n "$SESSION_ID" ]; then
+# resolve-session can only return a selection when `sessions/<host>/` holds a *.json record (it reads
+# <seg>.json there, else scans that directory's *.json). The store root resolves exactly as
+# CoordStore does: $MYCELIUM_COORD_DIR if non-empty, else ~/.local/state/mycelium/coordination. When
+# no record can exist, skip the CLI process entirely (a CLI error would also have meant "no selection").
+HAS_SEL=1
+if [ -n "$SESSION_ID" ] && [ -n "${MYCELIUM_COORD_DIR:-${HOME:-}}" ]; then
+  _SELDIR="${MYCELIUM_COORD_DIR:-${HOME:-}/.local/state/mycelium/coordination}/sessions/$HOST"
+  HAS_SEL=0
+  if [ -d "$_SELDIR" ]; then
+    shopt -s nullglob dotglob
+    _F=("$_SELDIR"/*.json)
+    shopt -u nullglob dotglob
+    if [ "${#_F[@]}" -gt 0 ]; then HAS_SEL=1; fi
+  fi
+fi
+if [ -n "$SESSION_ID" ] && [ "$HAS_SEL" = "1" ]; then
   SEL="$("$CLI" resolve-session "$HOST" "$SESSION_ID" 2>/dev/null || true)"
   read -r TASK PARTICIPANT < <(printf '%s' "$SEL" | python3 -c 'import json,sys
 try: d=json.load(sys.stdin)
