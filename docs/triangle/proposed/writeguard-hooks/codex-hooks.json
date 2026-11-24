@@ -1,11 +1,29 @@
 {
-  "_comment": "PROPOSED, NOT INSTALLED. Replace <ABS_PYTHON> and <ABS_PATH_TO> with absolute paths. Codex hooks need trust review before they run.",
+  "_comment": "PROPOSED, NOT INSTALLED. Replace <ABS_PYTHON> and <ABS_PATH_TO> with absolute paths. Codex hooks need trust review before they run. Codex keys hook trust by position (<file>:<event>:<group>:<handler>, see [hooks.state] in ~/.codex/config.toml), so APPEND these groups after every existing group in the target hooks.json (or put them in a hooks.json of their own); inserting them earlier renumbers the existing Mycelium hooks and changes which trust entry each one matches.",
   "hooks": {
     "PreToolUse": [
-      {"matcher": "apply_patch|Bash", "hooks": [{"type": "command", "command": "<ABS_PYTHON> <ABS_PATH_TO>/writeguard.py hook --host codex --event pre", "timeout": 10}]}
+      {
+        "matcher": "apply_patch|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<ABS_PYTHON> <ABS_PATH_TO>/writeguard.py hook --host codex --event pre",
+            "timeout": 10
+          }
+        ]
+      }
     ],
     "PostToolUse": [
-      {"matcher": "apply_patch|Bash", "hooks": [{"type": "command", "command": "<ABS_PYTHON> <ABS_PATH_TO>/writeguard.py hook --host codex --event post", "timeout": 10}]}
+      {
+        "matcher": "apply_patch|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<ABS_PYTHON> <ABS_PATH_TO>/writeguard.py hook --host codex --event post",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }

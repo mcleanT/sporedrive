@@ -208,7 +208,7 @@ mycelium-coord exec-owner-request TASK --request-id ID --authorization REF --sco
   do not ask for confirmation again; the fresh read supersedes any earlier STOP notice or snapshot.
   Usage counters and frozen acceptance are never reset. An expired execution stays stopped until the
   owner extends `expires_at` (`unpause` refuses with `execution_expired`); unauthorized work stays STOP.
-- **Housekeeping and Stop-lock (core overlay).** The health hook dispatches the knowledge audit /
+- **Housekeeping and Stop-lock (core overlay; only in builds exported WITH `core-overlay`, i.e. from a Mycelium 0.6.0 source — a stock 0.9.x build uses its own release's housekeeping and Stop behaviour).** The health hook dispatches the knowledge audit /
   transfer worker only when `housekeeping_ledger.py decide` reserves an attempt (one in-flight
   attempt, timed-out attempts recorded as failures, bounded retries, cooldown, one exhaustion notice);
   workers report `complete` / `fail` with their attempt id. A busy Stop lock blocks ONCE with an
@@ -242,10 +242,39 @@ reachable within a fixed per-call budget — a small page size never strands lat
   on exactly that native session — the same authority `resolve-session` uses); a stale post-rebind
   record is `live:false` and is dropped under `--live-only`.
 
+### Opt-in triangle features (Claude Code, Codex, Antigravity)
+
+These apply only to tasks created with the named `--feature` (MCP `protocol_features`) and to advisory
+processes. Tasks without them behave exactly as described above. Full rules: `docs/triangle/FEATURES.md`
+in the sporedrive repository (not shipped inside the plugin).
+
+- **Advisory process** (`MYCELIUM_COORD_ADVISORY=1`, how Antigravity runs): it may create an unmanaged
+  task, read, attach as a plain `observer`, ack/set-cursor/detach as that observer, and send
+  non-actionable kinds (question, progress, review_finding, acknowledgment, consult_request, report).
+  Any other role or `allow_transition`, actionable sends, checkpoint publish, execution mutators,
+  bridge notify, wakes, link proposals and job/worker runs are refused `advisory_process_refused`.
+  Do not retry those from an advisory process; ask a non-advisory participant instead.
+- **`send-capability`**: identity-bearing writes (send, ack, set-cursor, checkpoint publish, detach, wake,
+  bridge notify) must come from the process that attached the participant. MCP keeps this automatically.
+  The CLI starts a new process per call, so pass the same `--cap-file PATH` (or `MYCELIUM_COORD_CAP_FILE`)
+  to `attach` and to every later write; without it they fail `send_capability_required`. Never print or
+  copy the cap file.
+- **`triangle-kinds`**: enables `review_request`, `consult_request` and `report`. Without it those kinds are
+  refused `kind_requires_feature`.
+- **Call mode** (one transient headless session per request, e.g. a review): `mycelium-coord consult call
+  --target codex|claude|antigravity --packet P [--post-task T --post-reply-to M --sender S --cap-file F]`
+  from the caller's shell; `consult post` (or MCP `consult_post`) posts a finished answer later. MCP never
+  launches a call.
+- **Link mode** (`session-links`, needs `send-capability`): `link propose|confirm|end|get` (MCP
+  `coord_link_*`) pins two attached participants to their native sessions. `send --link ID --to PARTNER`
+  and `wake --link ID` reach only the pinned session; a role or `all` is refused
+  `link_requires_exact_recipient`. A link that went stale (a member detached or another session took the
+  participant) never retargets; propose a new one.
+
 ## Core rules (do not violate)
 
 1. **Attach explicitly.** `coord_attach(task, participant, role, worktree_realpath, host)` — CLI:
-   `attach TASK PARTICIPANT --role R --worktree WT --host host=codex|claude --host session=… --host
+   `attach TASK PARTICIPANT --role R --worktree WT --host host=codex|claude|antigravity --host session=… --host
    native_id=…`. Give your own `worktree_realpath` (a supervisor's is outside the executor repo —
    that's expected) and a native identity. Attaching a supervisor grants **no** repository-write or
    lifecycle-owner authority. The executor's worktree must equal the task's.

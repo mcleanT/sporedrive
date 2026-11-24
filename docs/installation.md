@@ -137,6 +137,9 @@ About the core overlay:
   An overlay built on an older source can silently hide newer source behavior.
 - **The guard:** `scripts/test_export_stop_budget.py` exports with the overlay and fails if an
   overlay hook drops any function its source defines.
+- **Which Mycelium it fits:** the overlay was written for Mycelium 0.6.0. Export refuses to apply it to
+  any other release (for example 0.9.x, where it would replace the newer core hooks with older copies)
+  and tells you to pass `--no-overlay`. The coordination features do not need the overlay.
 
 **Build identity.** Three identities can differ:
 
