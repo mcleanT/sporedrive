@@ -452,6 +452,9 @@ class JobManager:
             )
         finally:
             log.close()
+        for pid, p in list(_SUPERVISORS.items()):  # reap finished ones, as subprocess would for a dropped Popen
+            if p.poll() is not None:
+                _SUPERVISORS.pop(pid, None)
         _SUPERVISORS[proc.pid] = proc
         return proc.pid
 

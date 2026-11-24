@@ -535,3 +535,20 @@ def test_list_and_status_are_bounded_on_the_wire_with_escaped_metadata(tmp_path)
     assert out["truncated"] is True and out["reason_truncated"] is True
     assert out["reason"].startswith("launch_failed: ") and "over_budget" not in out
     assert out["stdout_sha256"] == "a" * 64 and out["exit_code"] == 127
+
+
+def test_a_finished_supervisor_is_reaped_when_the_next_one_is_spawned(tmp_path):
+    """The parent keeps each supervisor's Popen (so a killed one is reaped, not a zombie read as alive); finished ones
+    are reaped at the next spawn even when nobody asked for their status, as subprocess does for a dropped Popen."""
+    jm = _jm(tmp_path)
+    jm.run("first", [SH, "-c", "true"], cwd=str(tmp_path))
+    sup = jm.read_status("first")["supervisor_pid"]
+    for _ in range(200):  # the stored record only: status() would poll, and so reap, the supervisor itself
+        if (jm.read_status("first") or {}).get("status") in jobs.TERMINAL:
+            break
+        time.sleep(0.05)
+    time.sleep(1.0)  # the supervisor exits right after writing its terminal record
+    jm.run("second", [SH, "-c", "true"], cwd=str(tmp_path))
+    assert sup not in jobs._SUPERVISORS
+    with pytest.raises(ChildProcessError):
+        os.waitpid(sup, os.WNOHANG)  # already reaped: no zombie left behind
