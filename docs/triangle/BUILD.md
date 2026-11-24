@@ -459,4 +459,13 @@ Probe evidence: evidence/m2-probes.json (Claude 6 runs, Codex 6, agy 5).
   without the capability (they run outside the session process), so on a send-capability task a non-advisory process can
   still publish status for any participant: status is an observation, not a message (known limit).
 - Tests: 3 added + the MCP hidden-tool list extended; with the guards removed 2 fail, with them 4 pass (Betty).
+- Merged tree 95570d1 on Betty: 1098 passed, 3 skipped, 1 failed (evidence/betty/merged-95570d1-full-suite.txt). Collected test
+  ids: base 91546b3 272, origin/main 307, pre-merge f2376fc 1064, merged 1102; every origin/main and every pre-merge test id is
+  present in the merged run. The one failure, `test_codex_ipc_wake.py::test_owner_only_socket_guard_absent_and_not_a_socket`,
+  is main's own: it fails identically on origin/main alone on Betty (3/3; the owner-only check rejects the compute node's temp
+  parent before the not-a-socket check), and the triangle does not touch codex_ipc_wake.py or its test.
+- Live smokes on the merged code (scratch stores): Codex call ANSWERED with the sentinel, coverage 1/1, report posted via
+  --post-task/--post-reply-to; link — headless Codex confirm accepted (30.2 s), rebind → stale on disk, linked send refused;
+  Antigravity observer over ACP on the merged MCP server — 7/7 coord permissions, L2 active, reply via the link, request acked,
+  host config unchanged (its final chat text was empty this time; the board records are the evidence).
 
