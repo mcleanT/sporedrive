@@ -202,8 +202,10 @@ Known limits (not fixable inside sporedrive):
   in that repository are then attributed "shared" instead of "sole". The changes are still recorded, and Mycelium already
   accepts this for any denied Codex call. Builds before 0.9.7 do not observe `apply_patch` before the call. Not tested:
   whether Codex runs Mycelium's PreToolUse at all when another hook denies.
-- **Mycelium's own cross-session races** (pre-existing, Mycelium repository). Concurrent SessionStarts can dispatch the
-  knowledge audit and transfer twice. Manually run scripts rewrite files without a lock: `init_repo`, `init_knowledge`,
+- **Mycelium's own cross-session races** (pre-existing, Mycelium repository). In upstream Mycelium (0.9.x, including 0.9.7),
+  concurrent SessionStarts can dispatch the knowledge audit and transfer twice. The in-flight ledger that
+  prevents this, `housekeeping_ledger.py`, comes from this repository's `core-overlay/` and is present only in
+  builds that carry it. Manually run scripts rewrite files without a lock: `init_repo`, `init_knowledge`,
   `install_convention`, `migrate_existing_repos`, `sync_html_report`, `check_linter_versions --record` and the
   knowledge-map build.
 - **Not live-tested:** the agy IDE and App routes, the Claude `Bash` guard hook, and Codex hook ordering when one hook
