@@ -1,6 +1,7 @@
 # SporeDrive
 
-SporeDrive connects **Claude Code, Codex and Antigravity** so they can work with each other
+SporeDrive connects **Claude Code, Codex and Antigravity** through
+**[Mycelium](https://github.com/arjunrajlaboratory/mycelium)** so they can work with each other
 directly. Each host can take part from its CLI or its desktop app. A session in any of them can:
 
 - ask another for a second opinion or a review;
@@ -8,16 +9,25 @@ directly. Each host can take part from its CLI or its desktop app. A session in 
 - keep an ongoing, linked conversation with one partner session;
 - find which sessions are live and which task each one is bound to.
 
-Messages go through a shared record on disk instead of copy-paste between chat windows. A message
-can be addressed to one specific session. It survives compaction and restarts, and can be checked
-later.
+Messages go through Mycelium's coordination record on disk instead of copy-paste between chat
+windows. A message can be addressed to one specific session. It survives compaction and restarts,
+and can be checked later.
 
 ```mermaid
 flowchart LR
-  C["Claude Code<br/>CLI or app"] <--> M[("Shared coordination record<br/>on this machine")]
+  C["Claude Code<br/>CLI or app"] <--> M[("Mycelium coordination record<br/>on this machine")]
   X["Codex<br/>CLI or app"] <--> M
   A["Antigravity<br/>CLI or app"] <--> M
 ```
+
+**How it relates to Mycelium.** Mycelium is a plugin that gives each project a memory: decisions,
+learnings and handoffs kept in its `.living/` folder. SporeDrive is the home of Mycelium's
+coordination layer, `mycelium-coord`: the shared record, its CLI and its MCP tools.
+
+- Setup builds one Mycelium plugin with this layer included. Claude Code and Codex load it as part
+  of Mycelium, not as a second plugin.
+- Antigravity connects to the same coordination server through its own MCP settings.
+- The coordination works with or without Mycelium's project-memory hooks.
 
 **No host is in charge.** A session joins a task under a label: supervisor, executor or observer.
 Claude Code and Codex sessions can take any label, and any session on a task can message any
