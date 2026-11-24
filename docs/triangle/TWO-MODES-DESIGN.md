@@ -72,7 +72,8 @@ this list, evidence/two-modes-probe/README.txt; HOME is required) — strips
 every other `MYCELIUM_*` variable, and sets three explicitly: `MYCELIUM_COORD_ADVISORY=1` (any coordination CLI the
 target runs is adviser-limited), `MYCELIUM_COORD_DIR=<empty per-call dir>` (it cannot fall back to the default live
 store, store.py:74-75) and `MYCELIUM_CONSULT_TARGET=1` (`consult call` refuses to run inside a target: no recursion).
-`env_keys_passed` is recorded in the receipt.
+It also passes the one binary that preflight resolved, as `CODEX_BIN` / `CLAUDE_BIN` / `AGY_BIN` (v1.3: preflight and the
+adapter run the same binary; the receipt records it and the PATH value). `env_keys_passed` is recorded in the receipt.
 
 ### 2.3 Handoff packet `consult-packet/1`
 | Field | Req. | Content |
@@ -170,8 +171,8 @@ Member role `observer`; sends limited to `ADVISORY_ALLOWED_SEND_KINDS` (model.py
   byte-identical.
 - Live smokes on a scratch store (never the live store); pass read from stored receipts/board, not exit codes:
   - Call, once per target host: positive control (answer quotes a sentinel only in a named file); one forced timeout;
-    one missing-file packet; receipt outcome correct; env_keys_passed has only the allowlist plus the three set
-    `MYCELIUM_*` keys; Codex: read extraction lists the named file, either as a counted read ("argument") or as a flagged
+    one missing-file packet; receipt outcome correct; env_keys_passed has only the allowlist plus the three set `MYCELIUM_*` keys and the resolved
+    `<HOST>_BIN` (v1.3); Codex: read extraction lists the named file, either as a counted read ("argument") or as a flagged
     "possible" read; when only "possible", `coverage.read` is null with `read_lower_bound` — never a measured 0
     (else the smoke fails) (v1.3);
     no-recursion: a target told to run `mycelium-coord consult call` is refused (`MYCELIUM_CONSULT_TARGET`). A "sentinel in an unnamed
@@ -207,5 +208,10 @@ v1.3 (during build, lead decision under "handle it"): the call-mode verifier sho
 command line does not prove the file was read (pipes, `xargs`, `rg --files`, grep patterns). Codex read extraction now
 counts only a direct reader operand; anything else is "possible" and makes coverage a lower bound. The live smoke had
 read the named file through `rg --files | xargs sh -c 'sed …'`, which is now "possible", so the §5 Codex gate accepts
-a counted or a flagged read and fails only on a silent measured 0. The packet prompt now asks targets to read named
-files directly by path. Coverage stays a heuristic, never a gate on the answer itself.
+a counted or a flagged read and fails only on a silent measured 0. For Codex targets only, the packet prompt asks for a direct read by path
+(an Antigravity target told to use a shell reader tried a rejected `cat` and ended with an empty answer, live smoke r2).
+Coverage stays a heuristic, never a gate on the answer itself; any non-ANSWERED call has coverage null + lower bound.
+Also in v1.3 (verifier and Codex-review repairs): preflight refuses a repo that equals or contains HOME, a host config
+dir, the default store, MYCELIUM_COORD_DIR or the CLI's own `--root` store; symlinked named/evidence paths are refused
+(`named_path_symlink`); the prompt names the verified realpath and postflight re-checks it; the target receives the
+preflight-resolved binary (`<HOST>_BIN`).

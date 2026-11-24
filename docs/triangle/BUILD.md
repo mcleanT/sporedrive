@@ -394,7 +394,7 @@ Probe evidence: evidence/m2-probes.json (Claude 6 runs, Codex 6, agy 5).
   - Codex review (gpt-5.6-sol high): no link/advisory/legacy blockers; 5 call-mode blockers (post-launch OSError → NOT_STARTED +
     orphan; stop signal could lose the receipt; 3-contender lock recovery race; absent token/coverage parts as exact 0; CLI
     --root store unprotected + symlink TOCTOU) → repaired; Codex verification: 4 CLOSED, 1 PARTLY → closed by the lead.
-- Betty full suite: 928 → 947 → 973 → 993 passed (3 skipped, 0 failed); final run in evidence/betty/two-modes-final-full-suite.txt.
+- Betty full suite: 928 → 947 → 973 → 993 → 994 passed (3 skipped, 0 failed; 994 after the lead's repair-verify fix); final run in evidence/betty/two-modes-final-full-suite.txt.
 - Live smokes (scratch stores only): call r3 — Codex, Claude, Antigravity ANSWERED with the sentinel, coverage 1/1; Codex timeout
   TIMED_OUT with coverage null + lower bound; a target that tried `consult call` got REFUSED (recursion). Link — Claude ↔ headless
   Codex confirm/send/wake/ack, link stays active across 2 headless re-attaches (2/2 first attempt); Antigravity observer over ACP
@@ -405,3 +405,12 @@ Probe evidence: evidence/m2-probes.json (Claude 6 runs, Codex 6, agy 5).
 - Limits kept: Codex/Antigravity targets can read any user-readable file (only Claude is folder-restricted); board reads are not
   gated per member; files-read coverage is a heuristic (null + lower bound when unsure); Claude bridge route has an unlocked
   pin-check→send window; stored messages do not carry link_id (backlog).
+- Final live call grid on the committed code (r3 positives + r4): Codex/Claude/Antigravity missing-file → NOT_STARTED with no
+  launch; forced timeouts → TIMED_OUT (Codex 7.0 s, Claude 1 s deadline 2.4 s, Antigravity 6.1 s) with coverage null + lower
+  bound 0; recursion → the target's CLI got REFUSED; consult_post from an MCP-attached caller posted the r3 Claude answer as a
+  report (artifact_ref answer.md) and the r4 Codex timeout as CANNOT-EVALUATE. Claude bridge wake with the new link pin is
+  offline-tested only (the live link smoke woke Codex). Evidence leak scan: 290 files, 0 capability-shaped strings (positive
+  control 199/200); the store keeps only the capability sha256.
+- Open implementer questions, kept as limits/backlog: posted artifact_ref points into the caller's out-root (no durability
+  guarantee if that folder is removed); a receipt and answer replaced together are not detected (the sha256 binds the
+  answer to the receipt, not to an outside record); the packet `schema` key is optional.
