@@ -95,8 +95,9 @@ Each also has an MCP tool. There are two ways to talk:
     per call by default (the host's tool yield minus 5 s, never more than 50 s); call it again
     while the call runs. There is no cancel over MCP: the
     packet's deadline ends the call.
-  - A restricted connection cannot start calls. A called session is launched with no coordination
-    MCP server, so it has no way to start another call; the refusals of a restricted or called
+  - A restricted connection cannot start calls. A called session is launched without a coordination
+    MCP server, which is meant to stop it starting another call (not yet confirmed live for Codex
+    and Antigravity targets); the refusals of a restricted or called
     session are a backstop that depends on the host passing its environment to the server.
   - The call job runs with the MCP server's own permissions, not the app's shell sandbox or shell
     approval policy. Approving the `consult_start` tool call is the control; hosts can require it.

@@ -2070,9 +2070,6 @@ def _stage_packet(out_root: str, call_id: str, blob: bytes) -> str:
     different bytes is consult_call_id_conflict (a call id is never re-aimed)."""
     d = os.path.join(out_root, PACKET_STAGE_DIR)
     os.makedirs(d, mode=0o700, exist_ok=True)
-    why = private_dir_problem(d)
-    if why:
-        raise OSError(errno.EPERM, f"out root not private: {why}")
     p = os.path.join(d, call_id + ".json")
     try:
         fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
@@ -2113,9 +2110,9 @@ def start_call(
 ) -> dict:
     """Start one call as a detached owned job (MCP consult_start) and return within about ``settle_s`` seconds.
     Gates, each deciding before anything is created: recursion (``env``, default os.environ) -> authority -> arguments
-    and packet -> deadline fit -> optional post check (``post`` = {task, reply_to, sender}; posts nothing) -> call id
-    not taken. Then the packet is staged and the fixed ``dispatch_argv`` is launched with JobManager.run (idempotent by
-    job id). ``out_root`` and ``host_bin`` are test seams; the MCP tool never passes them."""
+    and packet -> deadline fit -> optional post check (``post`` = {task, reply_to, sender}; posts nothing) -> out root
+    and packets/ private to this user -> call id not taken. Then the packet is staged and the fixed ``dispatch_argv``
+    is launched with JobManager.run (idempotent by job id). ``out_root`` and ``host_bin`` are test seams; the MCP tool never passes them."""
     from .jobs import MAX_DEADLINE_S
 
     caller_env = os.environ if env is None else env

@@ -175,12 +175,13 @@ over. Code: `coordination/mycelium_coord/consult.py`; hosts: `src/consult/{codex
   shell) and runs it as the detached owned job `consult-<call_id>`, so the call survives the server exiting. The
   executable, PATH, out root, lane, cwd and environment are never taken over MCP. Gates, in order, each before anything is
   created: recursion (`MYCELIUM_CONSULT_TARGET`) -> REFUSED; restricted (advisory) process -> `advisory_process_refused`
-  (both tools are also hidden there; a called session is launched with no coordination MCP server, which is what stops it
-  starting another call: these environment-based refusals are a backstop, since a host may filter the environment it gives
-  its MCP servers); an out root or `packets/` that is a symlink, not owned by this user or open to group/other ->
-  NOT_STARTED `out root not private`; a call_id starting with `-` -> NOT_STARTED;
+  (both tools are also hidden there; a called session is launched without a coordination MCP server, which is meant to stop
+  it starting another call, not yet confirmed live for Codex and Antigravity targets; these environment-based refusals are
+  a backstop, since a host may filter the environment it gives its MCP servers); a call_id starting with `-` ->
+  NOT_STARTED;
   packet over 64 KiB or invalid -> NOT_STARTED; `deadline_s` + 30 + 60 over the 6 h job limit -> NOT_STARTED
-  `deadline_too_long`; optional post check (posts nothing) -> NOT_STARTED; an existing call directory this store's jobs did
+  `deadline_too_long`; optional post check (posts nothing) -> NOT_STARTED; an out root or `packets/` that is a symlink, not owned by this user
+  or open to group/other -> NOT_STARTED `out root not private`; an existing call directory this store's jobs did
   not make -> `consult_call_id_conflict`. The same call_id with the same packet replays; a different packet is
   `consult_call_id_conflict`. `consult_start` returns within about 2 s (`started` / `replayed` / `ended`); a busy lane
   shows inline as REFUSED `busy`, retryable. `consult_result` waits inside the tool 25 s by default (host yield minus 5 s, at most 50 s),
