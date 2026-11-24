@@ -1,0 +1,22 @@
+{
+ "artifactDirectoryPath": "/home/user/.gemini/antigravity-cli/brain/bcfab98b-9167-41ec-b32a-0ca9a6f39285",
+ "conversationId": "bcfab98b-9167-41ec-b32a-0ca9a6f39285",
+ "cwd": "/work/proj",
+ "hookEventName": "PreToolUse",
+ "lastUserInput": "Use run_command to run: echo shellwrite > d.txt . Then report done.",
+ "modelName": "gemini-4-neon-low",
+ "stepIdx": 2,
+ "toolCall": {
+  "args": {
+   "CommandLine": "echo shellwrite > d.txt",
+   "WaitMsBeforeAsync": 5000,
+   "toolSummary": "Write text to d.txt"
+  },
+  "id": "call_1978012942867814271",
+  "name": "run_command"
+ },
+ "transcriptPath": "/home/user/.gemini/antigravity-cli/brain/bcfab98b-9167-41ec-b32a-0ca9a6f39285/.system_generated/logs/transcript_full.jsonl",
+ "workspacePaths": [
+  "/work/proj"
+ ]
+}

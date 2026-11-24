@@ -13,7 +13,7 @@ import json
 import os
 import time
 
-from . import model
+from . import model, sendcap
 from .model import (
     ProtocolError,
     RECIPIENT_ALL,
@@ -23,6 +23,11 @@ from .model import (
     STATE_COMPLETION_CLAIMED,
     STATE_DELIVERED,
     STATE_PERSISTED,
+    FEATURE_SEND_CAPABILITY,
+    FEATURE_SESSION_LINKS,
+    FEATURE_TRIANGLE_KINDS,
+    PROTOCOL_FEATURES,
+    TRIANGLE_KINDS,
     utcnow,
 )
 from .store import CoordStore, StoreError, require_id, valid_id
@@ -43,15 +48,18 @@ def _same_path(a, b) -> bool:
         return str(a) == str(b)
 
 
-def _norm_sid(s) -> str:
+def _norm_sid(s, host_kind=None) -> str:
+    """Lowercase; the "claude-" prefix is stripped ONLY for host kind "claude" (others exact)."""
     s = str(s or "").strip().lower()
-    return s[len("claude-") :] if s.startswith("claude-") else s
+    if host_kind == "claude" and s.startswith("claude-"):
+        return s[len("claude-") :]
+    return s
 
 
-def _sid_match(stored, given) -> bool:
+def _sid_match(stored, given, host_kind=None) -> bool:
     # EXACT after normalization; an abbreviation must not resolve a native session
     # (adapter identity follow-up).
-    a, b = _norm_sid(stored), _norm_sid(given)
+    a, b = _norm_sid(stored, host_kind), _norm_sid(given, host_kind)
     return bool(a and b and a == b)
 
 
@@ -107,6 +115,9 @@ def _page(rows, key, cursor, limit):
     return [r for _k, r in page], nxt, more
 
 
+CORRELATION_EXEMPT_KINDS = ("acknowledgment", "completion_receipt")
+
+
 _HANDLE_PREFIX = "sd:"  # short correlated notification handle: sd: + 24 hex == 27 chars
 
 
@@ -150,6 +161,13 @@ class Coordinator:
     def __init__(self, store: CoordStore | None = None):
         self.store = store or CoordStore()
 
+    @property
+    def links(self):
+        """Mode 2 link manager (links.py); inert on a task without the session-links feature."""
+        from .links import Links
+
+        return Links(self)
+
     # ---- lock name: the task_id itself (validated, <=120), one coarse lock per task ----
     def _lock(self, task_id: str):
         return self.store.lock(require_id(task_id, "task_id"))
@@ -176,6 +194,76 @@ class Coordinator:
         self.store.write(rel, rec)
         return rec
 
+    def _advisory_selection_guard(
+        self, task_id: str, participant_id: str, host_kind, session_id
+    ) -> None:
+        """Round 4 (N1). In an advisory process, refuse BEFORE any write when the selection this
+        (host, session) would write or shadow is held by a different live participant.
+        (a) the host kind must be exactly one of claude/codex/antigravity (no case variants);
+        (b) every stored selection the write would replace is examined: the record at the EXACT path
+            _write_selection uses, plus any record the _sid_match fallback scan would match;
+        (c) a record held by a different (task, participant) blocks the write unless the holder is
+            missing, detached, or no longer on THAT RECORD's own host/session, or is an observer whose
+            stored host+session equal the caller's. Comparisons use the stored record, never the
+            caller's claim about it."""
+        if not model.advisory_process():
+            return
+        if not isinstance(host_kind, str) or host_kind not in model.HOST_KINDS:
+            raise ProtocolError(
+                "advisory_process_refused",
+                participant_id,
+                "advisory process: host kind must be exactly one of claude, codex, antigravity",
+            )
+        if not session_id:
+            return  # no selection would be written
+        recs, seen = [], set()
+        exact = f"sessions/{host_kind}/{_session_seg(session_id)}.json"
+        r = self.store.read(exact)
+        if r:
+            recs.append(r)
+            seen.add(exact)
+        for pth in self.store.listdir(f"sessions/{host_kind}"):
+            rel = f"sessions/{host_kind}/{pth.name}"
+            if rel in seen:
+                continue
+            r = self.store.read(rel)
+            if r and _sid_match(r.get("session_id"), session_id, host_kind):
+                recs.append(r)
+                seen.add(rel)
+        for rec in recs:
+            holder = (rec.get("task_id"), rec.get("participant_id"))
+            if holder == (task_id, participant_id):
+                continue
+            q = None
+            if holder[0] and holder[1]:
+                q = self.store.read(
+                    f"{_task_root(holder[0])}/participants/{holder[1]}.json"
+                )
+            if not q or q.get("detached"):
+                continue
+            qh = q.get("host") or {}
+            rec_host = rec.get("host") or host_kind
+            if not (
+                qh.get("host") == rec_host
+                and (
+                    qh.get("session") == rec.get("session_id")
+                    or _sid_match(qh.get("session"), rec.get("session_id"), rec_host)
+                )
+            ):
+                continue  # the holder moved on: a stale selection is not protected
+            if (
+                q.get("role") == "observer"
+                and qh.get("host") == host_kind
+                and qh.get("session") == session_id
+            ):
+                continue  # the same advisory identity re-selecting itself
+            raise ProtocolError(
+                "advisory_process_refused",
+                participant_id,
+                "refused in an advisory process: this host/session is already selected by another "
+                "participant (task %s, participant %s)" % (holder[0], holder[1]),
+            )
+
     def select_session(
         self,
         task_id: str,
@@ -190,6 +278,7 @@ class Coordinator:
         worktree never resolve to each other (native-routing review 1). The participant must be
         attached with a matching host kind."""
         with self._lock(task_id):
+            self._advisory_selection_guard(task_id, participant_id, host_kind, session_id)
             p = self._participant(task_id, participant_id)
             if (p.get("host") or {}).get("host") != host_kind:
                 raise ProtocolError(
@@ -203,7 +292,7 @@ class Coordinator:
             # foreign/stale session could be silently bound (session-transition review 1). Initial
             # binding (no current session) is still allowed; same-session compaction is unaffected.
             cur = (p.get("host") or {}).get("session")
-            if cur and not _sid_match(cur, session_id):
+            if cur and not _sid_match(cur, session_id, host_kind):
                 raise ProtocolError(
                     "session_identity_mismatch",
                     participant_id,
@@ -219,6 +308,21 @@ class Coordinator:
                 worktree or p.get("worktree_realpath"),
             )
 
+    def _read_selection_raw(self, host_kind: str, session_id: str) -> dict | None:
+        """The stored native-session selection record for (host, session), exactly as written
+        (no participant validation). Same lookup as resolve_session."""
+        from .store import valid_id as _vi
+
+        if not _vi(host_kind) or not session_id:
+            return None
+        rec = self.store.read(f"sessions/{host_kind}/{_session_seg(session_id)}.json")
+        if not rec:
+            for pth in self.store.listdir(f"sessions/{host_kind}"):
+                r = self.store.read(f"sessions/{host_kind}/{pth.name}")
+                if r and _sid_match(r.get("session_id"), session_id, host_kind):
+                    return r
+        return rec
+
     def resolve_session(self, host_kind: str, session_id: str) -> dict | None:
         """Resolve a native (host, session_id) to its selected {task, participant}, or None.
         Silent (None) if the participant is detached or its host kind no longer matches."""
@@ -230,7 +334,7 @@ class Coordinator:
         if not rec:
             for pth in self.store.listdir(f"sessions/{host_kind}"):
                 r = self.store.read(f"sessions/{host_kind}/{pth.name}")
-                if r and _sid_match(r.get("session_id"), session_id):
+                if r and _sid_match(r.get("session_id"), session_id, host_kind):
                     rec = r
                     break
         if not rec:
@@ -244,7 +348,7 @@ class Coordinator:
         # (attach allow_transition) moves it to a new session and leaves the old selection record
         # behind; that stale record must not resolve (session-transition review 1). The
         # participant's CURRENT host.session is the authority.
-        if not _sid_match((p.get("host") or {}).get("session"), rec.get("session_id")):
+        if not _sid_match((p.get("host") or {}).get("session"), rec.get("session_id"), host_kind):
             return None
         return {
             "task": rec["task_id"],
@@ -269,7 +373,7 @@ class Coordinator:
         host = p.get("host") or {}
         if host.get("host") != host_kind:
             return False
-        return _sid_match(host.get("session"), session_id)
+        return _sid_match(host.get("session"), session_id, host_kind)
 
     # ------------------------------------------------------------------ tasks
     def create_task(
@@ -281,10 +385,46 @@ class Coordinator:
         authorization_ref=None,
         revision: int = 0,
         title: str = "",
+        protocol_features: list | None = None,
+        message_budget: dict | None = None,
     ) -> dict:
         """Create-or-return a task. Idempotent: a second call returns the existing task unchanged
         (it never resets revision or authorization). authorization_ref is recorded, never a grant."""
         require_id(task_id, "task_id")
+        # Opt-in task fields (absent unless requested, so a default task.json is byte-for-byte the
+        # base format): protocol_features gates the triangle message kinds; message_budget caps sends.
+        if protocol_features is not None:
+            if not isinstance(protocol_features, list) or any(
+                f not in PROTOCOL_FEATURES for f in protocol_features
+            ):
+                raise ProtocolError(
+                    "invalid_protocol_features",
+                    task_id,
+                    f"protocol_features must be a list drawn from {PROTOCOL_FEATURES}",
+                )
+        if protocol_features and FEATURE_SESSION_LINKS in protocol_features and (
+            FEATURE_SEND_CAPABILITY not in protocol_features
+        ):
+            raise ProtocolError(
+                "session_links_requires_send_capability",
+                task_id,
+                f"protocol feature {FEATURE_SESSION_LINKS!r} requires {FEATURE_SEND_CAPABILITY!r} on the same task",
+            )
+        if message_budget is not None:
+            ok = isinstance(message_budget, dict) and message_budget and all(
+                k in ("per_correlation", "per_sender")
+                and isinstance(v, int)
+                and not isinstance(v, bool)
+                and v >= 0
+                for k, v in message_budget.items()
+            )
+            if not ok:
+                raise ProtocolError(
+                    "invalid_message_budget",
+                    task_id,
+                    "message_budget must be a non-empty object with non-negative integer "
+                    "per_correlation and/or per_sender",
+                )
         rel = f"{_task_root(task_id)}/task.json"
         with self._lock(task_id):
             existing = self.store.read(rel)
@@ -300,6 +440,10 @@ class Coordinator:
                 "revision": int(revision),
                 "created_at": utcnow(),
             }
+            if protocol_features:
+                task["protocol_features"] = list(protocol_features)
+            if message_budget:
+                task["message_budget"] = dict(message_budget)
             self.store.write(rel, task)
             self.store.append_receipt(
                 f"{_task_root(task_id)}/audit.jsonl",
@@ -488,6 +632,10 @@ class Coordinator:
         cwd is outside the executor repo is first-class: worktree_realpath is a field, never inferred."""
         require_id(task_id, "task_id")
         require_id(participant_id, "participant_id")
+        model.require_advisory_allowed(
+            "attach", role == "observer" and not allow_transition,
+            "only a plain observer attach is allowed (no other role, no allow_transition)",
+        )
         with self._lock(task_id):
             self._require_task(task_id)
             rel = f"{_task_root(task_id)}/participants/{participant_id}.json"
@@ -513,7 +661,26 @@ class Coordinator:
                     participant_id,
                     "executor worktree_realpath must equal the task's canonical worktree_realpath",
                 )
+            # Advisory selection-capture guard (round 4, N1): before ANY write, also for a fresh id.
+            self._advisory_selection_guard(
+                task_id, participant_id, (host or {}).get("host"), (host or {}).get("session")
+            )
             prev = self.store.read(rel)
+            if prev and model.advisory_process():
+                # advisory takeover guard: an observer may only (re)attach ITS OWN observer record
+                ph = prev.get("host") or {}
+                nh = host or {}
+                if (
+                    prev.get("role") != "observer"
+                    or ph.get("host") != nh.get("host")
+                    or ph.get("session") != nh.get("session")
+                ):
+                    raise ProtocolError(
+                        "advisory_process_refused",
+                        participant_id,
+                        "attach refused in an advisory process: a stored record exists for this "
+                        "participant_id with a different role/host/session",
+                    )
             if prev and not prev.get("detached"):
                 # Idempotent re-attach requires the SAME identity; a changed role/host/worktree is
                 # a conflict unless an explicit controlled transition is requested (finding 3).
@@ -541,7 +708,42 @@ class Coordinator:
                         "worktree_realpath": prev.get("worktree_realpath"),
                         "at": utcnow(),
                     }
-            self.store.write(rel, p)
+            # Send capability (proposal step 3): keep this process's capability when it already holds
+            # the current one; otherwise mint a new one. On an enforced task a participant whose holder
+            # process is still alive (or cannot be checked) is not taken over, except by an explicit
+            # allow_transition from a non-advisory process (audited).
+            cap_event = "minted"
+            cap_before = sendcap.held(self.store, task_id, participant_id)
+            if prev and not prev.get("detached") and sendcap.holds_current(
+                self.store, task_id, participant_id, prev
+            ):
+                p["send_cap"] = prev["send_cap"]
+                cap_event = "kept"
+            else:
+                if prev and not prev.get("detached") and self._cap_enforced(task):
+                    state = sendcap.holder_state((prev.get("send_cap") or {}).get("holder"))
+                    if state != sendcap.DEAD:
+                        if not allow_transition:
+                            raise ProtocolError(
+                                "participant_held"
+                                if state == sendcap.ALIVE
+                                else "participant_holder_unknown",
+                                participant_id,
+                                f"{participant_id} is held by another process that is "
+                                + ("still running" if state == sendcap.ALIVE else "not checkable")
+                                + "; attach under your own participant id (a non-advisory process may "
+                                "take it over with allow_transition, which is audited)",
+                            )
+                        cap_event = "takeover"
+                p["send_cap"] = sendcap.mint(self.store, task_id, participant_id)
+            try:
+                self.links.prepare_change(task_id, participant_id, p)  # strict: refuse with nothing applied
+                self.store.write(rel, p)
+            except BaseException:
+                # the record was not written: this process keeps the capability the store still matches
+                sendcap.restore(self.store, task_id, participant_id, cap_before)
+                raise
+            self.links.participant_changed(task_id, participant_id)  # a different native session -> stale
             # Bind the selection to this native session so startup/compaction resolve to the
             # right participant even with two sessions in one worktree (native-routing review 1).
             sid = (host or {}).get("session")
@@ -556,10 +758,10 @@ class Coordinator:
             self.store.append_receipt(
                 f"{_task_root(task_id)}/audit.jsonl",
                 "attach",
-                {"participant_id": participant_id, "role": role},
+                {"participant_id": participant_id, "role": role, "send_cap": cap_event},
                 lock_name=task_id,
             )
-            return p
+            return sendcap.public(p)
 
     def detach(self, task_id: str, participant_id: str) -> dict:
         """Detach WITHOUT terminating the peer. Records detach; leaves messages/acks intact."""
@@ -570,24 +772,86 @@ class Coordinator:
                 raise ProtocolError(
                     "unknown_participant", participant_id, "not attached"
                 )
+            model.require_advisory_allowed(
+                "detach", p.get("role") == "observer",
+                "only an observer participant may be detached",
+            )
+            self._require_cap(task_id, participant_id, "detach")
             p["detached"] = True
             p["detached_at"] = utcnow()
+            p.pop("send_cap", None)  # revoke: no capability matches a detached record (review 4)
+            self.links.prepare_change(task_id, participant_id, p)  # strict: refuse with nothing applied
             self.store.write(rel, p)
+            self.links.participant_changed(task_id, participant_id)  # a detached member -> stale
+            sendcap.forget(self.store, task_id, participant_id)
             self.store.append_receipt(
                 f"{_task_root(task_id)}/audit.jsonl",
                 "detach",
                 {"participant_id": participant_id},
                 lock_name=task_id,
             )
-            return p
+            return sendcap.public(p)
 
     def list_participants(self, task_id: str) -> list[dict]:
         out = []
         for path in self.store.listdir(f"{_task_root(task_id)}/participants"):
             rec = self.store.read(f"{_task_root(task_id)}/participants/{path.name}")
             if rec:
-                out.append(rec)
+                out.append(sendcap.public(rec))
         return sorted(out, key=lambda r: r.get("attached_at", ""))
+
+    def _require_advisory_observer(self, task_id: str, participant_id: str, op: str) -> None:
+        """Review F12. In an advisory process the participant an operation names (ack, set_cursor) or
+        sends as (send) must be an attached, non-detached OBSERVER: an adviser may not act as the
+        executor or supervisor. Containment of an MCP-only process, not authentication."""
+        if not model.advisory_process():
+            return
+        p = self.store.read(f"{_task_root(task_id)}/participants/{participant_id}.json")
+        model.require_advisory_allowed(
+            op,
+            bool(p) and not p.get("detached") and p.get("role") == "observer",
+            f"{participant_id} is not an attached observer; an advisory process may only act as one",
+        )
+
+    @staticmethod
+    def _cap_enforced(task: dict | None) -> bool:
+        """Send capability applies on a task with the send-capability feature, and always in an
+        advisory process."""
+        return model.advisory_process() or FEATURE_SEND_CAPABILITY in (
+            (task or {}).get("protocol_features") or []
+        )
+
+    def _require_cap(
+        self, task_id: str, participant_id: str, op: str, *, task=None, must_exist: bool = True
+    ) -> None:
+        """Refuse an identity-bearing write unless this process holds the participant's current
+        capability (enforced tasks and advisory processes only). On an enforced task the participant
+        must be attached and not detached (review 3); ``must_exist=False`` (bridge controller ids,
+        which need not be participants) skips ids with no record."""
+        task = task if task is not None else self.get_task(task_id)
+        if not self._cap_enforced(task):
+            return
+        p = self.store.read(f"{_task_root(task_id)}/participants/{participant_id}.json")
+        if not p and not must_exist:
+            return
+        if must_exist or p:
+            self._participant(task_id, participant_id)  # unknown_participant / participant_detached
+        if sendcap.holds_current(self.store, task_id, participant_id, p):
+            return
+        if sendcap.held(self.store, task_id, participant_id):
+            raise ProtocolError(
+                "send_capability_stale",
+                participant_id,
+                f"{op} refused: {participant_id} was attached again by another process after this one; "
+                "attach it here again (same identity) to act as it",
+            )
+        raise ProtocolError(
+            "send_capability_required",
+            participant_id,
+            f"{op} refused: this process did not attach {participant_id} and the task requires the "
+            "send capability. Attach it from this process with the same identity (coord_attach), or "
+            "attach and act under your own participant id. The CLI keeps capabilities in --cap-file.",
+        )
 
     def _participant(self, task_id: str, participant_id: str) -> dict:
         p = self.store.read(f"{_task_root(task_id)}/participants/{participant_id}.json")
@@ -625,6 +889,7 @@ class Coordinator:
         host: dict | None = None,
         execution_action_id: str | None = None,
         actionable: bool | None = None,
+        link_id: str | None = None,
     ) -> dict:
         """Persist an addressed message. Idempotent by (message_id, content): a repeat with the SAME
         content returns the stored message and does NOT re-append; a repeat with the SAME id but
@@ -652,6 +917,12 @@ class Coordinator:
         effective_actionable = (
             default_actionable or bool(actionable) or (execution_action_id is not None)
         )
+        model.require_advisory_allowed(
+            "send",
+            not effective_actionable and kind in model.ADVISORY_ALLOWED_SEND_KINDS,
+            "only non-actionable " + ", ".join(model.ADVISORY_ALLOWED_SEND_KINDS) + " sends are allowed",
+        )
+        self._require_advisory_observer(task_id, sender, "send")
         msg = model.build_message(
             message_id=message_id,
             task_id=task_id,
@@ -671,8 +942,9 @@ class Coordinator:
         em = ExecutionManager(self.store)
         idx_rel = f"{_task_root(task_id)}/ids/{message_id}.json"
         with self._lock(task_id):
-            self._require_task(task_id)
-            self._participant(task_id, sender)  # sender must be attached
+            task = self._require_task(task_id)
+            sender_p = self._participant(task_id, sender)  # sender must be attached
+            self._require_cap(task_id, sender, "send", task=task)
             # Idempotency keyed by the DURABLE body, not a pre-written index. The message file is
             # the single authoritative publication (atomic temp+rename); the index is a rebuildable
             # accelerator. A crash that loses the index is recovered by locating the durable body by
@@ -696,6 +968,30 @@ class Coordinator:
                     message_id,
                     "message_id reused with different content; a payload change requires a new id",
                 )
+            if link_id is not None:  # mode 2, first-time sends only (a replay returned above): exactly the partner
+                self.links.check_send(
+                    task_id, link_id, sender, recipient, kind, actionable=effective_actionable
+                )
+            # triangle kinds are opt-in per task (an old-version sender would refuse them; every
+            # reader tolerates them), and consult_request/report are never work requests.
+            if kind in TRIANGLE_KINDS and FEATURE_TRIANGLE_KINDS not in (
+                task.get("protocol_features") or []
+            ):
+                raise ProtocolError(
+                    "kind_requires_feature",
+                    message_id,
+                    f"kind {kind!r} needs the task opt-in protocol_features="
+                    f"[{FEATURE_TRIANGLE_KINDS!r}] set at create-task",
+                )
+            if kind in ("consult_request", "report") and (
+                actionable or execution_action_id is not None
+            ):
+                raise ProtocolError(
+                    "invalid_actionable",
+                    message_id,
+                    f"{kind} is non-actionable and cannot carry actionable/execution_action_id",
+                )
+            self._check_message_budget(task, task_id, sender, sender_p, correlation_id, msg)
             # managed work-request gate (review R1): a NEW actionable message on a managed task CLAIMS
             # and BINDS its reservation to THIS message id, atomically, under the already-held per-task
             # lock (re-entrant) — NOT a deferred read-only check. Native Claude reads the inbox
@@ -746,6 +1042,41 @@ class Coordinator:
             )
             return {"idempotent": False, "message": msg, "seq": seq}
 
+    def _check_message_budget(self, task, task_id, sender, sender_p, correlation_id, msg) -> None:
+        """Opt-in reply budget (task.message_budget). Runs under the held task lock, O(messages on
+        task). per_correlation counts every message sharing the correlation_id (supervisors exempt);
+        per_sender counts EVERY message by the sender (actionable or not); acknowledgment and
+        completion_receipt are exempt from per_correlation only. A task without the field is unchanged."""
+        budget = task.get("message_budget")
+        if not budget:
+            return
+        per_corr = budget.get("per_correlation")
+        per_sender = budget.get("per_sender")
+        check_corr = (per_corr is not None and correlation_id and sender_p.get("role") != "supervisor"
+                      and msg.get("kind") not in CORRELATION_EXEMPT_KINDS)
+        if not check_corr and per_sender is None:
+            return
+        n_corr = n_sender = 0
+        for rec in self._all_messages(task_id):
+            if (check_corr and rec.get("correlation_id") == correlation_id
+                    and rec.get("kind") not in CORRELATION_EXEMPT_KINDS):
+                n_corr += 1
+            if rec.get("sender") == sender:
+                n_sender += 1
+        if check_corr and n_corr + 1 > per_corr:
+            raise ProtocolError(
+                "message_budget_exceeded",
+                msg["message_id"],
+                f"correlation {correlation_id!r} already has {n_corr} messages "
+                f"(per_correlation={per_corr})",
+            )
+        if per_sender is not None and n_sender + 1 > per_sender:
+            raise ProtocolError(
+                "message_budget_exceeded",
+                msg["message_id"],
+                f"{sender} already sent {n_sender} messages (per_sender={per_sender})",
+            )
+
     def _all_messages(self, task_id: str) -> list[dict]:
         out = []
         for path in self.store.listdir(f"{_task_root(task_id)}/messages"):
@@ -766,7 +1097,7 @@ class Coordinator:
         if not message or not self._addressed_to(message, p):
             raise ProtocolError("message_not_addressed", message_id,
                                 "no message addressed to this participant")
-        return message
+        return model.with_reply_expected(message)
 
     def _max_seq(self, task_id: str) -> int:
         """Highest DURABLE message seq (derived from atomic body filenames). This is the seq
@@ -834,6 +1165,8 @@ class Coordinator:
             from .views import message_view
 
             page = [message_view(m) for m in page]
+        else:
+            page = [model.with_reply_expected(m) for m in page]
         return {
             "messages": page,
             "next_after_seq": next_after,
@@ -849,7 +1182,9 @@ class Coordinator:
     def set_cursor(self, task_id: str, participant_id: str, after_seq: int) -> dict:
         """Advance the bounded NOTIFICATION cursor. This is deliberately SEPARATE from acknowledgment
         so a reminder failure never loses a message (contract §Delivery). It is monotonic."""
+        self._require_advisory_observer(task_id, participant_id, "set_cursor")
         with self._lock(task_id):
+            self._require_cap(task_id, participant_id, "set_cursor")
             rel = f"{_task_root(task_id)}/cursors/{participant_id}.json"
             cur = self.store.read(rel) or {"after_seq": 0}
             new = max(int(cur.get("after_seq", 0)), int(after_seq))
@@ -928,8 +1263,10 @@ class Coordinator:
     ) -> dict:
         """Explicitly acknowledge that a specific message was RECEIVED. This is not a claim that its
         requested action completed (contract §Intended outcome). Idempotent per (participant, id)."""
+        self._require_advisory_observer(task_id, participant_id, "ack")
         with self._lock(task_id):
             p = self._participant(task_id, participant_id)
+            self._require_cap(task_id, participant_id, "ack")
             msg = self.get_message(task_id, message_id)
             if not msg:
                 raise ProtocolError(
@@ -1034,6 +1371,7 @@ class Coordinator:
         return STATE_PERSISTED
 
     # ------------------------------------------------------------------ checkpoints
+    @model.authority_op("checkpoint_publish")
     def publish_checkpoint(
         self,
         task_id: str,
@@ -1057,6 +1395,7 @@ class Coordinator:
         with self._lock(task_id):
             self._require_task(task_id)
             self._participant(task_id, participant_id)
+            self._require_cap(task_id, participant_id, "checkpoint_publish")
             prev = self.store.read(rel)
             if prev:
                 if prev.get("content_hash") == body_hash:
@@ -1199,7 +1538,7 @@ class Coordinator:
         messages addressed to this participant + the current revision/authorization. Large transcripts
         are NOT re-injected — only pending items and the checkpoint."""
         task = self._require_task(task_id)
-        p = self._participant(task_id, participant_id)
+        p = sendcap.public(self._participant(task_id, participant_id))
         from .execution import ExecutionManager
         from .views import checkpoint_view, execution_view, message_view, stops_wait
 
@@ -1214,6 +1553,8 @@ class Coordinator:
         count = len(pending)
         pending = pending[:limit]
         checkpoint = self.read_checkpoint(task_id)
+        if not compact:
+            pending = [model.with_reply_expected(m) for m in pending]
         if compact:
             pending = [message_view(m) for m in pending]
             checkpoint = checkpoint_view(checkpoint, after_revision=after_checkpoint_revision,
@@ -1252,6 +1593,8 @@ class Coordinator:
         *,
         controller_id: str | None = None,
     ) -> dict:
+        # a delivery-correlation write used only by the bridge and wake routes: an authority op (triangle merge)
+        model.require_authority("handle-mint")
         require_id(task_id, "task_id")
         require_id(message_id, "message_id")
         require_id(recipient, "recipient")
@@ -1511,6 +1854,17 @@ class Coordinator:
         completed. This NEVER calls a model, demands an ack, or writes into a scientific tree."""
         require_id(task_id, "task_id")
         require_id(participant_id, "participant_id")
+        if model.advisory_process():
+            # Triangle merge: an advisory process (consult/review/Antigravity) may publish status only for an
+            # observer participant it attached itself. Host hooks are not advisory and keep publishing without the
+            # send capability (they run outside the session process that holds it).
+            p = self.store.read(f"{_task_root(task_id)}/participants/{participant_id}.json") or {}
+            model.require_advisory_allowed(
+                "status-publish",
+                p.get("role") == "observer",
+                "an advisory process may publish status only for an observer participant",
+            )
+            self._require_cap(task_id, participant_id, "status-publish")
         if not native_session_id:
             raise ProtocolError(
                 "status_session_required",

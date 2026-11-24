@@ -27,7 +27,7 @@ from .execution import (
     STATUS_COMPLETED,
     STATUS_CLOSED,
 )
-from .model import ProtocolError, utcnow
+from .model import ProtocolError, authority_op, utcnow
 from .store import ID_RE
 
 BRIDGE_ACCEPTED = ("accepted", "completed")
@@ -133,17 +133,21 @@ def _same_path(a, b) -> bool:
         return str(a) == str(b)
 
 
-def _norm_session(s: str) -> str:
+def _norm_session(s: str, host_kind: str | None = None) -> str:
+    """Lowercase; strip the documented "claude-" prefix ONLY for a claude host (others exact)."""
     s = str(s or "").strip().lower()
-    return s[len("claude-") :] if s.startswith("claude-") else s
+    if host_kind == "claude" and s.startswith("claude-"):
+        return s[len("claude-") :]
+    return s
 
 
 def _session_match(binding_session, host: dict) -> bool:
     """EXACT match of the full native session id (after documented host-prefix normalization).
     An abbreviated/prefix id or the PID (native_id) is NOT authority to route to a live pane
     (adapter identity follow-up)."""
-    b = _norm_session(binding_session)
-    s = _norm_session(host.get("session"))
+    kind = host.get("host")
+    b = _norm_session(binding_session, kind)
+    s = _norm_session(host.get("session"), kind)
     return bool(b and s and b == s)
 
 
@@ -251,6 +255,7 @@ def _notification_line(task_id: str, msg: dict, handle: str | None = None) -> st
     return line if len(line) <= _ENVELOPE_MAX else line[:_ENVELOPE_MAX]
 
 
+@authority_op("coord_notify_via_bridge")
 def notify_via_bridge(
     co,
     *,
@@ -261,6 +266,7 @@ def notify_via_bridge(
     expected_revision: int,
     accept_timeout_s: float = 12.0,
     execution_action_id: str | None = None,
+    link_pin: dict | None = None,
 ) -> dict:
     msg = co.get_message(task_id, message_id)
     if not msg:
@@ -269,6 +275,9 @@ def notify_via_bridge(
             message_id,
             "cannot notify for a message that does not exist",
         )
+    # Send capability: when controller_id is a participant of an enforced task, only the process that
+    # attached it may notify as it.
+    co._require_cap(task_id, controller_id, "notify_via_bridge", must_exist=False)
     req_id = _bridge_request_id(task_id, message_id)
     corr_rel = f"tasks/{task_id}/correlations/{message_id}.json"
 
@@ -308,6 +317,17 @@ def notify_via_bridge(
 
     # Resolve the addressed recipient and verify the binding BEFORE any send (adapter review 1).
     recip = _resolve_recipient(co, task_id, msg)
+    if link_pin is not None:
+        # a link wake reaches only the pinned partner session: compare the record this delivery actually
+        # uses with the pin the link check returned (never retargets to a newcomer)
+        from .links import pin_of
+
+        if pin_of(recip) != link_pin:
+            raise ProtocolError(
+                "link_stale",
+                str(msg.get("recipient") or ""),
+                "the recipient is no longer on the session the link pinned; never retargeted",
+            )
     binding = _read_binding(binding_id)
     if binding is None:
         raise ProtocolError(
@@ -427,6 +447,19 @@ def notify_via_bridge(
                     execution_status=g.get("status"),
                     bound_to=g.get("bound_to"),
                 )
+
+    # Send capability re-check at the Enter boundary (review 1): a takeover that lands during staging
+    # withholds the keystroke, like the execution gate.
+    if co._cap_enforced(co.get_task(task_id)):
+        exec_gate = pre_enter_gate
+
+        def pre_enter_gate():
+            if exec_gate is not None:
+                exec_gate()
+            try:
+                co._require_cap(task_id, controller_id, "notify_via_bridge", must_exist=False)
+            except ProtocolError as e:
+                raise BridgeError("refused_" + e.code, e.message)
 
     try:
         res = Bridge().submit(

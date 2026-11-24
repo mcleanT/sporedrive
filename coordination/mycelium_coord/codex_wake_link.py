@@ -106,6 +106,9 @@ def wake_peer(
     receipt; the wake route stays ``not_established`` until a live start is validated in a reserved
     canary. Never raises for a gate/route refusal — it records and returns a structured outcome so a
     transport can reconcile; it raises only for a malformed request (unknown message/recipient)."""
+    from .model import require_authority
+
+    require_authority("wake-peer")  # waking another session is a drive op: refused in an advisory process
     msg = co.get_message(task_id, message_id)
     if not msg:
         raise ProtocolError(

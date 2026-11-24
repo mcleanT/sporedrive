@@ -1,0 +1,11 @@
+{
+  "writeguard": {
+    "_comment": "PROPOSED, NOT INSTALLED. Workspace-level <workspace>/.agents/hooks.json (shape verified to fire in M2 probes; matcher '*' verified, the script ignores tools it does not care about). agy is FAIL-CLOSED: the interpreter path must be absolute and exist, or matched tool calls are blocked. Replace <ABS_PYTHON> and <ABS_PATH_TO>.",
+    "PreToolUse": [
+      {"matcher": "*", "hooks": [{"command": "<ABS_PYTHON> <ABS_PATH_TO>/writeguard.py hook --host antigravity --event pre", "timeout": 10}]}
+    ],
+    "PostToolUse": [
+      {"matcher": "*", "hooks": [{"command": "<ABS_PYTHON> <ABS_PATH_TO>/writeguard.py hook --host antigravity --event post", "timeout": 10}]}
+    ]
+  }
+}

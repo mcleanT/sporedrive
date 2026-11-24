@@ -13,6 +13,8 @@ import hashlib
 import json
 import secrets
 from datetime import datetime, timezone
+import functools
+import os
 
 from .store import StoreError, valid_id
 
@@ -33,7 +35,94 @@ KINDS = (
     "checkpoint_ready",
     "completion_receipt",
     "acknowledgment",
+    "review_request",  # already in execution.ACTIONABLE_KINDS; was missing from KINDS
+    "consult_request",  # non-actionable (triangle-kinds)
+    "report",  # non-actionable (triangle-kinds)
 )
+
+# Kinds a BASE-commit (91546b3) reader tolerates only by accident: no reader validates the stored
+# kind (views/inbox/read_message/resume copy it verbatim), so these are readable by old servers, but
+# an old SENDER would refuse them (invalid_kind). Sending them therefore needs the task-level opt-in
+# protocol_features=["triangle-kinds"] so a task that mixes server versions stays well-defined.
+TRIANGLE_KINDS = ("review_request", "consult_request", "report")
+FEATURE_TRIANGLE_KINDS = "triangle-kinds"
+# Kinds that ask for an answer. reply_expected is DERIVED when a message is rendered (inbox, resume,
+# read_message), never stored: reply with kind `report`, reply_to the request.
+REPLY_EXPECTED_KINDS = ("review_request", "consult_request")
+
+
+def with_reply_expected(message: dict) -> dict:
+    """The message as rendered to a reader: reply_expected=True is added for a review/consult request,
+    nothing is added for any other kind (the stored record is never changed)."""
+    if message.get("kind") in REPLY_EXPECTED_KINDS:
+        return {**message, "reply_expected": True}
+    return message
+# Opt-in for the Codex exec-resume wake route (every wake is a billed model turn); see wake.py.
+FEATURE_CODEX_EXEC_WAKE = "codex-exec-wake"
+# Opt-in: every identity-bearing write (send, ack, set_cursor, checkpoint publish, detach, wake, bridge
+# notify) must come from the process that attached that participant (proposal step 3, "send binding").
+# An advisory process is always held to this rule, on every task. See coord.py "Send capability".
+FEATURE_SEND_CAPABILITY = "send-capability"
+# Opt-in: mode 2 "link" (links.py): two named live sessions pinned to one task. REQUIRES send-capability on the
+# same task, so every link operation is capability-checked.
+FEATURE_SESSION_LINKS = "session-links"
+PROTOCOL_FEATURES = (
+    FEATURE_TRIANGLE_KINDS,
+    FEATURE_CODEX_EXEC_WAKE,
+    FEATURE_SEND_CAPABILITY,
+    FEATURE_SESSION_LINKS,
+)
+
+# Advisory (consult/review/Antigravity) processes may read, attach as observer and send
+# non-actionable messages, but never exercise owner authority or drive other sessions.
+ADVISORY_ENV = "MYCELIUM_COORD_ADVISORY"
+
+
+def advisory_process() -> bool:
+    return os.environ.get(ADVISORY_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def require_authority(op: str) -> None:
+    """Single shared gate for authority/drive operations (MCP and CLI both reach the core)."""
+    if advisory_process():
+        raise ProtocolError(
+            "advisory_process_refused",
+            op,
+            f"{op} is an owner-authority/drive operation; refused in an advisory process "
+            f"({ADVISORY_ENV} is set)",
+        )
+
+
+# The single list of host kinds (coord attach validation, waitpath, wake routes). writeguard.py is a
+# standalone hook script and keeps its own copy; a test asserts the two are equal.
+HOST_KINDS = ("claude", "codex", "antigravity")
+
+# strict allowlist for an advisory sender (non-actionable notices only)
+ADVISORY_ALLOWED_SEND_KINDS = (
+    "question", "progress", "review_finding", "acknowledgment", "consult_request", "report",
+)
+
+
+def require_advisory_allowed(op: str, ok: bool, why: str) -> None:
+    """Allowlist gate: in an advisory process refuse unless ``ok`` (the caller computed it)."""
+    if advisory_process() and not ok:
+        raise ProtocolError(
+            "advisory_process_refused",
+            op,
+            f"{op} refused in an advisory process ({ADVISORY_ENV} is set): {why}",
+        )
+
+
+def authority_op(op: str):
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*a, **kw):
+            require_authority(op)
+            return fn(*a, **kw)
+
+        return wrapper
+
+    return deco
 
 # Which message KINDS default to actionable (they DISPATCH executable work) on a managed task. This
 # is the message-kind projection of execution.ACTIONABLE_KINDS (which also lists internal reservation

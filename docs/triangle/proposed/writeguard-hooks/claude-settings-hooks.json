@@ -1,0 +1,11 @@
+{
+  "_comment": "PROPOSED, NOT INSTALLED. Replace <ABS_PYTHON> (e.g. /usr/bin/python3) and <ABS_PATH_TO> with absolute paths. Claude's own Write/Edit staleness check already runs before hooks; these hooks only warn on shell overwrites and record reads/writes for the ledger.",
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "<ABS_PYTHON> <ABS_PATH_TO>/writeguard.py hook --host claude --event pre", "timeout": 10}]}
+    ],
+    "PostToolUse": [
+      {"matcher": "Bash|Read|Write|Edit|MultiEdit", "hooks": [{"type": "command", "command": "<ABS_PYTHON> <ABS_PATH_TO>/writeguard.py hook --host claude --event post", "timeout": 10}]}
+    ]
+  }
+}

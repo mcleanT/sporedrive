@@ -1,0 +1,14 @@
+{
+ "session_id": "01a20602-0e24-7a00-96dd-82acfac31aa4",
+ "turn_id": "01a20602-10cc-7082-a7fc-91834f55e3d8",
+ "transcript_path": "/home/user/.codex/sessions/2026/11/22/rollout-2026-11-22T20-25-27-01a20602-0e24-7a00-96dd-82acfac31aa4.jsonl",
+ "cwd": "/work/proj",
+ "hook_event_name": "PreToolUse",
+ "model": "gpt-6.2-astra",
+ "permission_mode": "default",
+ "tool_name": "apply_patch",
+ "tool_input": {
+  "command": "*** Begin Patch\n*** Delete File: existing2.txt\n*** Add File: existing2.txt\n+NEW2\n*** End Patch"
+ },
+ "tool_use_id": "exec-1820069e-8fc3-44c7-bf25-2a4d8e5bb067"
+}

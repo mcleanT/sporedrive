@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 
 from .jobs import DEFAULT_DEADLINE_S, DEFAULT_TAIL_BYTES, JobManager
-from .model import ProtocolError, utcnow
+from .model import ProtocolError, authority_op, utcnow
 from .store import CoordStore, require_id
 
 WORKER_SCHEMA_VERSION = "1.0.0"
@@ -76,6 +76,7 @@ class WorkerManager:
         return self.store.read(self._rel(worker_id, "worker.json"))
 
     # ------------------------------------------------------------------ run (CLI-only)
+    @authority_op("worker-run")
     def run(self, worker_id: str, prompt_path, *, profile: str = "routine", output_path=None,
             require_keys=(), expect: str = "json", task_id=None, action_id=None,
             dispatch_identity=None, deadline_s: float = DEFAULT_DEADLINE_S, label=None,

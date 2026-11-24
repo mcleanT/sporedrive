@@ -16,7 +16,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
-from . import schedule
+from . import consult, schedule
 from .coord import Coordinator
 from .execution import ExecutionManager
 from .jobs import DEFAULT_TAIL_BYTES, JOIN_MAX_S, JobManager
@@ -79,6 +79,8 @@ async def coord_create_task(
     authorization_ref: str | None = None,
     revision: int = 0,
     title: str = "",
+    protocol_features: list[str] | None = None,
+    message_budget: dict | None = None,
 ) -> dict:
     """Create-or-return an authorized coordination task. Idempotent; never resets an existing task.
 
@@ -89,6 +91,17 @@ async def coord_create_task(
         authorization_ref: Owner authorization reference (recorded, never a grant).
         revision: Initial task revision.
         title: Human title.
+        protocol_features: Opt-in features: "triangle-kinds" allows review_request/consult_request/report
+            messages (without it those kinds are refused with kind_requires_feature); "codex-exec-wake"
+            allows the headless Codex wake route (only for a Codex participant attached with wake=headless);
+            "send-capability" binds each participant to the process that attached it: send, ack, set_cursor,
+            checkpoint publish, detach, wake and bridge notify from any other process are refused
+            (send_capability_required / send_capability_stale), and attaching an id whose holder process is
+            still running is refused (participant_held).
+            "session-links" enables mode 2 (coord_link_propose / confirm / end / get; link_id on send and wake):
+            two named live sessions pinned to the task. It REQUIRES "send-capability" on the same task.
+        message_budget: Opt-in reply budget {"per_correlation": N, "per_sender": M}; sends beyond it
+            are refused with message_budget_exceeded (supervisors exempt from per_correlation).
     """
     return await asyncio.to_thread(
         lambda: _wrap(
@@ -100,6 +113,8 @@ async def coord_create_task(
                 authorization_ref=authorization_ref,
                 revision=revision,
                 title=title,
+                protocol_features=protocol_features,
+                message_budget=message_budget,
             ),
         )
     )
@@ -125,8 +140,19 @@ async def coord_attach(
         participant_id: Stable participant id.
         role: supervisor | executor | observer.
         worktree_realpath: Participant's canonical worktree (executor must match the task's).
-        host: Native identity object: {host: claude|codex|..., session: <id>, native_id: <id>}.
-        allow_transition: Permit a controlled rebind to a new identity/role.
+        host: Native identity object: {host: claude|codex|antigravity, session: <id>, native_id: <id>}.
+            Add "wake": "headless" to a Codex participant that is a machine-only headless thread, so
+            `codex exec resume` may wake it (needs the codex-exec-wake task feature); any other value or
+            no marker means the participant is never woken.
+        allow_transition: Permit a controlled rebind to a new identity/role. On a send-capability task it
+            also takes over an id whose holder process is still running (audited); refused in an advisory
+            process.
+
+    This server PROCESS keeps the participant's send capability in memory; it is never returned. On a
+    task with the send-capability feature (and always in an advisory process) only calls made through this
+    same server process can act as the participant; after a restart, attach again with the same identity
+    first. Sessions that share one server process (for example several Antigravity App conversations
+    served by one MCP process) share its capabilities: the binding is per process, not per conversation.
     """
     return await asyncio.to_thread(
         lambda: _wrap(
@@ -159,6 +185,7 @@ async def coord_send(
     host: dict | None = None,
     execution_action_id: str | None = None,
     actionable: bool | None = None,
+    link_id: str | None = None,
 ) -> dict:
     """Persist an addressed message. Idempotent by (message_id, content); a same-id different-content
     send is rejected. Exactly one of text / artifact_ref. A completion_receipt requires reply_to and
@@ -170,7 +197,10 @@ async def coord_send(
         message_id: Idempotency key ([A-Za-z0-9._:-], <=120).
         sender: Attached sender participant id.
         recipient: A participant id, a role, or 'all' (this task only).
-        kind: task|amendment|review_finding|progress|blocker|question|checkpoint_request|checkpoint_ready|completion_receipt|acknowledgment.
+        kind: task|amendment|review_finding|progress|blocker|question|checkpoint_request|checkpoint_ready|completion_receipt|acknowledgment,
+            plus the triangle kinds review_request|consult_request|report. The triangle kinds are accepted only on a
+            task created with protocol_features ["triangle-kinds"], otherwise the send is refused (kind_requires_feature).
+            A review_request or consult_request expects an answer: reply with kind report and reply_to that request.
         task_revision: Task revision this message pertains to.
         text: Bounded inline body (<=8000 chars) — or use artifact_ref.
         artifact_ref: Immutable artifact reference instead of inline text.
@@ -184,6 +214,8 @@ async def coord_send(
             compatible reservation via execution_action_id); False marks a status/notice that never
             wakes a completed/closed executor. Default (None) derives it from kind — task-like kinds
             are actionable. A trusted-agent disposition, not a free-text parse.
+        link_id: Mode 2: send inside this active session link; recipient must be exactly the partner
+            participant (a role or 'all' is refused link_requires_exact_recipient; a stale link link_stale).
     """
     return await asyncio.to_thread(
         lambda: _wrap(
@@ -203,6 +235,7 @@ async def coord_send(
                 host=host or {},
                 execution_action_id=execution_action_id,
                 actionable=actionable,
+                link_id=link_id,
             ),
         )
     )
@@ -220,6 +253,8 @@ async def coord_inbox(
     """Bounded read of messages addressed to this participant with seq > after_seq. Does NOT consume
     and does NOT move the stored cursor. Compact summaries are the default. Use coord_read_message
     for a selected full body before acting; summaries are not complete briefs or acceptance evidence.
+    A message of kind review_request or consult_request carries reply_expected=true (derived, not
+    stored): answer it with a message of kind report whose reply_to is that request's message_id.
 
     Args:
         task_id: Task id.
@@ -244,6 +279,8 @@ async def coord_inbox(
 async def coord_read_message(task_id: str, participant_id: str, message_id: str) -> dict:
     """Read ONE complete addressed message selected from a compact inbox/resume. No acknowledgment.
     content_hash hashes the message envelope, not a referenced file. Verify file hashes separately.
+    A review_request or consult_request carries reply_expected=true: reply with kind report, reply_to
+    this message_id.
     """
     return await asyncio.to_thread(lambda: _wrap(
         "coord_read_message", lambda: _co().read_message(task_id, participant_id, message_id)))
@@ -300,7 +337,8 @@ async def coord_wait(
 
 @mcp.tool(title="Wait Plan", annotations=_READ)
 async def wait_plan(route: str, timeout_s: float | None = None, outer_s: float | None = None,
-                    host_yield_s: float | None = None, preferred: bool = False) -> dict:
+                    host_yield_s: float | None = None, preferred: bool = False,
+                    host: str | None = None) -> dict:
     """Pure, clock-free wait-budget adapter (the one documented pattern for both routes). With
     preferred=true (or no timeout_s) it returns the REUSABLE preferred call shape — inner 50 s under
     an explicit 60 s outer allowance (cli: the shell call's timeout pragma; mcp: host_yield_s=60) —
@@ -316,11 +354,13 @@ async def wait_plan(route: str, timeout_s: float | None = None, outer_s: float |
         outer_s: The outer shell allowance you intend to pass (cli route).
         host_yield_s: Configured host tool-call yield, if known (mcp route).
         preferred: Return the preferred 50/60 pattern instead of checking a pair.
+        host: claude | codex | antigravity. antigravity returns the MCP in-tool 25 s fallback and
+            reports its shell route as unmeasured.
     """
     try:
         if preferred or timeout_s is None:
-            return preferred_pattern(route)
-        return check_wait(route, timeout_s, outer_s, host_yield_s=host_yield_s)
+            return preferred_pattern(route, host=host)
+        return check_wait(route, timeout_s, outer_s, host_yield_s=host_yield_s, host=host)
     except ValueError as e:
         raise ToolError("invalid_wait_plan: %s" % e)
 
@@ -606,6 +646,123 @@ async def coord_notify_via_bridge(
                 expected_revision=expected_revision,
                 accept_timeout_s=accept_timeout_s,
                 execution_action_id=execution_action_id,
+            ),
+        )
+    )
+
+
+@mcp.tool(title="Coord Link Propose", annotations=_WRITE)
+async def coord_link_propose(task_id: str, link_id: str, from_pid: str, to_pid: str) -> dict:
+    """Mode 2 (link): propose pinning two attached participants of a task into one collaboration link. The task
+    needs the session-links and send-capability features. host + native session are copied from the two stored
+    attach records, never from the caller. Not available in an advisory process. An Antigravity member must be
+    attached as observer. The link shares the whole task, as participants already do; it designates the recipient
+    of a send, it does not make the board private.
+
+    Args:
+        task_id: Task id.
+        link_id: New link id.
+        from_pid: Proposing participant (this process must hold its send capability).
+        to_pid: Partner participant (must confirm).
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap("coord_link_propose", lambda: _co().links.propose(task_id, link_id, from_pid, to_pid))
+    )
+
+
+@mcp.tool(title="Coord Link Confirm", annotations=_WRITE)
+async def coord_link_confirm(task_id: str, link_id: str, participant_id: str) -> dict:
+    """Mode 2 (link): the proposed partner confirms; capability-checked. Records each member's wake route truthfully.
+    A stale link (a member detached or a different native session holds it) is refused link_stale.
+
+    Args:
+        task_id: Task id.
+        link_id: Link id.
+        participant_id: The partner participant confirming (this process must hold its send capability).
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap("coord_link_confirm", lambda: _co().links.confirm(task_id, link_id, participant_id))
+    )
+
+
+@mcp.tool(title="Coord Link End", annotations=_WRITE)
+async def coord_link_end(task_id: str, link_id: str, participant_id: str, reason: str | None = None) -> dict:
+    """Mode 2 (link): either member ends the link; capability-checked.
+
+    Args:
+        task_id: Task id.
+        link_id: Link id.
+        participant_id: The member ending it.
+        reason: Short reason.
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap("coord_link_end", lambda: _co().links.end(task_id, link_id, participant_id, reason))
+    )
+
+
+@mcp.tool(title="Coord Link Get", annotations=_READ)
+async def coord_link_get(task_id: str, link_id: str) -> dict:
+    """Mode 2 (link): read one link. Its state reads stale when a member is detached or a different native
+    session holds the participant.
+
+    Args:
+        task_id: Task id.
+        link_id: Link id.
+    """
+    return await asyncio.to_thread(lambda: _wrap("coord_link_get", lambda: _co().links.get(task_id, link_id)))
+
+
+@mcp.tool(title="Coord Wake", annotations=_WRITE)
+async def coord_wake(
+    task_id: str,
+    message_id: str,
+    sender: str,
+    binding_id: str | None = None,
+    controller_id: str | None = None,
+    expected_revision: int | None = None,
+    accept_timeout_s: float = 12.0,
+    execution_action_id: str | None = None,
+    timeout_s: float | None = None,
+    link_id: str | None = None,
+) -> dict:
+    """Wake the ONE recipient of a stored message through its host route; the target comes only from the
+    recipient's stored participant record. Outcome: accepted | uncertain | unavailable | not_supported |
+    refused:<reason>; only accepted is a delivery, and an accepted/uncertain receipt is never re-run (a
+    retry is a billed model turn). Claude recipients use the cmux bridge (pass the bridge arguments);
+    Codex recipients use `codex exec resume` only when the task opted in (codex-exec-wake) and the
+    participant is marked wake=headless; Antigravity is next-turn inbox only (not_supported). Refused in
+    an advisory process.
+
+    Args:
+        task_id: Task id.
+        message_id: Message to wake the recipient for (single concrete recipient; kinds task,
+            review_request, consult_request).
+        sender: The attached participant requesting the wake.
+        binding_id: Claude route only: bridge writer binding for the recipient.
+        controller_id: Claude route only: stable controller id.
+        expected_revision: Claude route only: last observed bridge binding revision.
+        accept_timeout_s: Claude route only: seconds to wait for bridge correlation.
+        execution_action_id: Claude route only: managed dispatch reservation.
+        timeout_s: Codex route only: run timeout in seconds, finite in (0, 900] (default 240); anything else is rejected before any side effect.
+        link_id: Mode 2: the same exact-partner / not-stale link check before the normal route.
+    """
+    from .wake import wake_recipient
+
+    return await asyncio.to_thread(
+        lambda: _wrap(
+            "coord_wake",
+            lambda: wake_recipient(
+                _co(),
+                task_id,
+                message_id,
+                sender=sender,
+                binding_id=binding_id,
+                controller_id=controller_id,
+                expected_revision=expected_revision,
+                accept_timeout_s=accept_timeout_s,
+                execution_action_id=execution_action_id,
+                timeout_s=timeout_s,
+                link_id=link_id,
             ),
         )
     )
@@ -1853,6 +2010,79 @@ async def job_output(
                                  budget=budget),
         )
     )
+
+
+@mcp.tool(title="Consult Post", annotations=_WRITE)
+async def consult_post(
+    task_id: str,
+    sender: str,
+    reply_to: str,
+    call_dir: str,
+    message_id: str | None = None,
+) -> dict:
+    """Post ONE `report` for a finished consult call (mode 1). Launches nothing: it reads receipt.json (and
+    answer.md when ANSWERED) from the call directory the `mycelium-coord consult call` CLI made, re-hashes the
+    answer against the receipt's recorded sha256 (a tampered answer is refused: consult_answer_sha_mismatch) and
+    sends one report from this server process, which holds the sender's send capability. ANSWERED: the answer file
+    is the artifact_ref and the receipt sha256 is the evidence. Any other outcome: a report stating the outcome
+    (CANNOT-EVALUATE), never an empty answer. Idempotent by message_id. Not available in advisory processes.
+
+    Args:
+        task_id: Task id.
+        sender: Attached participant id posting the report (this server process must hold its capability).
+        reply_to: message_id of the review_request / consult_request being answered; the report goes to its sender.
+        call_dir: The finished call's directory (the `call_dir` printed by `consult call`).
+        message_id: Optional idempotency key; default derived from the call id.
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap(
+            "consult_post",
+            lambda: consult.post_report(
+                _co(), task_id=task_id, sender=sender, reply_to=reply_to, call_dir=call_dir, message_id=message_id
+            ),
+        )
+    )
+
+
+# Advisory allowlist: the ONLY tools an advisory process exposes. The core gate is the real control.
+ADVISORY_ALLOWED_TOOLS = frozenset((
+    "coord_create_task", "coord_attach", "coord_send", "coord_inbox", "coord_read_message", "coord_wait",
+    "wait_plan", "coord_ack", "coord_message_state", "coord_set_cursor", "coord_checkpoint_read",
+    "coord_resume", "coord_participants", "coord_list_tasks", "coord_find_recipients",
+    "coord_list_sessions", "coord_detach", "execution_read", "execution_status", "execution_receipt",
+    "execution_evidence", "sched_plan", "sched_verify", "job_status", "job_join",
+    "job_list", "job_output", "coord_link_confirm", "coord_link_end", "coord_link_get",
+))
+
+
+def _hide_authority_tools() -> list[str]:
+    """In an advisory process, drop the authority/drive tools from the tool list. The core gate
+    (model.require_authority) still refuses them if called by any other path."""
+    from .model import advisory_process
+
+    removed: list[str] = []
+    if not advisory_process():
+        return removed
+    try:
+        listed = [getattr(t, "name", t) for t in asyncio.run(mcp.list_tools())]
+    except Exception:
+        listed = []
+    for name in [n for n in listed if n not in ADVISORY_ALLOWED_TOOLS]:
+        # FastMCP 2.x: mcp.remove_tool; 3.x/4.x: mcp.local_provider.remove_tool.
+        for owner in (mcp, getattr(mcp, "local_provider", None)):
+            fn = getattr(owner, "remove_tool", None)
+            if fn is None:
+                continue
+            try:
+                fn(name)
+                removed.append(name)
+                break
+            except Exception:
+                continue  # not removable here: stays listed but refused by the core gate
+    return removed
+
+
+_hide_authority_tools()
 
 
 def main() -> None:

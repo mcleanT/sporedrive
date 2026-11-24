@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""Fake claude: emits stream-json and logs argv to FAKE_CLAUDE_LOG (JSON list) when set.
+FAKE_CLAUDE_MCP='[]' (default) or JSON list simulates MCP leakage.
+FAKE_CLAUDE_MODE: normal | empty | crash-after-text | timeout | extra-tools | hook-event | nonbuiltin-plugin | error-result"""
+import json, os, sys, time
+if "--version" in sys.argv:
+    print("fake-claude 0.0"); sys.exit(0)
+if os.environ.get("FAKE_CLAUDE_LOG"):
+    open(os.environ["FAKE_CLAUDE_LOG"], "w").write(json.dumps(sys.argv[1:]))
+sys.stdin.read()
+mode = os.environ.get("FAKE_CLAUDE_MODE", "normal")
+mcp = json.loads(os.environ.get("FAKE_CLAUDE_MCP", "[]"))
+tools = ["Read", "Grep", "Glob"] + (["Bash"] if mode == "extra-tools" else [])
+plugins = [{"name": "cc-plugin-x", "path": "builtin", "source": "cc-plugin-x@builtin"}]
+if mode == "nonbuiltin-plugin":
+    plugins.append({"name": "mycelium", "path": "/Users/x/.claude/plugins/mycelium", "source": "mycelium@market"})
+def p(m): print(json.dumps(m), flush=True)
+p({"type": "system", "subtype": "init", "session_id": "fake-sid", "model": "fake-model", "mcp_servers": mcp, "tools": tools,
+   "plugins": plugins, "messaging_socket_path": "/tmp/cc-socks/1.sock"})
+if mode == "hook-event":
+    p({"type": "system", "subtype": "hook_started", "hook_name": "SessionStart:x"})
+if mode == "timeout":
+    time.sleep(600)
+p({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "u1", "name": "Read", "input": {"file_path": "/work/review_me.py"}}]}})
+p({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "u1", "content": "x"}]}})
+if mode == "crash-after-text":
+    p({"type": "assistant", "message": {"content": [{"type": "text", "text": "Let me read the file."}]}})
+    sys.exit(1)
+ans = "" if mode == "empty" else "bug on line 3"
+p({"type": "result", "subtype": "error_during_execution" if mode == "error-result" else "success",
+   "is_error": mode == "error-result", "result": ans, "permission_denials": []})
