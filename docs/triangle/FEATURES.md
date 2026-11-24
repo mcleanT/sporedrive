@@ -1,5 +1,9 @@
 # Triangle coordination features (opt-in; old servers keep working)
 
+> **2026-11-24:** No app has a fixed role. Advisory containment is an optional switch on one coordination
+> process, and every call-mode session runs with it. This document records the design and tests
+> from when Antigravity was registered restricted, as an adviser.
+
 - Advisory containment (allowlist): env MYCELIUM_COORD_ADVISORY=1|true|yes. Every refusal is the core error
   `advisory_process_refused` (shared by MCP and CLI; helpers `model.authority_op`, `model.require_advisory_allowed`).
   REFUSED: attach with a role other than observer, or with allow_transition; any send whose message is actionable

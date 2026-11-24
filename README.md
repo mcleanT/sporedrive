@@ -30,12 +30,9 @@ coordination layer, `mycelium-coord`: the shared record, its CLI and its MCP too
 - The coordination works with or without Mycelium's project-memory hooks.
 
 **No host is in charge.** A session joins a task under a label: supervisor, executor or observer.
-Claude Code and Codex sessions can take any label, and any session on a task can message any
-other session on it. Three limits apply:
+No app has a fixed role: a session in any of the three can take any label, and any session on a
+task can message any other session on it. The labels are chosen per task. Two limits apply:
 
-- **Antigravity is set up as an adviser.** When it is registered in advisory mode, it joins only as
-  an observer. It can read, answer, review and comment, and the coordination core refuses its
-  attempts to start or direct work.
 - **An executor works in one worktree.** The executor label is tied to the task's worktree.
   Keeping that session the only writer is a workflow policy backed by each host's own permissions;
   SporeDrive does not enforce it at the filesystem level.
@@ -65,7 +62,7 @@ switched on in its own place:
 - **Per task (opt-in):** the extra message kinds (`triangle-kinds`), headless Codex wake
   (`codex-exec-wake`), send capability (`send-capability`) and link mode (`session-links`). A task
   created without them behaves as before.
-- **Per process:** advisory containment.
+- **Per process (optional):** restricted mode.
 - **Per host, once installed:** the stale-write guard.
 - **No task needed:** call mode is a CLI command.
 
@@ -73,7 +70,7 @@ switched on in its own place:
 |---|---|---|---|
 | Claude Code | supervisor, executor or observer | gives them through call mode or review messages | the cmux bridge types into the one bound session |
 | Codex | supervisor, executor or observer | gives them through call mode or review messages | `codex exec resume` on the stored thread, only on tasks with `codex-exec-wake` and a participant attached with `wake=headless` |
-| Antigravity | observer only, when run in advisory mode (the adviser setup) | gives them through call mode or non-actionable messages | no wake route; it reads its inbox on its next turn |
+| Antigravity | supervisor, executor or observer | gives them through call mode or review messages | no wake route; it reads its inbox on its next turn |
 
 Sessions find each other through the same record:
 
@@ -106,9 +103,14 @@ Each also has an MCP tool. There are two ways to talk:
 
 Three safeguards back these modes:
 
-- **Advisory containment.** It applies to a coordination process started with
-  `MYCELIUM_COORD_ADVISORY=1`, which is how Antigravity is meant to be registered. Such a process
-  is limited to the following.
+- **Restricted mode (optional).** It is called advisory containment in the code and in FEATURES.md.
+  It applies to a coordination process started with `MYCELIUM_COORD_ADVISORY=1`. It is a switch on
+  one connection, not a role for an app:
+  - Call mode starts every called session this way, whichever app it is.
+  - Any app's connection can also be started this way, for example for scripted runs that should
+    not drive work.
+
+  A restricted process is limited to the following.
   - **It may:**
     - read;
     - create an unmanaged task;
@@ -127,7 +129,7 @@ Three safeguards back these modes:
   that participant's capability: sends, acknowledgments, cursor moves, checkpoint publishes,
   detaches, wakes, bridge notifications and link changes.
   - The capability is minted at attach. The CLI keeps it in a `--cap-file`.
-  - It applies on tasks with `send-capability` and always in an advisory process.
+  - It applies on tasks with `send-capability` and always in a restricted process.
   - Link mode requires it.
 - **Stale-write guard** (`writeguard.py`, a hook for all three hosts). It refuses a tool-based
   whole-file write over a file the session has not read, or that changed since it last read it.
@@ -333,13 +335,15 @@ Cloning installs nothing. Setup is four distinct steps; details and exact comman
 
 Two optional steps are manual, and the installer does neither:
 
-- **Antigravity as an adviser.** Register the coordination MCP server with Antigravity with
-  `MYCELIUM_COORD_ADVISORY=1` in the server's environment.
+- **Connecting Antigravity.** Register the coordination MCP server with Antigravity
+  (`agy mcp add`). It then takes part like the other two apps. Add `MYCELIUM_COORD_ADVISORY=1` to
+  the server's environment only if you want its connection restricted.
   - `agy mcp add` writes `~/.gemini/config/mcp_config.json`, which the CLI and the desktop app
-    both read.
+    both read. It therefore applies to every Antigravity run on the machine, including scripted
+    `agy -p` runs.
   - Headless `agy -p` runs also need explicit `mcp(<server>/<tool>)` permission grants. Without
     them the CLI auto-denies the tools, exits 0 and does nothing.
-  - This has been exercised only on scratch stores.
+  - Only the restricted setup has been tried, and only on scratch stores.
 - **The stale-write guard.** Copy the matching template from
   `docs/triangle/proposed/writeguard-hooks/` into each host's hook configuration.
   - Replace `<ABS_PYTHON>` and `<ABS_PATH_TO>` with real absolute paths.
@@ -368,11 +372,11 @@ This is a working personal toolchain published as-is. It is not a production ser
   Check what a session actually loaded before trusting it; see the health checks in
   [docs/installation.md](docs/installation.md#health-checks).
 - **The triangle: containment, not authentication.**
-  - Advisory containment and send capability stop a contained process from driving work through
-    the coordination tools. They do not authenticate who a session is.
-  - Containment depends on the server's environment variable, not on which host is calling.
+  - Restricted mode and send capability stop a restricted process from driving work through the
+    coordination tools. They do not authenticate who a session is.
+  - Restriction depends on the server's environment variable, not on which host is calling.
   - The store is plain files owned by your user. An agent with shell access can get around
-    containment by running the CLI without the variable or by editing the store.
+    restriction by running the CLI without the variable or by editing the store.
   - In call mode, a Codex or Antigravity target can read any file your user account can read.
     Only Claude is confined to its folder.
   - On the Claude bridge route, a rebind just before the send can deliver a linked message to the
