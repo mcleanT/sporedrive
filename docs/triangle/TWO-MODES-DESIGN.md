@@ -1,5 +1,9 @@
 # Two communication modes for the triangle — design v1.5 (2026-11-24, owner approved build: "go ahead - handle it")
 
+> **2026-11-24:** No app has a fixed role. Advisory containment is an optional switch on one coordination
+> process, and every call-mode session runs with it. This document records the design and tests
+> from when Antigravity was registered restricted, as an adviser.
+
 Owner requirement (verbatim, 2026-11-23): "we need to have 2 different modes of communication. in one, we create a
 transient, headless session for the respective calls, this is especailly relevant for reviews. in the other, we have a
 full collaboration setup, where sessinos are linked and share info."

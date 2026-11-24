@@ -248,7 +248,8 @@ These apply only to tasks created with the named `--feature` (MCP `protocol_feat
 processes. Tasks without them behave exactly as described above. Full rules: `docs/triangle/FEATURES.md`
 in the sporedrive repository (not shipped inside the plugin).
 
-- **Advisory process** (`MYCELIUM_COORD_ADVISORY=1`, how Antigravity runs): it may create an unmanaged
+- **Advisory (restricted) process** (`MYCELIUM_COORD_ADVISORY=1`: every call-mode session, and any
+  connection started restricted; no app is restricted by default): it may create an unmanaged
   task, read, attach as a plain `observer`, ack/set-cursor/detach as that observer, and send
   non-actionable kinds (question, progress, review_finding, acknowledgment, consult_request, report).
   Any other role or `allow_transition`, actionable sends, checkpoint publish, execution mutators,
