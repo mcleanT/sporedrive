@@ -167,6 +167,27 @@ over. Code: `coordination/mycelium_coord/consult.py`; hosts: `src/consult/{codex
   object (outcome, retryable, usable, receipt path, call dir, plus `containment_breach`, `coverage`, `no_successful_read`
   and `over_limit`); exit 0 only when ANSWERED, otherwise 3. Refused in advisory processes (it launches a session).
   `--post-to` splits at the FIRST colon, so ids that contain `:` go through `--post-task` / `--post-reply-to`.
+- MCP (owner direction 2026-11-24; the one MCP launch route): `consult_start(target, packet, call_id?, post_task?,
+  post_reply_to?, sender?)` starts a call and `consult_result(call_id, wait_s?, after_version?, host_yield_s?,
+  answer_offset?, answer_limit?)` collects it. Any unrestricted Claude Code, Codex or Antigravity connection may start a call
+  to any of the three targets. The server builds one fixed argv for the CLI above (`python -m mycelium_coord --root <its
+  store> consult call --target T --packet <out-root>/packets/<call_id>.json --out-root <out-root> --call-id <call_id>`, no
+  shell) and runs it as the detached owned job `consult-<call_id>`, so the call survives the server exiting. The
+  executable, PATH, out root, lane, cwd and environment are never taken over MCP. Gates, in order, each before anything is
+  created: recursion (`MYCELIUM_CONSULT_TARGET`) -> REFUSED; restricted (advisory) process -> `advisory_process_refused`
+  (both tools are also hidden there; every called session is restricted, so a called session cannot start another call);
+  packet over 64 KiB or invalid -> NOT_STARTED; `deadline_s` + 30 + 60 over the 6 h job limit -> NOT_STARTED
+  `deadline_too_long`; optional post check (posts nothing) -> NOT_STARTED; an existing call directory this store's jobs did
+  not make -> `consult_call_id_conflict`. The same call_id with the same packet replays; a different packet is
+  `consult_call_id_conflict`. `consult_start` returns within about 2 s (`started` / `replayed` / `ended`); a busy lane
+  shows inline as REFUSED `busy`, retryable. `consult_result` waits at most 25 s inside the tool (host yield minus 5 s),
+  takes the call directory from the job's own argv (not from its own TMPDIR), and trusts a receipt only when its call id
+  and packet sha256 match the job; a job that ended without one is `ended_without_receipt`, usable false. The answer is
+  re-hashed against the receipt and paged (at most 3,000 bytes a page; whole response at most 4 KB). Post with
+  `consult_post` and the returned `call_dir`. No cancel over MCP: the packet's deadline bounds the call (a shell can run
+  `job-cancel consult-<call_id>`). An MCP-started call uses the user-id lane, shared with CLI calls made without
+  `--sender`. Servers must share one coordination store to collect each other's calls. Unit-tested with fake hosts; live
+  smokes from each app are pending.
 - With posting requested, everything the post needs is checked BEFORE the call is launched (task exists and has
   `triangle-kinds`, the reply-to message exists, is a review_request/consult_request addressed to the sender, the sender is
   attached and this process holds its capability); a failure is exit 3, outcome NOT_STARTED, nothing launched, nothing spent.
@@ -217,9 +238,10 @@ over. Code: `coordination/mycelium_coord/consult.py`; hosts: `src/consult/{codex
   plain summary line and the breach, coverage, no_successful_read and over_limit values), after re-hashing `answer.md`
   against the receipt (a tampered answer is refused, `consult_answer_sha_mismatch`). A non-ANSWERED call posts a report
   that states the outcome. `consult_post` launches nothing, is not in the advisory allowlist and is refused in advisory
-  processes. There is no MCP launch tool. A receipt and answer replaced together are not detected (no signature).
+  processes. The only MCP launch tool is `consult_start` (above). A receipt and answer replaced together are not detected (no signature).
 - Limits: "not handed to it" is not confinement. The Codex and Antigravity targets can still read any user-readable file;
-  the Claude target is confined to the repo folder. Antigravity cannot start calls in this build.
+  the Claude target is confined to the repo folder. Antigravity starts calls only over MCP (`consult_start`), once its
+  coordination MCP server is registered and unrestricted.
 
 ## Link mode (mode 2, 2026-11-23; design TWO-MODES-DESIGN.md v1.5 section 3; coordination/mycelium_coord/links.py)
 Two named live sessions pinned to one shared task, for ongoing collaboration. Opt-in task feature `session-links`, which
