@@ -3510,3 +3510,68 @@ def test_t17_an_mcp_started_target_gets_only_the_allowlisted_environment(mw, mon
     assert set(rec["env_keys_passed"]) == want and "FOO_TOKEN" not in rec["env_keys_passed"]
     dumped = json.loads((mw.w / "repo" / "env.dump.json").read_text())
     assert "FOO_TOKEN" not in dumped and dumped[consult.COORD_DIR_ENV] == os.path.join(res["call_dir"], "coord")
+
+
+@pytest.mark.parametrize("cid", ["..", "x" * 113])
+def test_t19_an_invalid_call_id_is_not_started_and_creates_nothing(mw, cid):
+    r = _start(mw, cid)
+    assert r["outcome"] == "NOT_STARTED" and r["reason"].startswith("argument: invalid call_id"), r
+    assert r["job_id"] is None and _jobs(mw.w) == [] and _staged(mw) == []
+
+
+def test_t20_the_answer_page_clamp_holds_even_when_the_response_budget_would_allow_more(mw, monkeypatch):
+    mw.set_mode("long")
+    _start(mw, "t20")
+    assert _collect("t20")["usable"] is True
+    monkeypatch.setattr(consult, "RESULT_BUDGET_BYTES", 10**6)  # isolate the per-page clamp from the 4 KB budget
+    r = consult.call_result(mw.jm, "t20", answer_limit=5000)
+    assert len(r["answer"]["text"].encode()) <= consult.RESULT_ANSWER_MAX and r["answer"]["next_offset"] <= 3000
+
+
+def test_t21_a_symlinked_call_dir_or_a_receipt_with_a_sixth_outcome_is_never_a_result(mw):
+    _start(mw, "t21")
+    res = _collect("t21")
+    assert res["usable"] is True
+    cd = Path(res["call_dir"])
+    rp = cd / "receipt.json"
+    good = rp.read_text()
+    rec = json.loads(good)
+    rec["outcome"] = "PASS"  # bound to this job (same call id and packet hash) but not one of the five outcomes
+    rp.write_text(json.dumps(rec))
+    r = _tool("consult_result", {"call_id": "t21"})
+    assert r["error"] == "consult_receipt_invalid" and r["outcome"] is None and r["usable"] is False
+    rp.write_text(good)
+    moved = mw.w / "elsewhere"
+    cd.rename(moved)
+    cd.symlink_to(moved)
+    assert "consult_job_not_a_call" in _tool_err("consult_result", {"call_id": "t21"})
+
+
+def _fake_dispatcher_job(mw, call_id, script_body, packet_path=None):
+    """A consult-<call_id> job whose argv is the template except argv[0], a stand-in that only prints."""
+    exe = mw.w / f"stand_in_{call_id}"
+    exe.write_text("#!%s\n%s" % (sys.executable, script_body))
+    exe.chmod(0o755)
+    argv = consult.dispatch_argv("claude", os.path.join(mw.out_root, "packets", call_id + ".json"), mw.out_root,
+                                 call_id, mw.jm.store.root)
+    argv[0] = str(exe)
+    if packet_path is not None:
+        argv[10] = packet_path
+    mw.jm.run(consult.CALL_JOB_PREFIX + call_id, argv, cwd=str(mw.w))
+    for _ in range(100):
+        if mw.jm.status(consult.CALL_JOB_PREFIX + call_id)["terminal"]:
+            return
+        time.sleep(0.1)
+    raise AssertionError("stand-in job never ended")
+
+
+def test_t22_an_argv_off_the_template_is_not_a_call(mw):
+    _fake_dispatcher_job(mw, "t22", "print('{}')\n", packet_path=str(mw.w / "elsewhere.json"))
+    assert "consult_job_not_a_call" in _tool_err("consult_result", {"call_id": "t22"})
+
+
+def test_t23_answered_on_stdout_without_a_receipt_is_never_an_outcome(mw):
+    _fake_dispatcher_job(mw, "t23", 'import json\nprint(json.dumps({"outcome": "ANSWERED", "usable": True}, indent=2))\n')
+    r = _tool("consult_result", {"call_id": "t23"})
+    assert r["state"] == "ended_without_receipt" and r["outcome"] is None and r["usable"] is False
+    assert "without a receipt" in r["reason"]

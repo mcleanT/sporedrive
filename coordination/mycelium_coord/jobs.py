@@ -331,7 +331,7 @@ class JobManager:
         return read_bounded(p, offset=offset, limit=limit, tail=tail, budget=budget or None,
                             envelope={"job_id": job_id, "stream": stream})
 
-    # ------------------------------------------------------------------ run (CLI-only)
+    # ------------------------------------------------------------------ run (CLI, and MCP consult_start's fixed argv)
     @authority_op("job-run")
     def run(self, job_id: str, argv: list, *, cwd=None, deadline_s: float = DEFAULT_DEADLINE_S,
             task_id=None, action_id=None, dispatch_identity=None, on_stop: str = "keep",
