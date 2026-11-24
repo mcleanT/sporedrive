@@ -1,91 +1,56 @@
 # SporeDrive
 
-SporeDrive is local workflow infrastructure for **supervised coding with Codex and Claude Code**,
-with **Antigravity** as an optional adviser.
+SporeDrive connects **Claude Code, Codex and Antigravity** so they can work with each other
+directly. Each host can take part from its CLI or its desktop app. A session in any of them can:
 
-- **The pair.** One session supervises, and one executor session is the only writer of a
-  repository worktree. The single writer is a workflow policy backed by each host's own
-  permissions; SporeDrive does not enforce it at the filesystem level.
-- **The triangle.** Claude Code, Codex and Antigravity can also consult each other, ask for
-  reviews and send reports. Antigravity is meant as an adviser: with its coordination server
-  started in advisory mode, its coordination tools can watch, read and comment but not drive work.
+- ask another for a second opinion or a review;
+- send a question or a report to one specific session;
+- keep an ongoing, linked conversation with one partner session;
+- find which sessions are live and which task each one is bound to.
 
-All sessions coordinate through a durable record on disk rather than through copy-paste between
-chat windows. Each host can take part from its CLI or its desktop app.
+Messages go through a shared record on disk instead of copy-paste between chat windows. A message
+can be addressed to one specific session. It survives compaction and restarts, and can be checked
+later.
+
+```mermaid
+flowchart LR
+  C["Claude Code<br/>CLI or app"] <--> M[("Shared coordination record<br/>on this machine")]
+  X["Codex<br/>CLI or app"] <--> M
+  A["Antigravity<br/>CLI or app"] <--> M
+```
+
+**No host is in charge.** A session joins a task under a label: supervisor, executor or observer.
+Claude Code and Codex sessions can take any label, and any session on a task can message any
+other session on it. Three limits apply:
+
+- **Antigravity is set up as an adviser.** When it is registered in advisory mode, it joins only as
+  an observer. It can read, answer, review and comment, and the coordination core refuses its
+  attempts to start or direct work.
+- **An executor works in one worktree.** The executor label is tied to the task's worktree.
+  Keeping that session the only writer is a workflow policy backed by each host's own permissions;
+  SporeDrive does not enforce it at the filesystem level.
+- **A stored message wakes nobody by itself.** Each host is reached in its own way, described
+  [below](#how-the-three-hosts-connect).
+
+SporeDrive also ships one ready-made way to use these connections: **supervised work**, where one
+session directs, one session writes, and dispatches and reviews have limits. It is optional; see
+[Optional workflow: supervised work](#optional-workflow-supervised-work).
 
 It is aimed at people who already run Codex and Claude Code, and optionally Antigravity, on a Mac.
-They want long or multi-step work to be:
+They want work across these hosts to be:
 
-- **bounded**: the number of dispatches and reviews has a limit;
 - **addressable**: a message reaches one specific session;
 - **resumable**: the task survives compaction and restarts;
-- **auditable**: "done" means evidence was checked, not merely claimed.
+- **auditable**: "done" means evidence was checked, not merely claimed;
+- **bounded, when they choose**: a managed task limits dispatches and reviews.
 
 SporeDrive coordinates the models; it does not make them reason better. It makes no promise of
 cost savings or reliability.
 
-## The problem it addresses
+## How the three hosts connect
 
-Supervising one agent with another usually fails in a few predictable ways:
-
-- instructions typed into the wrong window;
-- a supervisor that quietly starts editing too;
-- context lost at compaction;
-- review loops that never end;
-- "done" reported without evidence.
-
-SporeDrive answers each of these with a small, explicit mechanism:
-
-- a single-writer role split;
-- a persisted, addressed message store;
-- delivery bound to one native session identity;
-- per-task allowances enforced in code for managed tasks;
-- completion receipts that are verified against artifact hashes.
-
-## How a piece of work flows
-
-```mermaid
-flowchart LR
-  U[User task +<br/>versioned plan] --> S[Supervisor<br/>Codex]
-  S -->|work order| M[(Mycelium<br/>coordination store)]
-  M -->|identity-bound delivery<br/>via cmux bridge| E[Executor<br/>Claude Code]
-  E -->|edits, checks| W[(Worktree)]
-  E -->|evidence, checkpoint| M
-  M --> S
-  S -->|review / plan delta| M
-  E -->|completion receipt| M
-```
-
-1. The user gives a task. For substantial work, it comes with a versioned plan.
-2. The supervisor writes a **work order**: scope, fixed checks and the evidence required.
-3. The work order is **stored** as an addressed coordination message.
-4. The supervisor **delivers** it through the cmux bridge. The bridge types into the one session
-   that matches the bound workspace, worktree, session id and controller.
-5. The executor does the work, runs the checks, and reports **evidence** and **checkpoints**.
-6. At milestones, the supervisor reviews and relays a plan delta or repair order. Each review and
-   repair is drawn from a fixed allowance.
-7. The executor sends a **completion receipt** naming artifacts and their sha256.
-   - A matching hash verifies the evidence's identity only.
-   - The task closes only when its frozen required checks and criteria have passed and been
-     accepted.
-
-Five states are kept separate on purpose:
-
-| State | What it means |
-|---|---|
-| Stored | The message is persisted in the store. It wakes nobody. |
-| Submitted | The bridge typed it into the bound terminal session. |
-| Accepted | The native host actually took it as input. |
-| Evidence verified | A receipt's artifacts matched their recorded hashes. This proves which files were submitted. |
-| Accepted complete | The frozen required checks and criteria passed and were accepted, so the task can close. |
-
-A stored message does not wake an idle session. There is no background dispatcher, daemon or
-scheduler.
-
-## Three hosts: Claude Code, Codex and Antigravity
-
-Beyond the supervisor/executor pair, any of the three hosts can ask another for a second opinion,
-a review or a report.
+Any of the three hosts can ask another for a second opinion, a review or a report. Each piece is
+switched on in its own place:
 
 - **Per task (opt-in):** the extra message kinds (`triangle-kinds`), headless Codex wake
   (`codex-exec-wake`), send capability (`send-capability`) and link mode (`session-links`). A task
@@ -94,13 +59,23 @@ a review or a report.
 - **Per host, once installed:** the stale-write guard.
 - **No task needed:** call mode is a CLI command.
 
-| Host | Coordination roles | Reviews | How an idle session is reached |
+| Host | Labels it can join a task with | Reviews | How an idle session is reached |
 |---|---|---|---|
 | Claude Code | supervisor, executor or observer | gives them through call mode or review messages | the cmux bridge types into the one bound session |
 | Codex | supervisor, executor or observer | gives them through call mode or review messages | `codex exec resume` on the stored thread, only on tasks with `codex-exec-wake` and a participant attached with `wake=headless` |
-| Antigravity | observer (adviser) when run in advisory mode | gives them through call mode or non-actionable messages | no wake route; it reads its inbox on its next turn |
+| Antigravity | observer only, when run in advisory mode (the adviser setup) | gives them through call mode or non-actionable messages | no wake route; it reads its inbox on its next turn |
 
-There are two ways to talk:
+Sessions find each other through the same record:
+
+- `list-sessions` lists one host's sessions, the task each is bound to, and whether it is still
+  live.
+- `find-recipients` lists the participants a sender can address on a task, filtered by label or
+  host.
+- `status-read` reads the status published for a session, such as its runtime state and current
+  task.
+- A notification can carry a short `sd:` handle that resolves to the full message.
+
+Each also has an MCP tool. There are two ways to talk:
 
 - **Call mode (one-off, headless).** `mycelium-coord consult call --target codex|claude|antigravity`
   starts a brand-new session of the target.
@@ -164,7 +139,7 @@ Full reference: [docs/triangle/FEATURES.md](docs/triangle/FEATURES.md).
 | Component | Where | What it does |
 |---|---|---|
 | Instruction and skill policy | `src/claude/`, `src/codex/` | Global instruction files (`CLAUDE.md`, `AGENTS.md`), the Claude `codex-review` skill and `codex_ask` reviewer wrapper, and the Codex `cmux-driver` skill (driver protocol, runbook, plan template). |
-| Mycelium coordination | `coordination/mycelium_coord/` | Store for tasks, messages, checkpoints and execution allowances. Exposed as a CLI (`coordination/bin/mycelium-coord`) and `coord_*` / `execution_*` MCP tools. |
+| Mycelium coordination | `coordination/mycelium_coord/` | Store for tasks, messages, checkpoints, session discovery and status, and execution allowances. Exposed as a CLI (`coordination/bin/mycelium-coord`) and `coord_*` / `execution_*` MCP tools. |
 | Triangle features | `coordination/mycelium_coord/` (`consult.py`, `links.py`, `sendcap.py`, `wake.py`) | Call mode, link mode, send capability and the per-host wake routes. Advisory containment lives in the core (`model.py`) and the MCP allowlist (`mcp_server.py`). |
 | Call-mode adapters | `src/consult/` | One headless launcher per host, each restricted to reading: `codex_call.sh`, `claude_ask.sh`, `agy_ask.py`. |
 | Stale-write guard | `coordination/mycelium_coord/writeguard.py`, `docs/triangle/proposed/writeguard-hooks/` | A standalone hook script and per-host registration templates. Setup does not install it. |
@@ -177,7 +152,8 @@ State is split between your machine and the model services:
 - **On your machine:** the coordination store (a directory chosen by `--root` or
   `MYCELIUM_COORD_DIR`), install snapshots, and each project's `.living/` and `.mycelium/`
   bookkeeping.
-- **External:** only model inference, by the Codex and Claude Code services you already use.
+- **External:** only model inference, by the Codex, Claude Code and (if used) Antigravity services
+  you already use.
 
 Three layers are independent:
 
@@ -187,7 +163,74 @@ Three layers are independent:
 - **Host activation** (plugin install, hook trust, restarts) decides what a fresh session actually
   loads.
 
-## Role policy (project defaults)
+## Optional workflow: supervised work
+
+One way to use these connections is supervised work. One session directs, and one executor session
+is the only writer of a repository worktree. On a managed task, dispatches and reviews draw on fixed
+allowances, and the task closes only when its required checks have passed. The shipped instruction files and the cmux bridge are built
+around Codex directing and Claude Code executing.
+
+Consults, reviews, reports and linked conversations do not need this workflow.
+
+### The problem it addresses
+
+Directing one agent with another usually fails in a few predictable ways:
+
+- instructions typed into the wrong window;
+- a supervisor that quietly starts editing too;
+- context lost at compaction;
+- review loops that never end;
+- "done" reported without evidence.
+
+SporeDrive answers each of these with a small, explicit mechanism:
+
+- a single-writer role split;
+- a persisted, addressed message store;
+- delivery bound to one native session identity;
+- per-task allowances enforced in code for managed tasks;
+- completion receipts that are verified against artifact hashes.
+
+### How a piece of work flows
+
+```mermaid
+flowchart LR
+  U[User task +<br/>versioned plan] --> S[Supervisor<br/>Codex]
+  S -->|work order| M[(Mycelium<br/>coordination store)]
+  M -->|identity-bound delivery<br/>via cmux bridge| E[Executor<br/>Claude Code]
+  E -->|edits, checks| W[(Worktree)]
+  E -->|evidence, checkpoint| M
+  M --> S
+  S -->|review / plan delta| M
+  E -->|completion receipt| M
+```
+
+1. The user gives a task. For substantial work, it comes with a versioned plan.
+2. The supervisor writes a **work order**: scope, fixed checks and the evidence required.
+3. The work order is **stored** as an addressed coordination message.
+4. The supervisor **delivers** it through the cmux bridge. The bridge types into the one session
+   that matches the bound workspace, worktree, session id and controller.
+5. The executor does the work, runs the checks, and reports **evidence** and **checkpoints**.
+6. At milestones, the supervisor reviews and relays a plan delta or repair order. Each review and
+   repair is drawn from a fixed allowance.
+7. The executor sends a **completion receipt** naming artifacts and their sha256.
+   - A matching hash verifies the evidence's identity only.
+   - The task closes only when its frozen required checks and criteria have passed and been
+     accepted.
+
+Five states are kept separate on purpose:
+
+| State | What it means |
+|---|---|
+| Stored | The message is persisted in the store. It wakes nobody. |
+| Submitted | The bridge typed it into the bound terminal session. |
+| Accepted | The native host actually took it as input. |
+| Evidence verified | A receipt's artifacts matched their recorded hashes. This proves which files were submitted. |
+| Accepted complete | The frozen required checks and criteria passed and were accepted, so the task can close. |
+
+A stored message does not wake an idle session. There is no background dispatcher, daemon or
+scheduler.
+
+### Role policy (project defaults)
 
 The shipped instruction files configure these roles. They are this project's choices, not vendor
 recommendations:
@@ -215,7 +258,7 @@ Full contracts:
 [implementation-plan template](src/codex/skills/cmux-driver/references/implementation-plan.md) and
 [driver protocol](src/codex/skills/cmux-driver/references/driver-protocol.md).
 
-## Example: one milestone
+### Example: one milestone
 
 After setup, a user might hand the supervisor something like this:
 
@@ -259,6 +302,7 @@ Cloning installs nothing. Setup is four distinct steps; details and exact comman
 
 1. **Review and customize `src/`.** Then run `python3 scripts/wfctl.py install`. This *replaces*
    the managed global files under `~/.claude` and `~/.codex`, after snapshotting them.
+   These files include the supervised-work role policy.
    - `wfctl.py verify` reports drift.
    - `wfctl.py rollback <label>` restores a snapshot, and it supports `--dry-run`.
    - `install` itself has no dry-run mode.
