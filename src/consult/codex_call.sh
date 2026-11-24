@@ -58,10 +58,18 @@ PY
 [ -n "$OUT" ] || { echo "--out required" >&2; exit 5; }
 CODEX_BIN="${CODEX_BIN:-/opt/homebrew/bin/codex}"
 [ -x "$CODEX_BIN" ] || refuse 5 "codex binary not found: $CODEX_BIN"
-RAW="$OUT.stream.jsonl"; LAST="$OUT.last"; PROMPT="$(mktemp "${TMPDIR:-/tmp}/codex_call_prompt.XXXXXX")"; cat > "$PROMPT"
+RAW="$OUT.stream.jsonl"; LAST="$OUT.last"; PROMPT="$(mktemp "$(dirname "$OUT")/.codex_call_prompt.XXXXXX")"; cat > "$PROMPT"
 if [ ! -d "$CWD" ]; then rm -f "$PROMPT"; refuse 6 "cwd not a directory: $CWD"; fi
 CWD="$(cd "$CWD" && pwd -P)"
-case "$CWD" in "$HOME"|"$HOME/.claude"*|"$HOME/.codex"*|"$HOME/.gemini"*) rm -f "$PROMPT"; refuse 6 "refusing unsafe cwd $CWD";; esac
+UNSAFE=0
+case "$CWD" in "$HOME"|"$HOME/.claude"*|"$HOME/.codex"*|"$HOME/.gemini"*) UNSAFE=1;; esac
+# the same dirs by their REAL path: a symlinked ~/.claude (dotfiles style) must not let a call run inside its target
+for D in "$HOME" "$HOME/.claude" "$HOME/.codex" "$HOME/.gemini" "$HOME/.local/state/mycelium"; do
+  RD="$(cd "$D" 2>/dev/null && pwd -P)"
+  [ -n "$RD" ] || continue
+  if [ "$D" = "$HOME" ]; then [ "$CWD" != "$RD" ] || UNSAFE=1; else case "$CWD" in "$RD"|"$RD"/*) UNSAFE=1;; esac; fi
+done
+if [ "$UNSAFE" = 1 ]; then rm -f "$PROMPT"; refuse 6 "refusing unsafe cwd $CWD"; fi
 cfg_hash() { shasum -a 256 "$HOME/.codex/config.toml" "$HOME/.codex/hooks.json" 2>/dev/null | awk '{print $1}' | tr '\n' ','; }
 H0="$(cfg_hash)"
 ( cd "$CWD" && perl -e 'alarm shift; exec @ARGV' -- "$TIMEOUT" "$CODEX_BIN" exec \

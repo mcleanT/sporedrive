@@ -189,7 +189,8 @@ def test_propose_confirm_end_records_pins_from_the_attach_records(tmp_path):
         "ex-sess",
     )
     assert a["confirmed_at"] and b["confirmed_at"] is None and a["wake_route"] is None
-    assert a["session_verified"] is True
+    # review F14: the pin is a label copied from the attach record; nothing verified it
+    assert a["session_verified"] is False and a["session_source"] == "attach_record"
     assert (co.store.root / "tasks" / "t" / "links" / "L1.json").is_file()
 
     # only the proposed partner may confirm
@@ -458,7 +459,7 @@ def test_wake_in_link_checks_the_pin_then_runs_the_existing_route(tmp_path):
     m = _send(co, "w1", "lead", "ex", kind="task", link_id="L1")["message"]
     rec = wake.wake_recipient(co, "t", "w1", sender="lead", link_id="L1")
     # the link check passed; the unchanged route then ran (Codex without codex-exec-wake: a recorded refusal)
-    assert rec["recipient"] == "ex" and rec["outcome"] != "accepted" and "route" in rec
+    assert rec["recipient"] == "ex" and rec["outcome"] == "refused:codex_exec_wake_not_enabled"
     # a message addressed to someone other than the partner is refused inside the link
     _send(co, "w2", "lead", "third", kind="task")
     assert (
@@ -795,3 +796,381 @@ def test_propose_refuses_role_named_members(tmp_path, bad):
         assert _code(lambda: co.links.propose("t", "L1", a, b)) == "link_member_id_reserved"
     assert not (co.store.root / "tasks" / "t" / "links").exists() or not list(
         (co.store.root / "tasks" / "t" / "links").iterdir())
+
+
+# ================================================================== comprehensive-review repair round (v1.4)
+def _links_dir(co):
+    return co.store.root / "tasks" / "t" / "links"
+
+
+def _audit_kinds(co):
+    return [
+        json.loads(x)["kind"]
+        for x in (co.store.root / "tasks" / "t" / "audit.jsonl").read_text().splitlines()
+    ]
+
+
+def test_rf1_stray_tmp_file_in_links_is_never_a_link_and_detach_attach_stay_whole(tmp_path):
+    co = _co(tmp_path)
+    _active(co)
+    (_links_dir(co) / ".tmp-8za0igop.json").write_text("{")  # a partial write left by an interrupted store.write
+    assert [l["link_id"] for l in co.links._all("t")] == ["L1"]
+    co.detach("t", "lead")  # must not raise corrupt_record after the participant write
+    assert "detach" in _audit_kinds(co)
+    assert co.store.read("tasks/t/participants/lead.json")["detached"] is True
+    assert co.store.read("tasks/t/links/L1.json")["state"] == "stale"  # persisted, not only computed
+    assert "link_stale_update_failed" not in _audit_kinds(co)
+    # a second detach is not needed and an unrelated attach works
+    _attach(co, "obs", "observer", "claude")
+    # stale is sticky: the same session re-attaching does not revive the link
+    _attach(co, "lead", "supervisor", "claude")
+    assert co.links.get("t", "L1")["state"] == "stale"
+    assert _code(lambda: _send(co, "m1", "lead", "ex", link_id="L1")) == "link_stale"
+    assert _code(lambda: co.links.confirm("t", "L1", "ex")) == "link_stale"
+
+
+def test_rf1_attach_with_a_stray_tmp_file_does_not_half_apply(tmp_path):
+    co = _co(tmp_path)
+    _active(co)
+    (_links_dir(co) / ".tmp-abcd.json").write_text("{")
+    _attach(co, "ex", "executor", "codex", session="elsewhere", allow_transition=True)
+    assert co.store.read("tasks/t/links/L1.json")["state"] == "stale"
+    assert _audit_kinds(co)[-1] == "attach"  # the audit receipt after the participant write was reached
+    _attach(co, "ex", "executor", "codex", allow_transition=True)  # back on the original session
+    assert co.links.get("t", "L1")["state"] == "stale"  # never active again
+
+
+def test_rf1_unreadable_link_file_is_best_effort_and_audited_not_a_half_applied_detach(tmp_path):
+    co = _co(tmp_path)
+    _active(co)
+    (_links_dir(co) / "L9.json").write_text("{")  # a real-named but corrupt record
+    co.detach("t", "lead")
+    kinds = _audit_kinds(co)
+    assert "detach" in kinds and "link_stale_update_failed" in kinds
+    assert co.store.read("tasks/t/links/L1.json")["state"] == "stale"  # the readable link was still updated
+    fail = [json.loads(x) for x in (co.store.root / "tasks" / "t" / "audit.jsonl").read_text().splitlines()
+            if "link_stale_update_failed" in x][0]
+    assert fail["failures"] == [{"file": "L9.json", "error": "corrupt_record"}]
+
+
+def test_rf1_failed_store_write_leaves_no_temp_file(tmp_path, monkeypatch):
+    store = CoordStore(str(tmp_path / "s"))
+    store.write("a/x.json", {"k": 1})
+
+    def boom(a, b):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError):
+        store.write("a/x.json", {"k": 2})
+    with pytest.raises(OSError):
+        store.write_artifact("a/body.txt", "hello")
+    monkeypatch.undo()
+    names = sorted(p.name for p in (store.root / "a").iterdir())
+    assert names == ["x.json"], names  # no .tmp-* left; the old record is intact
+    assert store.read("a/x.json") == {"k": 1}
+
+
+def test_rf12_advisory_process_may_confirm_or_end_only_as_an_observer(tmp_path, monkeypatch):
+    co = _co(tmp_path)
+    _pair(co)
+    co.links.propose("t", "L1", "lead", "ex")
+    monkeypatch.setenv(ADV, "1")
+    # a process holding the executor's capability is not an observer: refused with a clear code
+    assert _code(lambda: co.links.confirm("t", "L1", "ex")) == "advisory_process_refused"
+    assert co.links.get("t", "L1")["state"] == "proposed"
+    monkeypatch.delenv(ADV)
+    co.links.confirm("t", "L1", "ex")
+    monkeypatch.setenv(ADV, "1")
+    assert _code(lambda: co.links.end("t", "L1", "lead", "x")) == "advisory_process_refused"
+    assert co.links.get("t", "L1")["state"] == "active"
+    monkeypatch.delenv(ADV)
+    assert co.links.end("t", "L1", "lead", "x")["state"] == "ended"
+
+
+def test_rf14_session_verified_is_never_claimed_and_the_source_is_named(tmp_path):
+    co = _co(tmp_path)
+    _attach(co, "lead", "supervisor", "claude", session="anything-i-typed")
+    _attach(co, "ex", "executor", "codex", session="also-made-up")
+    link = co.links.propose("t", "L1", "lead", "ex")
+    for m in link["members"]:
+        assert m["session_verified"] is False and m["session_source"] == "attach_record"
+
+
+def test_rf16_propose_refuses_two_members_on_the_same_native_session(tmp_path):
+    co = _co(tmp_path)
+    _attach(co, "a", "supervisor", "claude", session="S1")
+    _attach(co, "b", "executor", "claude", session="S1")
+    assert _code(lambda: co.links.propose("t", "L1", "a", "b")) == "link_invalid_members"
+    assert not (_links_dir(co) / "L1.json").exists()
+    # the same session label on two DIFFERENT hosts is two different pins
+    _attach(co, "c", "executor", "codex", session="S1")
+    assert co.links.propose("t", "L2", "a", "c")["state"] == "proposed"
+    # two Antigravity observers pinned to the same native_id are one session too
+    _attach(co, "n1", "observer", "antigravity", native_id="agy-1", session=False)
+    _attach(co, "n2", "observer", "antigravity", native_id="agy-1", session=False)
+    assert _code(lambda: co.links.propose("t", "L3", "n1", "n2")) == "link_invalid_members"
+    _attach(co, "n3", "observer", "antigravity", native_id="agy-2", session=False)
+    assert co.links.propose("t", "L4", "n1", "n3")["state"] == "proposed"
+
+
+def test_rf17_claude_member_without_a_session_records_wake_route_none(tmp_path):
+    co = _co(tmp_path)
+    _attach(co, "lead", "supervisor", "claude", session=False, native_id="pid-7")  # native_id only: no bridge key
+    _attach(co, "ex", "executor", "codex")
+    co.links.propose("t", "L1", "lead", "ex")
+    act = co.links.confirm("t", "L1", "ex")
+    assert [m["wake_route"] for m in act["members"]] == ["none", "poll"]
+
+
+def _racing_queue(co, action, monkeypatch):
+    def q(th):
+        action(co)  # lands after the recipient was read and the link checked, before the locked launch
+        return "clear", {}
+
+    monkeypatch.setattr(wake, "_queue_state", q)
+
+
+@pytest.mark.parametrize("what", ["end_link", "rebind_sender", "rebind_recipient", "detach_sender"])
+def test_rf15_codex_launch_lock_rechecks_the_full_link_state(tmp_path, monkeypatch, what):
+    co = _codex_link(tmp_path)
+    launched = []
+    monkeypatch.setattr(wake.subprocess, "Popen", lambda cmd, **kw: launched.append(cmd) or _Proc())
+    actions = {
+        "end_link": lambda c: c.links.end("t", "L1", "lead", "gone"),
+        "rebind_sender": lambda c: _attach(c, "lead", "supervisor", "claude", session="lead-new", allow_transition=True),
+        "rebind_recipient": _rebind_ex,
+        "detach_sender": lambda c: c.detach("t", "lead"),
+    }
+    _racing_queue(co, actions[what], monkeypatch)
+    rec = wake.wake_recipient(co, "t", "w1", sender="lead", link_id="L1")
+    assert launched == [], f"codex exec resume was launched after {what}"
+    expect = {
+        "end_link": "refused:link_not_active",
+        "rebind_sender": "refused:link_stale",
+        "rebind_recipient": "refused:link_stale",
+        "detach_sender": "refused:link_stale",
+    }[what]
+    assert rec["outcome"] == expect, rec
+
+
+def test_rf15_an_untouched_link_still_launches(tmp_path, monkeypatch):
+    co = _codex_link(tmp_path)
+    launched = []
+    monkeypatch.setattr(wake.subprocess, "Popen", lambda cmd, **kw: launched.append(cmd) or _Proc())
+    monkeypatch.setattr(wake, "_queue_state", lambda th: ("clear", {}))
+    wake.wake_recipient(co, "t", "w1", sender="lead", link_id="L1")
+    assert len(launched) == 1
+
+
+def test_rf23_dead_code_is_gone():
+    from mycelium_coord import links
+
+    assert not hasattr(links, "STATES") and not hasattr(links.Links, "list_links")
+
+
+# ------------------------------------------------------------------ F27: MCP link tools, link_id pass-through, CLI wake --link
+def _mcp_world(tmp_path, monkeypatch):
+    pytest.importorskip("fastmcp")
+    from mycelium_coord import mcp_server
+
+    co = _co(tmp_path)
+    _pair(co)
+    monkeypatch.setattr(mcp_server, "_co", lambda: co)
+    return co, mcp_server
+
+
+def test_f27_mcp_link_tools_round_trip_and_refusals(tmp_path, monkeypatch):
+    from fastmcp import Client
+    import asyncio
+
+    co, ms = _mcp_world(tmp_path, monkeypatch)
+
+    async def go():
+        async with Client(ms.mcp) as c:
+            out = {}
+            out["propose"] = (await c.call_tool("coord_link_propose", {"task_id": "t", "link_id": "L1", "from_pid": "lead", "to_pid": "ex"})).data
+            with pytest.raises(Exception) as e1:  # the proposer is not the partner
+                await c.call_tool("coord_link_confirm", {"task_id": "t", "link_id": "L1", "participant_id": "lead"})
+            out["e_confirm"] = str(e1.value)
+            out["confirm"] = (await c.call_tool("coord_link_confirm", {"task_id": "t", "link_id": "L1", "participant_id": "ex"})).data
+            out["sent"] = (await c.call_tool("coord_send", {
+                "task_id": "t", "message_id": "m1", "sender": "lead", "recipient": "ex",
+                "kind": "progress", "task_revision": 1, "text": "x", "link_id": "L1"})).data
+            with pytest.raises(Exception) as e2:  # link_id reaches the gate: 'all' is not the partner
+                await c.call_tool("coord_send", {
+                    "task_id": "t", "message_id": "m2", "sender": "lead", "recipient": "all",
+                    "kind": "progress", "task_revision": 1, "text": "x", "link_id": "L1"})
+            out["e_send"] = str(e2.value)
+            await c.call_tool("coord_send", {
+                "task_id": "t", "message_id": "w1", "sender": "lead", "recipient": "ex",
+                "kind": "task", "task_revision": 1, "text": "x", "link_id": "L1"})
+            wk = (await c.call_tool("coord_wake", {"task_id": "t", "message_id": "w1", "sender": "lead", "link_id": "L1"})).data
+            out["wake"] = wk
+            out["get"] = (await c.call_tool("coord_link_get", {"task_id": "t", "link_id": "L1"})).data
+            out["end"] = (await c.call_tool("coord_link_end", {"task_id": "t", "link_id": "L1", "participant_id": "ex", "reason": "done"})).data
+            with pytest.raises(Exception) as e3:
+                await c.call_tool("coord_link_get", {"task_id": "t", "link_id": "nope"})
+            out["e_get"] = str(e3.value)
+            return out
+
+    out = asyncio.run(go())
+    assert out["propose"]["state"] == "proposed"
+    assert "link_confirm_not_partner" in out["e_confirm"]
+    assert out["confirm"]["state"] == "active"
+    assert out["sent"]["message"]["recipient"] == "ex"
+    assert "link_requires_exact_recipient" in out["e_send"]
+    assert out["wake"]["outcome"] == "refused:codex_exec_wake_not_enabled"  # past the link gate, into the route
+    assert out["get"]["state"] == "active"
+    assert out["end"]["state"] == "ended" and out["end"]["end_reason"] == "done"
+    assert "unknown_link" in out["e_get"]
+
+
+def test_f27_mcp_wake_with_a_stale_link_is_refused_link_stale(tmp_path, monkeypatch):
+    from fastmcp import Client
+    import asyncio
+
+    co, ms = _mcp_world(tmp_path, monkeypatch)
+    co.links.propose("t", "L1", "lead", "ex")
+    co.links.confirm("t", "L1", "ex")
+    _send(co, "w1", "lead", "ex", kind="task", link_id="L1")
+    _attach(co, "ex", "executor", "codex", session="elsewhere", allow_transition=True)
+
+    async def go():
+        async with Client(ms.mcp) as c:
+            with pytest.raises(Exception) as e:
+                await c.call_tool("coord_wake", {"task_id": "t", "message_id": "w1", "sender": "lead", "link_id": "L1"})
+            return str(e.value)
+
+    assert "link_stale" in asyncio.run(go())
+
+
+def test_f27_cli_wake_link_passes_the_link_gate_then_refuses_when_stale(tmp_path, capsys):
+    from mycelium_coord import cli
+
+    co = _co(tmp_path)
+    _active(co)
+    _send(co, "w1", "lead", "ex", kind="task", link_id="L1")
+    root = str(co.store.root)
+    rc = cli.run(["--root", root, "wake", "t", "w1", "--sender", "lead", "--link", "L1"])
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0 and out["outcome"] == "refused:codex_exec_wake_not_enabled"  # link passed, normal route ran
+    _send(co, "w2", "lead", "ex", kind="task", link_id="L1")
+    _attach(co, "ex", "executor", "codex", session="elsewhere", allow_transition=True)
+    rc = cli.run(["--root", root, "wake", "t", "w2", "--sender", "lead", "--link", "L1"])
+    assert rc == 3 and json.loads(capsys.readouterr().out)["error"] == "link_stale"
+
+
+# ------------------------------------------------------------------ F28: legacy behaviour against a golden from the PRE-CHANGE code
+GOLDEN = Path(__file__).resolve().parent / "fixtures" / "legacy_golden_01d5b25.json"
+
+
+def test_legacy_task_is_byte_identical_to_the_pre_change_golden(tmp_path, monkeypatch):
+    """The golden was produced by commit 01d5b25 (before the two-modes change) on Betty with a frozen clock
+    (`git archive 01d5b25`, the same scenario as below, participant send capabilities stripped). The current
+    code must reproduce every file of a legacy task (triangle-kinds + send-capability, no session-links)."""
+    golden = json.loads(GOLDEN.read_text())
+    assert golden["source_commit"] == "01d5b25"
+    import mycelium_coord
+
+    for name, mod in list(sys.modules.items()):
+        if name.startswith("mycelium_coord") and hasattr(mod, "utcnow"):
+            monkeypatch.setattr(mod, "utcnow", lambda: "2026-01-01T00:00:00Z")
+    co = Coordinator(CoordStore(str(tmp_path / "legacy")))
+    co.create_task(
+        "t", project="p", worktree_realpath="/wt", revision=1,
+        protocol_features=["triangle-kinds", "send-capability"],
+    )
+    _pair(co)
+    _send(co, "m1", "lead", "ex", kind="task")
+    _send(co, "m2", "ex", "lead", kind="progress")
+    _send(co, "m3", "lead", "all", kind="progress")
+    co.detach("t", "lead")
+    _attach(co, "lead", "supervisor", "claude")
+    root = co.store.root
+    got = {}
+    for p in sorted((root / "tasks" / "t").rglob("*")):
+        if p.is_file():
+            rel = str(p.relative_to(root))
+            txt = p.read_text()
+            if "/participants/" in rel:
+                d = json.loads(txt)
+                d.pop("send_cap", None)
+                txt = json.dumps(d, indent=2, sort_keys=True) + "\n"
+            got[rel] = txt
+    assert sorted(got) == sorted(golden["files"])  # no new file (no links/ dir) and none missing
+    for rel, want in golden["files"].items():
+        assert got[rel] == want, rel
+
+
+# ================================================================== Codex verification of the review fixes (v1.5)
+def _fail_stale_writes(co, monkeypatch):
+    from mycelium_coord.links import Links  # co.links builds a new Links per access: patch the class
+
+    real = Links._write
+
+    def boom(self, task_id, link, event, extra=None):
+        if event == "link_stale":
+            raise OSError(28, "No space left on device")
+        return real(self, task_id, link, event, extra)
+
+    monkeypatch.setattr(Links, "_write", boom)
+
+
+def test_rv1_a_failed_stale_write_refuses_the_rebind_and_the_detach_with_nothing_applied(tmp_path, monkeypatch):
+    co = _co(tmp_path)
+    _active(co)
+    ex_before = co.store.read("tasks/t/participants/ex.json")
+    _fail_stale_writes(co, monkeypatch)
+    with pytest.raises(OSError):
+        _attach(co, "ex", "executor", "codex", session="elsewhere", allow_transition=True)
+    with pytest.raises(OSError):
+        co.detach("t", "lead")
+    monkeypatch.undo()
+    assert co.store.read("tasks/t/participants/ex.json") == ex_before
+    assert not co.store.read("tasks/t/participants/lead.json").get("detached")
+    assert co.links.get("t", "L1")["state"] == "active"  # nobody changed, so the link is still true
+    # the review's residual window is gone: a detach that lands has already left the link stale on disk
+    co.detach("t", "lead")
+    assert co.store.read("tasks/t/links/L1.json")["state"] == "stale"
+    _attach(co, "lead", "supervisor", "claude")
+    assert co.links.get("t", "L1")["state"] == "stale"
+
+
+def test_rv1_a_refused_attach_keeps_the_capability_the_store_still_matches(tmp_path, monkeypatch):
+    from mycelium_coord import sendcap
+
+    co = _co(tmp_path)
+    _active(co)
+    rel = "tasks/t/participants/ex.json"
+    rec = co.store.read(rel)
+    held_before = sendcap.held(co.store, "t", "ex")
+    assert held_before
+    rec["send_cap"]["sha256"] = "0" * 64  # another (dead) holder's capability is current, so attach mints
+    co.store.write(rel, rec)
+    monkeypatch.setattr(sendcap, "holder_state", lambda h: sendcap.DEAD)
+    _fail_stale_writes(co, monkeypatch)
+    with pytest.raises(OSError):
+        _attach(co, "ex", "executor", "codex", session="elsewhere", allow_transition=True)
+    assert sendcap.held(co.store, "t", "ex") == held_before  # not the never-written new mint
+    assert co.store.read(rel)["send_cap"]["sha256"] == "0" * 64
+
+
+def test_rv2_a_prelaunch_store_failure_is_unavailable_and_retryable_not_uncertain(tmp_path, monkeypatch):
+    co = _codex_link(tmp_path)
+    launched = []
+    monkeypatch.setattr(wake.subprocess, "Popen", lambda cmd, **kw: launched.append(cmd) or _Proc())
+    monkeypatch.setattr(wake, "_queue_state", lambda th: ("clear", {}))
+    from mycelium_coord.links import Links  # co.links builds a new Links per access: patch the class
+
+    real = Links.recheck_live
+
+    def boom(self, task_id, link_id):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(Links, "recheck_live", boom)
+    rec = wake.wake_recipient(co, "t", "w1", sender="lead", link_id="L1")
+    assert launched == [] and rec["outcome"] == wake.UNAVAILABLE, rec
+    monkeypatch.setattr(Links, "recheck_live", real)
+    wake.wake_recipient(co, "t", "w1", sender="lead", link_id="L1")
+    assert len(launched) == 1, "the wake attempt was consumed although nothing ran"

@@ -58,10 +58,18 @@ PY
 [ -n "$OUT" ] || { echo "--out required" >&2; exit 5; }
 CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude)}"
 [ -n "$CLAUDE_BIN" ] || refuse 5 "claude binary not found"
-RAW="$OUT.stream.jsonl"; PROMPT="$(mktemp "${TMPDIR:-/tmp}/claude_ask_prompt.XXXXXX")"; cat > "$PROMPT"
+RAW="$OUT.stream.jsonl"; PROMPT="$(mktemp "$(dirname "$OUT")/.claude_ask_prompt.XXXXXX")"; cat > "$PROMPT"
 if [ ! -d "$CWD" ]; then rm -f "$PROMPT"; refuse 6 "cwd not a directory: $CWD"; fi
 CWD="$(cd "$CWD" && pwd -P)"
-case "$CWD" in "$HOME"|"$HOME/.claude"*|"$HOME/.codex"*|"$HOME/.gemini"*) rm -f "$PROMPT"; refuse 6 "refusing unsafe cwd $CWD";; esac
+UNSAFE=0
+case "$CWD" in "$HOME"|"$HOME/.claude"*|"$HOME/.codex"*|"$HOME/.gemini"*) UNSAFE=1;; esac
+# the same dirs by their REAL path: a symlinked ~/.claude (dotfiles style) must not let a call run inside its target
+for D in "$HOME" "$HOME/.claude" "$HOME/.codex" "$HOME/.gemini" "$HOME/.local/state/mycelium"; do
+  RD="$(cd "$D" 2>/dev/null && pwd -P)"
+  [ -n "$RD" ] || continue
+  if [ "$D" = "$HOME" ]; then [ "$CWD" != "$RD" ] || UNSAFE=1; else case "$CWD" in "$RD"|"$RD"/*) UNSAFE=1;; esac; fi
+done
+if [ "$UNSAFE" = 1 ]; then rm -f "$PROMPT"; refuse 6 "refusing unsafe cwd $CWD"; fi
 # Isolation (D7): --safe-mode turns off plugins, hooks, MCP, CLAUDE.md, skills; --restricted ignores
 # user/project/local settings and confines file tools to the working directory; empty strict MCP config;
 # read-only tools; hook events included in the stream so a breach is observable.

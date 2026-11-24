@@ -98,6 +98,8 @@ async def coord_create_task(
             checkpoint publish, detach, wake and bridge notify from any other process are refused
             (send_capability_required / send_capability_stale), and attaching an id whose holder process is
             still running is refused (participant_held).
+            "session-links" enables mode 2 (coord_link_propose / confirm / end / get; link_id on send and wake):
+            two named live sessions pinned to the task. It REQUIRES "send-capability" on the same task.
         message_budget: Opt-in reply budget {"per_correlation": N, "per_sender": M}; sends beyond it
             are refused with message_budget_exceeded (supervisors exempt from per_correlation).
     """

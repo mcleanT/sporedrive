@@ -7,8 +7,10 @@ per invocation: state lives entirely in the CoordStore.
 from __future__ import annotations
 
 import argparse
+import datetime
 import os
 import json
+import signal
 import sys
 
 from .coord import Coordinator
@@ -132,11 +134,39 @@ def build_parser() -> argparse.ArgumentParser:
         "--post-to",
         default=None,
         metavar="TASK:MSG",
-        help="post exactly one report replying to message MSG of task TASK (split at the first ':'); needs --sender",
+        help="post exactly one report replying to message MSG of task TASK (split at the FIRST ':', so a TASK containing "
+        "':' cannot be given this way: use --post-task/--post-reply-to); needs --sender",
+    )
+    p.add_argument(
+        "--post-task",
+        default=None,
+        dest="post_task",
+        help="task id to post the report to (with --post-reply-to); ids may contain ':'. Not combinable with --post-to",
+    )
+    p.add_argument(
+        "--post-reply-to",
+        default=None,
+        dest="post_reply_to",
+        help="message id of the review_request/consult_request the report answers (with --post-task)",
     )
     p.add_argument(
         "--sender", default=None, help="participant id that posts the report"
     )
+    p.add_argument(
+        "--cap-file",
+        default=None,
+        dest="call_cap_file",
+        help="send-capability file of --sender (same as the global --cap-file)",
+    )
+    p = csub.add_parser(
+        "post",
+        help="post exactly one report for an already finished call (same checks as the MCP consult_post); launches nothing",
+    )
+    p.add_argument("--task", required=True)
+    p.add_argument("--reply-to", required=True, dest="reply_to", help="message id of the request being answered")
+    p.add_argument("--sender", required=True, help="participant id that posts the report")
+    p.add_argument("--call-dir", required=True, dest="call_dir", help="the finished call's directory")
+    p.add_argument("--message-id", default=None, dest="message_id", help="idempotency key (default: derived from the call id)")
     p.add_argument(
         "--cap-file",
         default=None,
@@ -156,7 +186,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=None,
         dest="protocol_features",
-        help="opt-in protocol feature (repeatable): triangle-kinds enables review_request/consult_request/report (otherwise refused with kind_requires_feature); codex-exec-wake enables the headless Codex wake route; send-capability binds each participant to the process that attached it (CLI: keep it with --cap-file)",
+        help="opt-in protocol feature (repeatable): triangle-kinds enables review_request/consult_request/report (otherwise refused with kind_requires_feature); codex-exec-wake enables the headless Codex wake route; send-capability binds each participant to the process that attached it (CLI: keep it with --cap-file); session-links enables mode 2 `link` (two named live sessions pinned to one task) and REQUIRES send-capability on the same task",
     )
     p.add_argument(
         "--message-budget",
@@ -980,18 +1010,51 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def _enclosing_job_deadline(store) -> float | None:
+    """Seconds LEFT before the owned job this process runs under is stopped (jobs.py exports MYCELIUM_JOB_ID to the
+    job's command and records started_at once it launched), or None when not under a job or it cannot be read.
+    Time left, not the total (Codex verify of review F5): a job that already spent most of its deadline must not
+    admit a long call. Before started_at is recorded (the first instant of the job) the total is used."""
+    jid = os.environ.get("MYCELIUM_JOB_ID")
+    if not jid:
+        return None
+    try:
+        jm = JobManager(store)
+        d = (jm.read_request(jid) or {}).get("deadline_s")
+        if not (isinstance(d, (int, float)) and not isinstance(d, bool) and d > 0):
+            return None
+        started = (jm.status(jid) or {}).get("started_at")
+    except Exception:  # noqa: BLE001 - an unreadable job record means "unknown", never a refusal
+        return None
+    if isinstance(started, str) and started:
+        try:
+            t0 = datetime.datetime.fromisoformat(started.replace("Z", "+00:00"))
+            if t0.tzinfo is None:
+                t0 = t0.replace(tzinfo=datetime.timezone.utc)
+            spent = (datetime.datetime.now(datetime.timezone.utc) - t0).total_seconds()
+            return max(0.0, float(d) - max(0.0, spent))
+        except ValueError:
+            pass
+    return float(d)
+
+
 def _consult_call(args, co) -> int:
     """`consult call`: foreground, prints one JSON object. Exit 0 only when the call is ANSWERED (and, with
-    --post-to, the report was posted); anything else exits 3, so a script never mistakes it for a review."""
+    --post-to, the report was posted); anything else exits 3, so a script never mistakes it for a review.
+    A call stopped by a signal (job stop or deadline) still prints its summary and posts its report, then dies by
+    that signal."""
     if not os.environ.get(
         consult.RECURSION_ENV
     ):  # inside a target the recursion refusal below is the answer
         require_authority(
             "consult-call"
         )  # launching a session is an authority op: refused in advisory processes
-    if bool(args.post_to) != bool(args.sender):
+    if args.post_to and (args.post_task or args.post_reply_to):
         _emit(
-            {"error": "invalid_args", "message": "--post-to and --sender go together"}
+            {
+                "error": "invalid_args",
+                "message": "use either --post-to TASK:MSG or --post-task with --post-reply-to, not both",
+            }
         )
         return 3
     task_id = msg_id = None
@@ -999,6 +1062,43 @@ def _consult_call(args, co) -> int:
         task_id, sep, msg_id = args.post_to.partition(":")
         if not sep or not task_id or not msg_id:
             _emit({"error": "invalid_args", "message": "--post-to must be TASK:MSG"})
+            return 3
+    elif args.post_task or args.post_reply_to:
+        task_id, msg_id = args.post_task, args.post_reply_to
+        if not task_id or not msg_id:
+            _emit(
+                {
+                    "error": "invalid_args",
+                    "message": "--post-task and --post-reply-to go together",
+                }
+            )
+            return 3
+    if bool(task_id) != bool(args.sender):
+        _emit(
+            {
+                "error": "invalid_args",
+                "message": "posting (--post-to, or --post-task with --post-reply-to) and --sender go together",
+            }
+        )
+        return 3
+    if task_id:
+        # everything the post needs is checked BEFORE the paid call: a typo or a missing capability costs nothing
+        try:
+            consult.post_preflight(co, task_id=task_id, sender=args.sender, reply_to=msg_id)
+        except (ProtocolError, StoreError) as e:
+            _emit(
+                {
+                    "outcome": "NOT_STARTED",
+                    "retryable": False if isinstance(e, ProtocolError) else None,
+                    "exit": None,
+                    "reason": f"post_preflight: {e.code}: {e.message}",
+                    "usable": False,
+                    "call_id": None,
+                    "call_dir": None,
+                    "receipt": None,
+                    "post": {"posted": False, "error": e.code, "message": e.message},
+                }
+            )
             return 3
     extra = {consult.BIN_ENV[args.target]: args.host_bin} if args.host_bin else None
     rec = consult.run_call(
@@ -1010,6 +1110,8 @@ def _consult_call(args, co) -> int:
         caller=args.sender,
         path=args.target_path,
         store_root=str(co.store.root),
+        defer_stop=True,
+        enclosing_deadline_s=_enclosing_job_deadline(co.store),
     )
     out = {
         "outcome": rec["outcome"],
@@ -1020,9 +1122,45 @@ def _consult_call(args, co) -> int:
         "call_id": rec["call_id"],
         "call_dir": rec["call_dir"],
         "receipt": rec["receipt_path"],
+        "containment_breach": rec.get("containment_breach"),
+        "coverage": rec.get("coverage"),
+        "no_successful_read": rec.get("no_successful_read"),
+        "over_limit": (rec.get("answer") or {}).get("over_limit"),
     }
+    stopped = rec.get("stopped_signal")
+    if stopped:
+        out["stopped_signal"] = stopped
+        for sg in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            try:  # the stop was already taken: a second one must not cut the report short
+                signal.signal(sg, signal.SIG_IGN)
+            except (ValueError, OSError):
+                pass
     code = 0 if rec["outcome"] == "ANSWERED" else 3
-    if args.post_to:
+    if stopped and task_id and rec["receipt_path"]:
+        # Codex verify of review F5: the post may wait on a contended task lock for as long as job-run's SIGTERM grace,
+        # so on a stop the summary is printed FIRST; the post is then attempted, and its result is on the board (or
+        # can be redone with `consult post --call-dir`).
+        out["post"] = {
+            "posted": None,
+            "state": "attempting_after_stop",
+            "fallback": "mycelium-coord consult post --task T --reply-to M --sender S --call-dir "
+            + str(rec["call_dir"]),
+        }
+        _emit(out)
+        sys.stdout.flush()
+        try:
+            consult.post_report(
+                co, task_id=task_id, sender=args.sender, reply_to=msg_id, call_dir=rec["call_dir"]
+            )
+        except (ProtocolError, StoreError):
+            pass
+        try:  # now die by the signal that was requested
+            signal.signal(stopped, signal.SIG_DFL)
+            os.kill(os.getpid(), stopped)
+        except (ValueError, OSError):
+            pass
+        return 3
+    if task_id:
         if not rec["receipt_path"]:
             out["post"] = {
                 "posted": False,
@@ -1050,7 +1188,41 @@ def _consult_call(args, co) -> int:
                 out["post"] = {"posted": False, "error": e.code, "message": e.message}
                 code = 3
     _emit(out)
+    if stopped:
+        sys.stdout.flush()
+        try:  # now die by the signal that was requested
+            signal.signal(stopped, signal.SIG_DFL)
+            os.kill(os.getpid(), stopped)
+        except (ValueError, OSError):
+            pass
+        return 3
     return code
+
+
+def _consult_post(args, co) -> int:
+    """`consult post`: one report for a finished call, from this process (it needs the sender's capability)."""
+    try:
+        m = consult.post_report(
+            co,
+            task_id=args.task,
+            sender=args.sender,
+            reply_to=args.reply_to,
+            call_dir=args.call_dir,
+            message_id=args.message_id,
+        )
+    except (ProtocolError, StoreError) as e:
+        _emit({"posted": False, "error": e.code, "message": e.message})
+        return 3
+    msg = m.get("message") or {}
+    _emit(
+        {
+            "posted": True,
+            "message_id": msg.get("message_id"),
+            "recipient": msg.get("recipient"),
+            "idempotent_replay": bool(m.get("idempotent")),
+        }
+    )
+    return 0
 
 
 def _split_command(argv: list[str] | None):
@@ -1125,7 +1297,7 @@ def run(argv: list[str] | None = None) -> int:
                 )
             )
         elif op == "consult":
-            return _consult_call(args, co)
+            return _consult_call(args, co) if args.consult_op == "call" else _consult_post(args, co)
         elif op == "task":
             _emit(co.get_task(args.task_id))
         elif op == "list-tasks":

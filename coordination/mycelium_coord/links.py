@@ -8,17 +8,18 @@ Identity pin: the PAIR (host kind, host.session, host.native_id) copied from the
 record, never from the caller. A link is stale when a member is detached or a DIFFERENT native session holds the
 participant (any change of that triple; None never equals a changed value). A new send capability on the SAME
 session (a headless Codex wake re-attach, a restarted session re-attaching) changes none of the pin and is not
-stale. A stale link refuses `link_stale`; it never retargets.
+stale. A stale link refuses `link_stale`; it never retargets. The pin is a claimed label copied from the attach
+record, not an authenticated identity (member `session_source` is "attach_record", `session_verified` is always
+false). Design v1.4; review fixes F1, F12, F14-F17.
 """
 
 from __future__ import annotations
 
 from . import model
 from .model import ProtocolError, utcnow
-from .store import require_id
+from .store import StoreError, require_id
 
 LINK_SCHEMA = "session-link/1"
-STATES = ("proposed", "active", "stale", "ended")
 
 
 def _root(task_id: str) -> str:
@@ -48,7 +49,9 @@ def wake_route_for(task: dict, participant: dict) -> str:
     if participant.get("role") == "observer":
         return "none"
     if kind == "claude":
-        return "claude-bridge"
+        # the cmux bridge matches a delivery by host.session; a Claude member with no session can never be
+        # delivered to, so recording "claude-bridge" would be untrue (review F17)
+        return "claude-bridge" if host.get("session") else "none"
     if kind == "codex":
         if (
             model.FEATURE_CODEX_EXEC_WAKE in (task.get("protocol_features") or [])
@@ -129,28 +132,102 @@ class Links:
                 self._write(task_id, link, "link_stale", {"reason": why})
         return link
 
-    def _all(self, task_id: str) -> list[dict]:
+    def _all(self, task_id: str, errors: list | None = None) -> list[dict]:
+        """Every link record. Dot-names (a stray `.tmp-*.json` left by an interrupted write) are never links
+        (review F1a). With `errors` given, an unreadable file is collected and skipped instead of raising."""
         out = []
-        for path in self.store.listdir(f"{_root(task_id)}/links"):
-            rec = self.store.read(f"{_root(task_id)}/links/{path.name}")
+        for path in self.store.listdir(f"{_root(task_id)}/links", "[!.]*.json"):
+            try:
+                rec = self.store.read(f"{_root(task_id)}/links/{path.name}")
+            except StoreError as e:
+                if errors is None:
+                    raise
+                errors.append((path.name, e.code))
+                continue
             if rec:
                 out.append(rec)
         return out
 
-    def participant_changed(self, task_id: str, participant_id: str) -> None:
-        """Called by attach/detach under the task lock: mark this participant's links stale when its pin
-        no longer holds. A same-session re-attach changes nothing."""
+    def prepare_change(self, task_id: str, participant_id: str, new_record: dict) -> None:
+        """Called by attach/detach under the task lock BEFORE the participant record is written (Codex verify of
+        review F1): persist staleness for every proposed/active link of this participant that the new record would
+        make stale. STRICT for readable links: a failed stale write raises, so the attach/detach is refused with
+        the participant record untouched, and a link can never revive through a same-session re-attach after a
+        stale write that did not land. Unreadable link files are skipped here (they cannot be used for a send or
+        wake either). A same-session re-attach makes no link stale and writes nothing. If the participant write
+        then fails, the link stays stale (the safe direction; re-propose)."""
         task = self.co.get_task(task_id)
         if not task or model.FEATURE_SESSION_LINKS not in (
             task.get("protocol_features") or []
         ):
             return
-        for link in self._all(task_id):
+        for link in self._all(task_id, errors=[]):
+            if link.get("state") not in ("proposed", "active"):
+                continue
+            m = next(
+                (x for x in link["members"] if x["participant_id"] == participant_id), None
+            )
+            if m is None:
+                continue
+            if not new_record or new_record.get("detached"):
+                why = f"member_detached:{participant_id}"
+            elif pin_of(new_record) != {
+                "host": m["host"],
+                "session": m["session"],
+                "native_id": m["native_id"],
+            }:
+                why = f"member_session_changed:{participant_id}"
+            elif m["host"] == "antigravity" and new_record.get("role") != "observer":
+                why = f"member_role_changed:{participant_id}"
+            else:
+                continue
+            link["state"] = "stale"
+            link["stale_reason"] = why
+            link["stale_at"] = utcnow()
+            self._write(task_id, link, "link_stale", {"reason": why})
+
+    def participant_changed(self, task_id: str, participant_id: str) -> None:
+        """Called by attach/detach under the task lock: mark this participant's links stale when its pin
+        no longer holds. A same-session re-attach changes nothing.
+
+        BEST-EFFORT (review F1c): attach/detach already wrote the participant, so a failure here must not leave
+        the audit receipt, the selection binding and the capability revocation undone. Each failure (an
+        unreadable link file, a failed write) is recorded as a `link_stale_update_failed` audit entry and the
+        scan continues. "Stale is sticky" still holds: `_require_live`/`get` recompute staleness from the live
+        participant record on every check and persist it, so a link whose update failed here is refused and
+        retried on its next use. The strict pre-write step `prepare_change` closes the window where a stale
+        write that never landed could be undone by a same-session re-attach."""
+        task = self.co.get_task(task_id)
+        if not task or model.FEATURE_SESSION_LINKS not in (
+            task.get("protocol_features") or []
+        ):
+            return
+        failures: list[dict] = []
+        scan_errors: list = []
+        links = self._all(task_id, errors=scan_errors)
+        for name, code in scan_errors:
+            failures.append({"file": name, "error": code})
+        for link in links:
             if any(m["participant_id"] == participant_id for m in link["members"]):
-                self._refresh(task_id, link)
+                try:
+                    self._refresh(task_id, link)
+                except (StoreError, OSError) as e:
+                    failures.append(
+                        {"link_id": link.get("link_id"), "error": getattr(e, "code", type(e).__name__)}
+                    )
+        if failures:
+            try:
+                self.store.append_receipt(
+                    f"{_root(task_id)}/audit.jsonl",
+                    "link_stale_update_failed",
+                    {"participant_id": participant_id, "failures": failures},
+                    lock_name=task_id,
+                )
+            except (StoreError, OSError):
+                pass
 
     @staticmethod
-    def _member(task_id: str, p: dict, now: str | None) -> dict:
+    def _member(p: dict, now: str | None) -> dict:
         pin = pin_of(p)
         return {
             "participant_id": p["participant_id"],
@@ -159,7 +236,11 @@ class Links:
             "session": pin["session"],
             "native_id": pin["native_id"],
             "native_session_id": pin["session"] or pin["native_id"],
-            "session_verified": bool(pin["session"]) and pin["host"] != "antigravity",
+            # review F14: the pin is a LABEL copied from the participant's attach record (containment, not
+            # authentication; sendcap.py). Nothing here verifies the session is real, so the honest field names
+            # its source instead of claiming verification.
+            "session_source": "attach_record",
+            "session_verified": False,
             "wake_route": None,
             "confirmed_at": now,
         }
@@ -198,6 +279,15 @@ class Links:
                 )
             pa = self.co._participant(task_id, from_pid)
             pb = self.co._participant(task_id, to_pid)
+            pa_pin, pb_pin = pin_of(pa), pin_of(pb)
+            if pa_pin == pb_pin and pa_pin["host"] and (pa_pin["session"] or pa_pin["native_id"]):
+                # two participants on one native session would make the "two live sessions" link one session
+                # linked to itself (review F16)
+                raise ProtocolError(
+                    "link_invalid_members",
+                    link_id,
+                    "both members are pinned to the same native session; a link needs two different sessions",
+                )
             self.co._require_cap(task_id, from_pid, "link_propose", task=task)
             for p in (pa, pb):
                 if (p.get("host") or {}).get("host") == "antigravity" and p.get(
@@ -227,8 +317,8 @@ class Links:
                 "created_by": from_pid,
                 "created_at": now,
                 "members": [
-                    self._member(task_id, pa, now),
-                    self._member(task_id, pb, None),
+                    self._member(pa, now),
+                    self._member(pb, None),
                 ],
                 "ended_at": None,
                 "end_reason": None,
@@ -249,6 +339,7 @@ class Links:
                     "only the proposed partner may confirm",
                 )
             self.co._participant(task_id, participant_id)
+            self.co._require_advisory_observer(task_id, participant_id, "link_confirm")
             self.co._require_cap(task_id, participant_id, "link_confirm", task=task)
             if link["state"] == "stale":
                 raise ProtocolError(
@@ -289,6 +380,7 @@ class Links:
                     "link_not_member", participant_id, "only a link member may end it"
                 )
             self.co._participant(task_id, participant_id)
+            self.co._require_advisory_observer(task_id, participant_id, "link_end")
             self.co._require_cap(task_id, participant_id, "link_end", task=task)
             if link["state"] == "ended":
                 return {**link, "idempotent": True}
@@ -307,10 +399,6 @@ class Links:
     def get(self, task_id: str, link_id: str) -> dict:
         self._task(task_id)
         return self._view(task_id, self._read(task_id, link_id))
-
-    def list_links(self, task_id: str) -> list[dict]:
-        self._task(task_id)
-        return [self._view(task_id, l) for l in self._all(task_id)]
 
     # ------------------------------------------------------------------ the send / wake gate
     def _active(self, task_id: str, link_id: str, sender: str) -> tuple[dict, dict]:
@@ -395,6 +483,14 @@ class Links:
                 )
             self._require_live(task_id, link)
             return link
+
+    def recheck_live(self, task_id: str, link_id: str) -> dict:
+        """Full link-state re-check for a launch (review F15). Caller holds the task lock. The link must still
+        be active, not ended, and BOTH members' participant records must still match the pins it recorded
+        (a member detached or rebound makes it stale and refuses). Raises ProtocolError; never retargets."""
+        link = self._read(task_id, link_id)
+        self._require_live(task_id, link)
+        return self._read(task_id, link_id)
 
     @staticmethod
     def member_pin(link: dict, participant_id: str) -> dict | None:

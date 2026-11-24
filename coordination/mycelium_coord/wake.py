@@ -433,6 +433,12 @@ def _codex_locked(ctx, thread: str) -> tuple[str, dict]:
             if ctx.get("link_pin") is not None and _pin_of(fresh) != ctx["link_pin"]:
                 # same lock as the launch: a rebind after the link check can never be launched against
                 return _refused("link_stale"), {}
+            if ctx.get("link_id") is not None:
+                # full link state under the launch lock: still active, not ended, both members' pins unchanged
+                try:
+                    co.links.recheck_live(task_id, ctx["link_id"])
+                except ProtocolError as e:
+                    return _refused(e.code), {}
             if not (
                 not fresh.get("detached")
                 and fh.get("host") == "codex"
@@ -463,9 +469,11 @@ def _codex_locked(ctx, thread: str) -> tuple[str, dict]:
                 )
             except OSError as e:
                 return UNAVAILABLE, {"error": type(e).__name__}
-    except StoreError as e:
-        if proc is None and getattr(e, "code", "") == "lock_timeout":
-            return UNAVAILABLE, {"error": "task_lock_timeout"}
+    except (StoreError, OSError) as e:
+        if proc is None:  # nothing was launched: retryable, never uncertain (Codex verify of the review fixes)
+            if getattr(e, "code", "") == "lock_timeout":
+                return UNAVAILABLE, {"error": "task_lock_timeout"}
+            return UNAVAILABLE, {"error": f"prelaunch_{type(e).__name__}", "code": getattr(e, "code", None)}
         raise
     try:
         try:
@@ -653,6 +661,7 @@ def wake_recipient(
             "recip": recip,
             "sender": sender,
             "link_pin": link_pin,
+            "link_id": link_id,
             "route_args": {
                 "binding_id": binding_id,
                 "controller_id": controller_id,

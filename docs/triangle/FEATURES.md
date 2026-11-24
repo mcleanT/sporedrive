@@ -153,74 +153,114 @@
 - Review: Codex scoped review (9 findings: 7 fixed, 1 accepted limit, 1 test gap fixed) and one targeted verification
   (7 closed; the two items above documented). Evidence: evidence/sendcap-review/, live smoke evidence/sendcap-smoke/.
 
-## Call mode (mode 1, 2026-11-23; design TWO-MODES-DESIGN.md v1.2)
+## Call mode (mode 1, 2026-11-23; design TWO-MODES-DESIGN.md v1.5)
 A transient, headless, read-only call: a brand-new session of Codex, Claude Code or Antigravity gets one written packet
 (`consult-packet/1`), answers once and is thrown away. No board connection, no coordination MCP server, nothing carried
 over. Code: `coordination/mycelium_coord/consult.py`; hosts: `src/consult/{codex_call.sh,claude_ask.sh,agy_ask.py}`.
 - CLI (foreground, run from the caller's shell): `mycelium-coord consult call --target codex|claude|antigravity --packet p.json
-  [--out-root DIR] [--post-to TASK:MSG --sender PID --cap-file F]`. Prints one JSON object (outcome, retryable, usable,
-  receipt path, call dir); exit 0 only when ANSWERED, otherwise 3. Refused in advisory processes (it launches a session).
+  [--out-root DIR] [--post-to TASK:MSG | --post-task T --post-reply-to M] [--sender PID --cap-file F]`. Prints one JSON
+  object (outcome, retryable, usable, receipt path, call dir, plus `containment_breach`, `coverage`, `no_successful_read`
+  and `over_limit`); exit 0 only when ANSWERED, otherwise 3. Refused in advisory processes (it launches a session).
+  `--post-to` splits at the FIRST colon, so ids that contain `:` go through `--post-task` / `--post-reply-to`.
+- With posting requested, everything the post needs is checked BEFORE the call is launched (task exists and has
+  `triangle-kinds`, the reply-to message exists, is a review_request/consult_request addressed to the sender, the sender is
+  attached and this process holds its capability); a failure is exit 3, outcome NOT_STARTED, nothing launched, nothing spent.
+  `mycelium-coord consult post --task T --reply-to M --sender S --call-dir D [--message-id ID] [--cap-file F]` posts an
+  already finished call with the same checks (the CLI twin of `consult_post`).
+- Under `job-run`: a call can run up to `limits.deadline_s` (default 900) plus a 30 s dispatch grace, but `job-run`'s default
+  deadline is 600 s. Give the job a deadline of at least `deadline_s + 30` (`job-run --deadline 960 ...`). When the CLI runs
+  under a job (`MYCELIUM_JOB_ID`) and the time left in the job (its deadline minus the time since it started) is smaller, the
+  call is refused up front (`job_deadline_too_short`, NOT_STARTED, nothing launched). A call stopped by the job (deadline or
+  stop) prints its JSON summary FIRST (`post.state: "attempting_after_stop"` with a `consult post` fallback command), then
+  posts the CANNOT-EVALUATE report (when posting was requested), then dies by the signal; `jobs.py` allows only a short grace
+  after its SIGTERM, and the post may wait on a task lock, so the summary never depends on the post.
 - Per call a fresh directory `<out-root>/<call_id>/` (an existing one is refused) holds `packet.json`, `prompt.txt`,
   `host/` (adapter output and raw stream), an empty `coord/` (the target's `MYCELIUM_COORD_DIR`), `receipt.json`
   (`consult-receipt/1`) and, only when ANSWERED, `answer.md`.
 - Preflight, before any launch: packet validated (unknown keys refused, framing over about 1,000 words refused, never
-  trimmed); every named file resolved and sha256-checked inside the repo folder; `$HOME`, the host config folders and the
-  coordination state folder refused. Failure is NOT_STARTED/REFUSED and nothing runs.
+  trimmed); every named file resolved and sha256-checked inside the repo folder (a symlinked named or evidence path is
+  refused, `named_path_symlink`). A repo folder that equals or contains `$HOME`, a host config folder (`~/.claude`, `~/.codex`,
+  `~/.gemini`), the coordination state folder (`~/.local/state/mycelium`), the default store, `MYCELIUM_COORD_DIR` or the CLI's
+  own `--root` store is refused, compared both by its spelling and by its realpath (a symlinked config folder is still
+  protected; `claude_ask.sh` and `codex_call.sh` repeat the check on the real paths). Failure is NOT_STARTED/REFUSED and nothing
+  runs. A transient local error before launch (no space, too many open files) is `retryable` true, an unknown cause null, never
+  false.
 - The target starts with an exact environment allowlist: PATH, HOME, USER, LOGNAME, LANG, TMPDIR (only those the caller
   has) plus `MYCELIUM_COORD_ADVISORY=1`, `MYCELIUM_COORD_DIR=<empty per-call dir>`, `MYCELIUM_CONSULT_TARGET=1`.
-  Nothing else is inherited; `env_keys_passed` is in the receipt. A call started inside a target is refused (recursion).
+  The one binary preflight resolved is also passed as `CODEX_BIN` / `CLAUDE_BIN` / `AGY_BIN` (v1.3), so nothing else is
+  inherited except that key; `env_keys_passed` is in the receipt. A call started inside a target is refused (recursion).
 - One call in flight per (caller, target host); a second is REFUSED `busy` (retryable). A lock whose holder process is
   dead is recovered. The caller is `--sender` when given, else the user id.
+- A call whose post was requested but failed after an ANSWERED call (for example a stale capability) still exits 3; the answer is kept
+  and `consult post` can post it later.
 - Five outcomes, decided on (exit, reason): NOT_STARTED, REFUSED, UNAVAILABLE (retryable true = quota/429/network,
   false = auth/model rejected, null = unknown and never recorded as permanent), TIMED_OUT, ANSWERED. Exit 0 or the
   host's "answer kept, flagged" exit 4 only counts with a non-empty answer. Only ANSWERED is usable; the rest are
   CANNOT-EVALUATE, never "found nothing".
 - Receipt measures what it can and says null otherwise: tokens (null, never 0), read coverage (Codex: a lower-bound
-  heuristic over `command_execution` events; null with source `unmeasured` when it cannot be extracted),
+  heuristic over `command_execution` events; `files_read_match` records `argument` (a direct reader operand that resolves to
+  the named file) or `possible` (never counted); `coverage.read` is null with `read_lower_bound` unless every named file is an
+  `argument` match; null with source `unmeasured` when it cannot be extracted),
   `named_files_unchanged` (hash of the named files only), `host_config_unchanged`, `implicit_context` (what the host can
-  still read; not confinement), `env_keys_passed`.
+  still read; not confinement), `env_keys_passed`. Codex reads: a bare basename that is not that file in the repo folder,
+  and any relative operand after a `cd`/`pushd` in the same command, count only as `possible`, never toward an exact count.
+  `containment_breach` is true on ANY launched outcome when a named file or the host config changed. `limits.max_answer_chars`
+  is advisory: an over-long answer is kept and flagged `answer.over_limit`.
 - Posting: `--post-to` (CLI, needs the sender's `--cap-file`) or the MCP tool `consult_post(task_id, sender, reply_to,
   call_dir, message_id?)` (for callers attached over MCP, whose capability lives in the server process) sends exactly one
-  `report` after the call: the answer as `artifact_ref` and the receipt sha256 as evidence, after re-hashing `answer.md`
+  `report` after the call: the answer as `artifact_ref` and the receipt sha256 as evidence (plus a second evidence entry with a
+  plain summary line and the breach, coverage, no_successful_read and over_limit values), after re-hashing `answer.md`
   against the receipt (a tampered answer is refused, `consult_answer_sha_mismatch`). A non-ANSWERED call posts a report
   that states the outcome. `consult_post` launches nothing, is not in the advisory allowlist and is refused in advisory
   processes. There is no MCP launch tool. A receipt and answer replaced together are not detected (no signature).
 - Limits: "not handed to it" is not confinement. The Codex and Antigravity targets can still read any user-readable file;
   the Claude target is confined to the repo folder. Antigravity cannot start calls in this build.
 
-## Link mode (mode 2, 2026-11-23; design TWO-MODES-DESIGN.md v1.2 section 3; coordination/mycelium_coord/links.py)
+## Link mode (mode 2, 2026-11-23; design TWO-MODES-DESIGN.md v1.5 section 3; coordination/mycelium_coord/links.py)
 Two named live sessions pinned to one shared task, for ongoing collaboration. Opt-in task feature `session-links`, which
 **requires** `send-capability` on the same task (`create-task` refuses it otherwise: `session_links_requires_send_capability`),
 so every link operation is capability-checked. A task without the feature behaves exactly as before and has no `links/` directory.
 - **Record**: `tasks/<task_id>/links/<link_id>.json` (`session-link/1`), written under the task lock, each change an audit receipt
   (`link_propose`, `link_confirm`, `link_end`, `link_stale`). Members `[proposer, partner]`, each
-  `{participant_id, role, host, session, native_id, native_session_id, session_verified, wake_route, confirmed_at}`. host and native
-  session are copied from the participant's stored attach record, never from the caller.
+  `{participant_id, role, host, session, native_id, native_session_id, session_source, session_verified, wake_route, confirmed_at}`.
+  host and native session are copied from the participant's stored attach record, never from the caller. They are a claimed
+  label, not an authenticated identity (containment, not authentication; sendcap.py): `session_source` is `attach_record` and
+  `session_verified` is always `false` (v1.4: it used to read `true` for any non-empty string). Propose refuses two members on the
+  same (host, session / native_id) (`link_invalid_members`).
 - **Lifecycle**: `link propose` (non-advisory; both attached; the proposer's capability) -> `link confirm` (by the partner,
   capability-checked; records each member's `wake_route` truthfully: `claude-bridge`, `codex-exec-resume` for a headless-owned
-  Codex thread on a `codex-exec-wake` task, `poll`, or `none` for an observer) -> `link end` (either member). `link show` reads it.
-  An advisory process may confirm and end, not propose. An Antigravity member must be attached as `observer`
-  (`session_verified: false`, sends limited to the advisory kinds).
+  Codex thread on a `codex-exec-wake` task, `poll`, or `none` for an observer or a Claude member with no `host.session`, which the
+  bridge could never reach) -> `link end` (either member). `link show` reads it.
+  An advisory process may propose nothing, and may confirm and end only as an attached observer (`advisory_process_refused`
+  otherwise, same rule as send, ack and set_cursor). An Antigravity member must be attached as `observer` (sends limited to the
+  advisory kinds).
 - **Stale**: when a member detaches, or a different native session holds the participant. The pin is the triple
   (host kind, `host.session`, `host.native_id`); a null never equals a changed value. A new capability on the SAME session (a
   headless Codex wake re-attach, a restarted session re-attaching) is not stale. Stale is sticky (a later re-attach does not revive
-  it), refuses `link_stale`, and never retargets.
+  it), refuses `link_stale`, and never retargets. Attach/detach write a readable link stale BEFORE the participant record; if
+  that write fails the attach/detach is refused with nothing applied. An unreadable link file does not block the attach or
+  detach (the audit gets `link_stale_update_failed`), and every later check recomputes and persists staleness. Dot-named files in `links/` (a leftover `.tmp-*.json`) are never links; `store.write` removes its
+  temp file on failure.
   An Antigravity member must stay an observer: a rebind to another role makes the link stale (`member_role_changed:<id>`), and
   `send --link` from an Antigravity member refuses any actionable send. A participant id that is a role name or `all` cannot be a
   link member (`link_member_id_reserved`). A repeated identical send or wake (same id, same content) returns the stored result before
   the link check runs; only a first-time send or wake is gated, and a new id after a rebind gets `link_stale`.
 - **Known limit (Claude bridge route)**: the bridge compares the recipient's pin just before the cmux send, with no lock around the
   send itself. A rebind in that gap is not caught; the message may reach the new session. Codex and Antigravity do not have this window
-  (Codex rechecks the pin under the launch claim; Antigravity polls).
+  (Codex rechecks the whole link, not only the recipient pin, under the launch lock: still active, not ended, both members'
+  pins unchanged; Antigravity polls).
 - **Send / wake inside a link**: `send --link ID --to PARTNER` (MCP `coord_send link_id`) and `wake --link ID` (MCP `coord_wake link_id`).
   The recipient must be exactly the partner participant; a role, `all` or anyone else is refused `link_requires_exact_recipient`;
   a non-member sender `link_sender_not_member`; a stale link `link_stale`; a proposed/ended link `link_not_active`. After the check
   `wake_recipient` runs unchanged. A send without `--link` is unchanged.
-- **MCP**: `coord_link_propose`, `coord_link_confirm`, `coord_link_end`, `coord_link_get`; an advisory process sees confirm, end and get only.
-  The tools take `task_id` (the link record lives under its task) and the acting `participant_id`.
+- **MCP**: `coord_link_propose(task_id, link_id, from_pid, to_pid)`, `coord_link_confirm(task_id, link_id, participant_id)`,
+  `coord_link_end(task_id, link_id, participant_id, reason?)`, `coord_link_get(task_id, link_id)`; an advisory process sees
+  confirm, end and get only. A refusal during `wake` is sometimes a raised error (caller-side checks, no receipt) and sometimes a
+  recorded `refused:<code>` receipt (re-checks under a lock), as for every wake refusal.
+  Enable the feature with `create-task --feature session-links --feature send-capability` (MCP `protocol_features`).
 - **Sharing** is the whole task, as participants already have (no per-member filter). A link designates the recipient of a send; it
   does not make the board private (board reads are not capability-gated) and it grants no authority.
 - **Call mode fixes shipped with it**: `consult call` now refuses under `MYCELIUM_CONSULT_TARGET` before constructing the store;
-  Codex read coverage counts a named file as read when it is a reader's argument or is mentioned in a completed exit-0 command that
-  runs a reader (`files_read_match` records `argument` / `mentioned`); a shortfall is `coverage.read: null` with `read_lower_bound`,
-  and `no_successful_read: null` when the lower bound is 0, never 0/true.
+  Codex read coverage counts a named file as read only when it is a direct reader operand (`files_read_match` records `argument`;
+  anything else, including a mention in a reader command, is `possible` and never counted); a shortfall is `coverage.read: null`
+  with `read_lower_bound`, and `no_successful_read: null` when the lower bound is 0, never 0/true.

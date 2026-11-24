@@ -1,4 +1,4 @@
-"""Mode 1 "call" (docs/triangle/TWO-MODES-DESIGN.md v1.2 sections 2.1-2.5): a transient, headless, read-only
+"""Mode 1 "call" (docs/triangle/TWO-MODES-DESIGN.md v1.4 sections 2.1-2.5): a transient, headless, read-only
 consult of one target host (Codex, Claude Code or Antigravity) from one written packet.
 
 What lives here: packet validation (consult-packet/1), preflight (named files resolved and hashed inside the
@@ -33,7 +33,7 @@ import threading
 import time
 
 from . import sendcap
-from .model import ProtocolError, require_authority
+from .model import FEATURE_TRIANGLE_KINDS, ProtocolError, require_authority
 from .store import valid_id
 
 PACKET_SCHEMA = "consult-packet/1"
@@ -230,6 +230,16 @@ def _bad(reason: str):
     raise ConsultError("NOT_STARTED", "packet_invalid: " + reason, False)
 
 
+# A packet string the prompt renders on ONE line (a heading, a bullet, a path) may not carry a line break or any other
+# control character: it would start a new, unquoted line and escape the "evidence, not instructions" fence.
+_LINE_BREAKS = re.compile("[\x00-\x1f\x7f\u0085\u2028\u2029]")
+
+
+def _one_line(name: str, v: str) -> None:
+    if _LINE_BREAKS.search(v):
+        _bad(f"{name} must not contain a newline or any other control character")
+
+
 def _str_list(v, name):
     if v is None:
         return []
@@ -304,6 +314,14 @@ def validate_packet(raw) -> dict:
         ("source_path", "lines", "text", "sha256"),
         ("source_path", "lines", "text", "sha256"),
     )
+    for i, e in enumerate(files):
+        _one_line(f"files[{i}].path", e["path"])
+        _one_line(f"files[{i}].why", e["why"])
+    for i, e in enumerate(refs):
+        _one_line(f"evidence_refs[{i}].path", e["path"])
+    for i, e in enumerate(exc):
+        _one_line(f"excerpts[{i}].source_path", e["source_path"])
+        _one_line(f"excerpts[{i}].lines", e["lines"])
     for i, e in enumerate(files + refs):
         if not _HEX64.match(e["sha256"].lower()):
             _bad(f"sha256 of {e['path']!r} is not 64 hex characters")
@@ -318,6 +336,12 @@ def validate_packet(raw) -> dict:
             _bad(f"excerpts[{i}].sha256 does not match the sha256 of its text")
         e["sha256"] = e["sha256"].lower()
     decisions = _str_list(raw.get("decisions"), "decisions")
+    _one_line("scope.repo_realpath", repo)
+    for k in ("in_scope", "out_of_scope"):
+        for i, v in enumerate(scope[k]):
+            _one_line(f"scope.{k}[{i}]", v)
+    for i, v in enumerate(decisions):
+        _one_line(f"decisions[{i}]", v)
     lim = raw.get("limits")
     if not isinstance(lim, dict):
         _bad("limits must be an object {model, effort, deadline_s, max_answer_chars}")
@@ -393,15 +417,11 @@ def _protected_paths(
     out = []
     for h in sorted(homes):
         out.append(("home directory", h, "node"))
-        for sub in (".claude", ".codex", ".gemini"):
-            out.append(("host config or coordination state directory", os.path.join(h, sub), "tree"))
-        out.append(
-            (
-                "host config or coordination state directory",
-                os.path.join(h, ".local", "state", "mycelium"),
-                "tree",
-            )
-        )
+        subs = [os.path.join(h, s) for s in (".claude", ".codex", ".gemini")]
+        subs.append(os.path.join(h, ".local", "state", "mycelium"))
+        for sub in subs:  # both spellings: a symlinked config dir (dotfiles style) is protected by its real target too
+            for c in sorted({sub, os.path.realpath(sub)}):
+                out.append(("host config or coordination state directory", c, "tree"))
     for extra in (coord_dir, store_root):  # the caller's own store: MYCELIUM_COORD_DIR and the CLI's --root
         if extra:
             for c in {extra, os.path.realpath(extra)}:
@@ -439,7 +459,10 @@ def preflight(
             False,
         )
     repo = os.path.realpath(repo_in)
-    why = _unsafe_repo(repo, home, coord_dir, store_root)
+    # the verified realpath AND the literal spelling are both compared with every protected path (and its realpath)
+    why = _unsafe_repo(repo, home, coord_dir, store_root) or _unsafe_repo(
+        os.path.abspath(repo_in), home, coord_dir, store_root
+    )
     if why:
         raise ConsultError(
             "REFUSED", f"preflight: refusing unsafe repo folder ({why}): {repo}", False
@@ -595,7 +618,7 @@ def build_env(
 
 
 def resolve_host_bin(target: str, env: dict) -> str | None:
-    """The binary preflight expects to run, or None. Presence check only; the adapter resolves it again."""
+    """The binary preflight expects to run, or None. Presence check only; the adapter is then handed this exact binary through <HOST>_BIN (v1.3), so both run the same one."""
     override = env.get(BIN_ENV[target])
     if override:
         return (
@@ -821,11 +844,12 @@ def classify(
             return "NOT_STARTED", False
         return "UNAVAILABLE", signature_retryable((signature_text or "") + " " + reason)
     if code == 6:
-        return (
-            ("NOT_STARTED", False)
-            if _NOT_STARTED_6.match(reason)
-            else ("REFUSED", False)
-        )
+        if _NOT_STARTED_6.match(reason):
+            # "cannot create ...": a transient errno in the reason (disk full, too many files) is retryable; any other
+            # cause is unknown (null). Never a recorded permanent failure.
+            m = re.search(r"\[Errno (\d+)\]", reason)
+            return "NOT_STARTED", (True if m and int(m.group(1)) in _TRANSIENT_ERRNOS else None)
+        return "REFUSED", False
     if code == 7:
         return "UNAVAILABLE", None
     return "UNAVAILABLE", signature_retryable((signature_text or "") + " " + reason)
@@ -897,7 +921,8 @@ def tokens_from(target: str, usage) -> dict:
         t = {
             # a total is never derived from a missing part: without input_tokens, input is null (cache writes alone
             # are not "the input"); they stay visible in cache_creation_input
-            "input": None if fresh is None else fresh + (created or 0),
+            # nor from a missing cache-creation count: without it the sum would be an under-count shown as exact
+            "input": None if fresh is None or created is None else fresh + created,
             "cached_input": _int_or_none(usage.get("cache_read_input_tokens")),
             "output": _int_or_none(usage.get("output_tokens")),
             "source": "claude:result.usage",
@@ -969,7 +994,7 @@ def _split_shell_segments(inner: str):
     return segs
 
 
-def _reader_segments_ex(command: str):
+def _reader_segments_ex(command: str, with_cd: bool = False):
     """Yield (reader, [file-operand tokens], piped) for each cat/sed/head/tail/rg/nl/less/grep segment of a codex
     shell command (typically `/bin/zsh -lc "sed -n '1,20p' named.txt"`). ``piped`` is True when the segment sits
     downstream of a `|` (its input is a pipe, so it is not evidence that it opened a named file). For grep/rg the
@@ -994,9 +1019,12 @@ def _reader_segments_ex(command: str):
         for idx in range(0, len(parts), 2):
             piped = idx > 0 and parts[idx - 1] == "|"
             segs.append((parts[idx].split(), piped))
+    after_cd = False  # an earlier `cd`/`pushd`/`popd` in this command: relative operands no longer mean the repo folder
     for st, piped in segs:
         while st and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", st[0]):
             st = st[1:]
+        if st and os.path.basename(st[0]) in ("cd", "pushd", "popd"):
+            after_cd = True
         if not st or os.path.basename(st[0]) not in _READERS:
             continue
         cmd, args, skip = os.path.basename(st[0]), [], False
@@ -1016,7 +1044,10 @@ def _reader_segments_ex(command: str):
             a in ("-e", "--regexp", "-f", "--file") for a in st[1:]
         ):
             args = args[1:]  # the first positional is the search pattern, never a file
-        yield cmd, args, piped
+        if with_cd:
+            yield cmd, args, piped, after_cd
+        else:
+            yield cmd, args, piped
 
 
 def _reader_segments(command: str):
@@ -1071,18 +1102,27 @@ def codex_reads_detail(stream_path: str, named: list[dict], cwd: str):
         ):
             continue
         command = str(it.get("command") or "")
-        segs = list(_reader_segments_ex(command))
-        for _cmd, args, piped in segs:
+        segs = list(_reader_segments_ex(command, with_cd=True))
+        for _cmd, args, piped, after_cd in segs:
             if piped:
                 continue
             successful = True
             for a in args:
-                rp = os.path.realpath(a if os.path.isabs(a) else os.path.join(cwd, a))
+                absolute = os.path.isabs(a)
+                rp = os.path.realpath(a if absolute else os.path.join(cwd, a))
                 if rp in by_real:
-                    how[rp] = "argument"
+                    # an absolute operand is exact wherever the command runs; a relative one is exact only while the
+                    # command still runs in the repo folder (no earlier cd/pushd)
+                    if absolute or not after_cd:
+                        how[rp] = "argument"
+                    elif how.get(rp) != "argument":
+                        how[rp] = "possible"
                 elif "/" not in a and a in by_base:
+                    # a bare basename that is not that file in the repo folder may be another file of the same name
+                    # (README.md, __init__.py): never an exact read, only a possible one
                     for n in by_base[a]:
-                        how[n["path"]] = "argument"
+                        if how.get(n["path"]) != "argument":
+                            how[n["path"]] = "possible"
         if not segs and _runs_reader(command):
             successful = True  # a reader the splitter cannot parse (e.g. inside `xargs ... sh -c '...'`)
         if _runs_reader(command):
@@ -1209,12 +1249,19 @@ def run_call(
     lock_dir: str | None = None,
     caller: str | None = None,
     store_root: str | None = None,
+    defer_stop: bool = False,
+    enclosing_deadline_s: float | None = None,
 ) -> dict:
     """Run one call (see ``_run_call``). ``store_root`` is the caller's effective coordination store (the CLI's
-    --root): a repo folder equal to or containing it is refused. An unexpected exception never escapes without a receipt: before the adapter
+    --root): a repo folder equal to or containing it is refused. ``enclosing_deadline_s``: the deadline of the job this
+    call runs under, if known; a packet whose deadline_s plus the dispatch grace does not fit is refused before launch
+    (NOT_STARTED, ``job_deadline_too_short``). ``defer_stop``: a stop signal received during the call is NOT re-raised
+    on this process; the returned receipt dict carries ``stopped_signal`` and the caller (the CLI) must report, then
+    die by that signal itself. Default: re-raise at once, as before. An unexpected exception never escapes without a receipt: before the adapter
     launched the outcome is NOT_STARTED; after it, UNAVAILABLE with retryable null and "internal error: <type>". Never
     ANSWERED."""
-    ctx: dict = {}
+    ctx: dict = {"enclosing_deadline_s": enclosing_deadline_s}
+    result = None
     # Stop handlers are installed before anything is created and kept until the receipt is on disk: a stop at any
     # point only sets a flag (or, while the target runs, kills its group), and is honoured by re-raising it after.
     state = ctx["state"] = {"proc": None, "sig": None}
@@ -1241,9 +1288,10 @@ def run_call(
             except (ValueError, OSError):
                 pass
     try:
-        return _run_call_guarded(
+        result = _run_call_guarded(
             target, packet_path, out_root, call_id, env, path, extra_env, lock_dir, caller, store_root, ctx
         )
+        return result
     finally:
         state["proc"] = None
         for sg, old in saved.items():
@@ -1251,7 +1299,9 @@ def run_call(
                 signal.signal(sg, old)
             except (ValueError, OSError):
                 pass
-        if state["sig"] is not None:
+        if state["sig"] is not None and defer_stop and isinstance(result, dict):
+            result["stopped_signal"] = state["sig"]  # the caller reports, then dies by this signal itself
+        elif state["sig"] is not None:
             # the stop was requested: the receipt (if any could be made) is on disk, so now honour it with the
             # default action instead of carrying on as if nothing had been asked of this process
             try:
@@ -1378,7 +1428,10 @@ def _run_call(
     try:
         os.makedirs(out_root, mode=0o700, exist_ok=True)
     except OSError as e:
-        return finish("NOT_STARTED", f"cannot create out root {out_root}: {e}", False)
+        # no call directory exists yet, so there is no receipt; the retryable flag is still the errno's
+        return finish(
+            "NOT_STARTED", f"cannot create out root {out_root}: {e}", _os_retryable(e)
+        )
     call_dir = os.path.join(out_root, call_id)
     try:
         os.mkdir(
@@ -1388,7 +1441,7 @@ def _run_call(
         return finish("REFUSED", f"call directory already exists: {call_dir}", False)
     except OSError as e:
         return finish(
-            "NOT_STARTED", f"cannot create call directory {call_dir}: {e}", False
+            "NOT_STARTED", f"cannot create call directory {call_dir}: {e}", _os_retryable(e)
         )
     rec["call_dir"] = call_dir
     ctx["call_dir"] = call_dir
@@ -1398,8 +1451,15 @@ def _run_call(
         try:
             with open(packet_path, "rb") as f:
                 blob = f.read()
+        except OSError as e:  # a momentarily short resource (EMFILE, EIO, ...) is retryable; a missing file is not
+            raise ConsultError(
+                "NOT_STARTED",
+                f"packet_invalid: cannot read packet {packet_path}: {e}",
+                _os_retryable(e),
+            )
+        try:
             raw = json.loads(blob.decode("utf-8"))
-        except (OSError, ValueError) as e:
+        except ValueError as e:
             raise ConsultError(
                 "NOT_STARTED",
                 f"packet_invalid: cannot read packet {packet_path}: {e}",
@@ -1413,6 +1473,15 @@ def _run_call(
         rec["requested_enforced"] = (
             target != "antigravity"
         )  # agy_ask takes no model/effort flags
+        enc = ctx.get("enclosing_deadline_s")
+        if enc is not None and lim["deadline_s"] + DISPATCH_GRACE_S > enc:
+            raise ConsultError(
+                "NOT_STARTED",
+                f"job_deadline_too_short: the enclosing job allows {enc:g}s but this call can run up to "
+                f"limits.deadline_s {lim['deadline_s']} + dispatch grace {DISPATCH_GRACE_S} = "
+                f"{lim['deadline_s'] + DISPATCH_GRACE_S}s; raise the job deadline or lower limits.deadline_s",
+                False,
+            )
         pre = preflight(
             packet,
             caller_env.get("HOME") or "/nonexistent",
@@ -1512,14 +1581,14 @@ def _run_call(
                 prompt, timeout=lim["deadline_s"] + DISPATCH_GRACE_S
             )
             state["proc"] = None
+            # the adapter returned, but it kills only its own leader on a timeout: descendants it left in its process
+            # group would keep running unlimited after the receipt. Kill the group and free the busy lock only once it
+            # is empty (the output already read is kept).
+            _so, _se, group_gone = _kill_and_reap(proc)
         except subprocess.TimeoutExpired:
             state["proc"] = None
             dispatcher_timeout = True
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except OSError:
-                pass
-            so, se = proc.communicate()
+            so, se, group_gone = _kill_and_reap(proc)
         except _Stopped:
             state["proc"] = None
             stopped = True
@@ -1582,6 +1651,8 @@ def _run_call(
             signature_text=error_signature_text(target, host_rec, out),
             session_started=bool((host_rec or {}).get("session_id")),
         )
+    if not group_gone and not (stopped or post_error):
+        reason += "; the target's group is STILL running and the busy lock is kept"
     hr = host_rec or {}
     rec["model_observed"] = hr.get("model_reported")
     rec["effort_observed"] = hr.get("effort_observed")
@@ -1609,10 +1680,9 @@ def _run_call(
         )
     except OSError:
         rec["named_files_unchanged"] = False
-    if outcome == "ANSWERED" and (
-        rec["named_files_unchanged"] is False or rec["host_config_unchanged"] is False
-    ):
-        # an answer is still an answer, but a named file or the host config changed while the target ran
+    if rec["named_files_unchanged"] is False or rec["host_config_unchanged"] is False:
+        # on ANY launched outcome: a named file or the host config changed while the target ran. An ANSWERED call
+        # keeps its answer; a failed one is still flagged, so the receipt never contradicts its own fields.
         rec["containment_breach"] = True
     _coverage(rec, target, hr, host_rec, out, pre, outcome)
     _hook("post")
@@ -1748,6 +1818,68 @@ def _coverage_measured(rec: dict, target: str, hr: dict, host_rec, out: str, pre
 
 
 # ------------------------------------------------------------------ post one report (CLI --post-to and MCP consult_post)
+REQUEST_KINDS = ("review_request", "consult_request")
+
+
+def check_post_target(co, *, task_id: str, sender: str, reply_to: str) -> dict:
+    """Everything a report post needs that does not depend on the finished call, read-only: the task exists and has the
+    ``triangle-kinds`` feature, ``reply_to`` exists and is a review_request / consult_request addressed to ``sender``,
+    the sender is attached and this process holds its send capability. Raises ProtocolError; returns the request."""
+    task = co.get_task(task_id)
+    if not task:
+        raise ProtocolError("consult_task_not_found", task_id, "no such task")
+    if FEATURE_TRIANGLE_KINDS not in (task.get("protocol_features") or []):
+        raise ProtocolError(
+            "kind_requires_feature",
+            task_id,
+            f"task {task_id!r} was created without protocol_features=[{FEATURE_TRIANGLE_KINDS!r}]; a report cannot be posted",
+        )
+    req = co.get_message(task_id, reply_to)
+    if not req:
+        raise ProtocolError(
+            "consult_reply_to_not_found",
+            reply_to,
+            "no such request message on this task",
+        )
+    p = co._participant(task_id, sender)  # unknown_participant / participant_detached
+    if req.get("kind") not in REQUEST_KINDS or not co._addressed_to(req, p):
+        raise ProtocolError(
+            "consult_reply_to_not_a_request",
+            reply_to,
+            f"{reply_to!r} is not a review_request/consult_request addressed to {sender!r} "
+            f"(kind {req.get('kind')!r}, recipient {req.get('recipient')!r})",
+        )
+    co._require_cap(task_id, sender, "send", task=task)  # send_capability_required / _stale on an enforced task
+    return req
+
+
+def post_preflight(co, *, task_id: str, sender: str, reply_to: str) -> None:
+    """Refuse, before any call is launched, a ``--post-to`` that could not be posted afterwards."""
+    require_authority("consult-post")
+    check_post_target(co, task_id=task_id, sender=sender, reply_to=reply_to)
+
+
+def report_flags(rec: dict) -> list[str]:
+    """Short plain-language lines a reader of the report must not miss (breach, no read, over limit, coverage)."""
+    out = []
+    if rec.get("containment_breach"):
+        out.append("WARNING: containment breach (a named file or the host config changed during the call)")
+    if rec.get("no_successful_read"):
+        out.append("WARNING: the target completed no read (it answered without opening a file)")
+    if (rec.get("answer") or {}).get("over_limit"):
+        out.append("answer over limit (kept in full)")
+    cov = rec.get("coverage")
+    if not isinstance(cov, dict):
+        out.append("coverage unknown")
+    elif cov.get("read") is not None:
+        out.append(f"coverage {cov['read']} of {cov.get('named')} named files read")
+    elif cov.get("read_lower_bound") is not None:
+        out.append(f"coverage at least {cov['read_lower_bound']} of {cov.get('named')} named files (exact count unknown)")
+    else:
+        out.append("coverage unknown")
+    return out
+
+
 def post_report(
     co,
     *,
@@ -1780,13 +1912,7 @@ def post_report(
         raise ProtocolError(
             "consult_receipt_invalid", rp, f"not a {RECEIPT_SCHEMA} receipt"
         )
-    req = co.get_message(task_id, reply_to)
-    if not req:
-        raise ProtocolError(
-            "consult_reply_to_not_found",
-            reply_to,
-            "no such request message on this task",
-        )
+    req = check_post_target(co, task_id=task_id, sender=sender, reply_to=reply_to)
     receipt_sha = hashlib.sha256(blob).hexdigest()
     evidence = [{"file": os.path.abspath(rp), "sha256": receipt_sha}]
     kw = {"artifact_ref": None, "text": None}
@@ -1806,16 +1932,28 @@ def post_report(
                 "answer.md does not match the receipt's recorded sha256",
             )
         kw["artifact_ref"] = os.path.abspath(ap)
+        # a message carries exactly one of text / artifact_ref, so the plain line a reader must not miss (breach,
+        # no read, over limit, coverage) travels as a second evidence entry next to the receipt hash
+        evidence.append(
+            {
+                "summary": "; ".join(report_flags(rec)),
+                "containment_breach": rec.get("containment_breach"),
+                "coverage": rec.get("coverage"),
+                "no_successful_read": rec.get("no_successful_read"),
+                "over_limit": (rec.get("answer") or {}).get("over_limit"),
+            }
+        )
     else:
         kw["text"] = (
             "CANNOT-EVALUATE: consult call %s to %s ended %s (retryable=%s): %s. There is no usable answer; do not "
-            "read this as a review that found nothing."
+            "read this as a review that found nothing.%s"
             % (
                 rec["call_id"],
                 rec.get("target_host"),
                 rec["outcome"],
                 rec.get("retryable"),
                 str(rec.get("reason"))[:500],
+                " WARNING: containment breach." if rec.get("containment_breach") else "",
             )
         )
     return co.send(

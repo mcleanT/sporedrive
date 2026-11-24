@@ -193,11 +193,19 @@ class CoordStore:
         p.parent.mkdir(parents=True, exist_ok=True)
         os.chmod(p.parent, 0o700)
         fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=".tmp-", suffix=".json")
-        with os.fdopen(fd, "w") as f:
-            json.dump(obj, f, indent=2, sort_keys=True)
-            f.write("\n")
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, p)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(obj, f, indent=2, sort_keys=True)
+                f.write("\n")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, p)
+        except BaseException:
+            # never leave a partial temp file behind (a stray .tmp-*.json was once read as a record)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
         return p
 
     def write_artifact(self, rel: str, data: str) -> Path:
@@ -207,10 +215,17 @@ class CoordStore:
         p.parent.mkdir(parents=True, exist_ok=True)
         os.chmod(p.parent, 0o700)
         fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=".tmp-", suffix=".txt")
-        with os.fdopen(fd, "w") as f:
-            f.write(data)
-        os.chmod(tmp, 0o444)
-        os.replace(tmp, p)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(data)
+            os.chmod(tmp, 0o444)
+            os.replace(tmp, p)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
         os.chmod(p, 0o444)
         return p
 

@@ -673,6 +673,7 @@ class Coordinator:
             # process is still alive (or cannot be checked) is not taken over, except by an explicit
             # allow_transition from a non-advisory process (audited).
             cap_event = "minted"
+            cap_before = sendcap.held(self.store, task_id, participant_id)
             if prev and not prev.get("detached") and sendcap.holds_current(
                 self.store, task_id, participant_id, prev
             ):
@@ -695,7 +696,13 @@ class Coordinator:
                             )
                         cap_event = "takeover"
                 p["send_cap"] = sendcap.mint(self.store, task_id, participant_id)
-            self.store.write(rel, p)
+            try:
+                self.links.prepare_change(task_id, participant_id, p)  # strict: refuse with nothing applied
+                self.store.write(rel, p)
+            except BaseException:
+                # the record was not written: this process keeps the capability the store still matches
+                sendcap.restore(self.store, task_id, participant_id, cap_before)
+                raise
             self.links.participant_changed(task_id, participant_id)  # a different native session -> stale
             # Bind the selection to this native session so startup/compaction resolve to the
             # right participant even with two sessions in one worktree (native-routing review 1).
@@ -733,6 +740,7 @@ class Coordinator:
             p["detached"] = True
             p["detached_at"] = utcnow()
             p.pop("send_cap", None)  # revoke: no capability matches a detached record (review 4)
+            self.links.prepare_change(task_id, participant_id, p)  # strict: refuse with nothing applied
             self.store.write(rel, p)
             self.links.participant_changed(task_id, participant_id)  # a detached member -> stale
             sendcap.forget(self.store, task_id, participant_id)

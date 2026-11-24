@@ -1,4 +1,4 @@
-# Two communication modes for the triangle — design v1.3 (2026-11-23, owner approved build: "go ahead - handle it")
+# Two communication modes for the triangle — design v1.5 (2026-11-24, owner approved build: "go ahead - handle it")
 
 Owner requirement (verbatim, 2026-11-23): "we need to have 2 different modes of communication. in one, we create a
 transient, headless session for the respective calls, this is especailly relevant for reviews. in the other, we have a
@@ -43,8 +43,15 @@ v1 applies those findings and an advisor check. v0 + review: scratchpad `twomode
   `require_authority`, model.py:77-85). jobs.py and execution.py are untouched; no new usage limit.
 - Output goes to a fresh per-call directory the dispatcher creates under the job/scratch dir; an existing directory is
   refused (the adapters clear their output path at start, claude_ask.sh:39-41, agy_ask.py:153-160).
-- `--post-to` posts exactly one `report` from the CLI process itself, using the caller's `--cap-file` capability
-  (answer as `artifact_ref`, receipt sha256 as evidence). Deterministic code posts; the target never does.
+- `--post-to TASK:MSG` (split at the first `:`) or `--post-task T --post-reply-to M` (for ids containing `:`; mixing the two is
+  refused) posts exactly one `report` from the CLI process itself, using the caller's `--cap-file` capability (answer as
+  `artifact_ref`, receipt sha256 as evidence). Deterministic code posts; the target never does. **v1.4:** everything the post needs
+  (task, `triangle-kinds`, reply-to is a review/consult request addressed to the sender, sender attached, capability) is checked
+  BEFORE launch (exit 3, NOT_STARTED, nothing spent), and the CLI twin of `consult_post` is `consult post --task --reply-to
+  --sender --call-dir [--message-id]`. Under `job-run` (default deadline 600 s) a call needs a job deadline of at least
+  `deadline_s + 30`; a job with less TIME LEFT (deadline minus time since the job started, v1.5) is refused before launch
+  (`job_deadline_too_short`), and a call stopped by the job prints its JSON FIRST (v1.5: `post.state: "attempting_after_stop"`
+  with a `consult post` fallback command), then posts the CANNOT-EVALUATE report, then dies by the signal.
 - **v1.2: MCP `consult_post(task_id, sender, reply_to, call_dir, message_id?)`** for callers attached through MCP. Their
   capability lives only in their MCP server process (sendcap.py:10-13: MCP tools never return it), so they have nothing
   to put in `--cap-file`. The tool launches nothing: it reads the finished call directory's `receipt.json` (and
@@ -60,9 +67,11 @@ v1 applies those findings and an advisor check. v0 + review: scratchpad `twomode
 |---|---|---|---|
 | Command | NEW `src/consult/codex_call.sh`: `/opt/homebrew/bin/codex exec --ignore-user-config --ephemeral --skip-git-repo-check --sandbox read-only --disable hooks --json -C <cwd> -m M -c model_reasoning_effort=E -o <last> -` (direct binary, not the cmux shim; `--skip-git-repo-check` needed outside a git/trusted dir, probe) | `src/consult/claude_ask.sh` as is | `src/consult/agy_ask.py` as is (ACP, fresh `--gemini-dir`, `mcpServers: []`) |
 | Answer evidence | non-empty `-o` file + exit 0 + `turn.completed` in the JSON stream | `result` success, not `is_error` (claude_ask.sh:100) | `stopReason == end_turn`, non-empty (agy_ask.py:293-305) |
-| Files read | lower-bound heuristic from `command_execution` events (cat/sed/head/rg on a named path, inside `/bin/zsh -lc '…'`); misses directory-wide rg, python reads etc. → `coverage_source: "codex-commands"` | tool events → `"tool-events"` | permission/tool events → `"tool-events"` |
+| Files read | lower-bound heuristic from `command_execution` events (cat/sed/head/rg on a named path, inside `/bin/zsh -lc '…'`); misses directory-wide rg, python reads etc. → `coverage_source: "codex-commands"`. Only a direct reader operand that resolves to the named file is an `argument` match and counts; a bare-basename match, any relative operand after `cd`/`pushd`/`popd` in the same command, and a mention are `possible` and never counted (v1.4, F2) | tool events → `"tool-events"` | permission/tool events → `"tool-events"` |
 
-All targets: cwd = the packet's `scope.repo_realpath` (`$HOME` and host config dirs refused, claude_ask.sh:64); no board
+All targets: cwd = the packet's `scope.repo_realpath` (preflight refuses a repo that equals or contains `$HOME`, a host config dir,
+the default store, `MYCELIUM_COORD_DIR` or the CLI's `--root` store, by spelling and by realpath; claude_ask.sh and codex_call.sh
+repeat the check on real paths, v1.4); no board
 connection and no coordination MCP server (Codex keeps its built-in `codex_apps`, evidence m5-probes Q2).
 
 **Environment** (fixes jobs.py:430, which copies the whole environment): the dispatcher launches the target with an
@@ -89,11 +98,19 @@ adapter run the same binary; the receipt records it and the PATH value). `env_ke
 | kind | yes | review / verification (of named findings) / consult |
 
 The target sees a deterministic rendering of these fields and nothing else (no "Session context" block). Oversize
-(> ~1,000 words of framing) is refused at preflight, never trimmed.
+(> ~1,000 words of framing) is refused at preflight, never trimmed. A string the prompt renders on one line (file and
+evidence paths, `why`, excerpt `source_path` and `lines`, scope items, decisions) may not contain a line break or any
+other control character: the packet is refused (`packet_invalid`), because such a character would start an unquoted line
+and escape the "evidence, not instructions" fence.
+
+`limits.max_answer_chars` is **advisory** (review F26): it is told to the target ("answer in at most N characters") but
+not enforced. An answer over it is kept in full, the call stays ANSWERED, and the receipt records `answer.over_limit: true`;
+the CLI JSON and the posted report show the flag.
 
 ### 2.4 Receipt `consult-receipt/1` and outcome classes
 Fields: call_id, target_host, outcome, retryable (true/false/null), exit, reason, duration_s, model/effort requested
-and observed (null when unobserved), tokens {input, cached_input, output, source} (null, never 0), files_read[],
+and observed (null when unobserved), tokens {input, cached_input, output, source} (null, never 0; Claude `input` is null when
+`cache_creation_input_tokens` is absent; the meaning of `input` per host is in src/consult/README.md), files_read[],
 coverage {read, named, source}, no_successful_read, named_files_unchanged (hash of the named files before/after — not a
 whole-repo git status), host_config_unchanged, implicit_context, env_keys_passed, and the host's raw receipt/stream.
 
@@ -101,14 +118,15 @@ Outcome is decided on **(exit, reason)**, not exit alone (claude_ask/agy_ask exi
 "incomplete run", README:32):
 | Outcome | Meaning |
 |---|---|
-| NOT_STARTED | no model call: bad packet, missing/outside file, missing binary, argument error, cannot create temp dir |
+| NOT_STARTED | no model call: bad packet, missing/outside file, missing binary, argument error, cannot create temp dir. `retryable` is true for a transient errno (no space, too many open files), null for an unknown cause, false only for a real refusal (v1.4) |
 | REFUSED | policy gate: unsafe dir, `busy` (one call in flight per caller × target host) |
 | UNAVAILABLE | launched, no usable answer: auth/model rejected (retryable false), quota/429/network (retryable true, keep cache), empty, protocol/incomplete, answer-write failed. consult.py reads transient vs terminal from the kept raw stream/stderr (claude `result` error/API status, codex `--json` error events, agy session/prompt error JSON); no matching signature → retryable null, which is never recorded as a permanent failure |
 | TIMED_OUT | deadline hit |
-| ANSWERED | host completion evidence + non-empty answer; breach/config change keeps ANSWERED with `containment_breach: true` |
+| ANSWERED | host completion evidence + non-empty answer; breach/config change keeps ANSWERED with `containment_breach: true` (v1.4: the flag is also true on any launched non-ANSWERED outcome when a named file or the host config changed) |
 
 Only ANSWERED is usable; every other outcome is CANNOT-EVALUATE, never "the reviewer found nothing". Coverage and
-`no_successful_read` are recorded and shown to the caller; they do not gate acceptance (same as today's codex_ask).
+`no_successful_read` are recorded and shown to the caller (v1.4: the CLI JSON also carries `containment_breach`, `coverage`,
+`no_successful_read` and `over_limit`, and the posted report adds them as a second evidence entry); they do not gate acceptance (same as today's codex_ask).
 When read extraction is unavailable or fails: `coverage = null`, `coverage_source = "unmeasured"`,
 `no_successful_read = null` — never 0 or false.
 
@@ -124,44 +142,62 @@ Installed `~/.claude/tools/codex_ask.sh` and the codex-review skill are unchange
   early, coord.py:766-767).
 - `tasks/<id>/links/<link_id>.json` via `store.write` under the task lock; each change is an audit receipt.
 - Fields: link_id, task_id, state (proposed/active/stale/ended), created_by/at, members[2] each
-  `{participant_id, role, host, native_session_id, session_verified, wake_route, confirmed_at}`, ended_at, end_reason.
-  host + native_session_id are copied from the participant's stored attach record, never from the caller.
+  `{participant_id, role, host, session, native_id, native_session_id, session_source, session_verified, wake_route,
+  confirmed_at}`, ended_at, end_reason, plus stale_reason/stale_at/confirmed_at/ended_by when they apply. host + session +
+  native_id are copied from the participant's stored attach record, never from the caller; they are a claimed label, not an
+  authenticated identity. v1.4: `session_source` is `"attach_record"` and `session_verified` is always `false` (it used to be
+  `true` for any non-empty string, a verification that never happened). Propose refuses two members pinned to the same
+  (host, session / native_id): `link_invalid_members`. Dot-named files in `links/` are never links.
 
 ### 3.2 Lifecycle
-1. `coord_link_propose(task_id, from_pid, to_pid)` — non-advisory process; both attached.
-2. `coord_link_confirm(link_id)` — by the partner; capability-checked → active.
-3. `coord_link_end(link_id, reason)` — either member.
+1. `coord_link_propose(task_id, link_id, from_pid, to_pid)` — non-advisory process; both attached.
+2. `coord_link_confirm(task_id, link_id, participant_id)` — by the partner; capability-checked → active.
+3. `coord_link_end(task_id, link_id, participant_id, reason?)` — either member. `coord_link_get(task_id, link_id)` reads.
 4. **Stale** when a member detaches, or a *different native session* takes the participant (allow_transition rebind,
    coord.py:632-660). The pin is the pair (host.session, native_id) — native_id may be null (model.py:232, e.g.
    Antigravity) and a null must never compare equal to a changed session. A new capability on the *same* pinned session (headless Codex wake = new process, sendcap.py:8-9;
    a restarted session re-attaching) does **not** make it stale. A stale link refuses `link_stale`; never retargets.
-5. Advisory processes may confirm and end, not propose.
+   Staleness is persisted by attach/detach BEFORE the participant record is written (v1.5, `Links.prepare_change`): a readable
+   link that the change would make stale is written stale first, and if that write fails the attach/detach is refused with
+   nothing applied (the process also keeps the send capability the store still matches). An unreadable link file is skipped
+   there and recorded after the write as `link_stale_update_failed`; every later check recomputes and persists staleness from
+   the live participant record. So a link can no longer revive through a same-session re-attach after a stale write that did
+   not land (the v1.4 residual window is closed).
+5. Advisory processes may not propose; they may confirm and end only as an attached observer (v1.4, same rule as send/ack/
+   set_cursor; `advisory_process_refused` otherwise).
 
 ### 3.3 Sending to the designated session
 `coord_send(..., link_id)`: recipient must be the partner's participant_id (role / `all` refused:
 `link_requires_exact_recipient`); the pinned native session must equal the participant's current binding, else
-`link_stale`. `coord_wake(link_id)` does the same check, then the existing `wake_recipient` unchanged.
+`link_stale`. `coord_wake(link_id)` does the same check, then the existing `wake_recipient` unchanged. v1.4: the Codex launch,
+under the task lock that wraps `Popen`, re-reads the whole link (still active, not ended, both members' pins unchanged) and
+refuses `link_not_active` / `link_stale` instead of launching.
 
 ### 3.4 What is shared
 Everything on the task, exactly as participants share today. No per-member filter in this build (so no new read path
 to protect). If restricted sharing is wanted later it is an owner decision; default "share the task".
 
 ### 3.5 Wake per host (recorded truthfully at confirm)
-Claude: cmux bridge (wake.py:253-290). Codex headless-owned thread: `codex exec resume` (wake.py:348-380). Codex
+Claude: cmux bridge (wake.py:253-290); a Claude member with no `host.session` records `none` (the bridge matches on the session
+and could never deliver; v1.4). Codex headless-owned thread: `codex exec resume` (wake.py:348-380). Codex
 desktop/CLI not headless-owned: poll (wake.py:360). Antigravity: poll (wake.py:293-295). Observers: never woken
 (wake.py:596). Only `accepted` counts as delivered; `uncertain` is never retried.
 
 ### 3.6 Antigravity
-Member role `observer`; sends limited to `ADVISORY_ALLOWED_SEND_KINDS` (model.py:93); `session_verified: false`.
+Member role `observer`; sends limited to `ADVISORY_ALLOWED_SEND_KINDS` (model.py:93); `session_verified` is `false` for every
+member (see 3.1).
 
 ## 4. Code
 - New: `mycelium_coord/consult.py` (packet, preflight, env allowlist, dispatch, outcome mapping, receipt, post),
   `mycelium_coord/links.py`, `src/consult/codex_call.sh`.
-- Changed: model.py (feature + validators), coord.py (link methods, `link_id` on send), mcp_server.py (link tools;
-  allowlist entries for link confirm/end; no consult launch tool — `consult_post` is post-only), cli.py (`consult call`, `link …`), wake.py (link check
-  before routing),
+- Changed: model.py (feature + validators), coord.py (link hooks in attach/detach, `link_id` on send), mcp_server.py (link tools;
+  allowlist entries for link confirm/end; no consult launch tool — `consult_post` is post-only), cli.py (`consult call`,
+  `consult post`, `link …`), wake.py (link check before routing and again under the Codex launch lock), bridge_link.py (the
+  link pin travels with a Claude bridge delivery and is compared against the recipient record just before the send),
+  store.py (v1.4 only: `write`/`write_artifact` remove their temp file on failure),
   claude_ask.sh / agy_ask.py (nullable usage + observed-effort fields only).
-- Untouched: execution.py, sendcap.py, store.py, jobs.py, installed codex_ask.sh, tasks without `session-links`.
+- Untouched: execution.py, sendcap.py, jobs.py, installed codex_ask.sh, tasks without `session-links` (store.py changed only in
+  v1.4, as above).
 
 ## 5. Tests
 - Betty unit tests (nothing CPU-heavy on the Mac): packet/preflight → NOT_STARTED; total (exit, reason) mapping;
@@ -215,3 +251,27 @@ Also in v1.3 (verifier and Codex-review repairs): preflight refuses a repo that 
 dir, the default store, MYCELIUM_COORD_DIR or the CLI's own `--root` store; symlinked named/evidence paths are refused
 (`named_path_symlink`); the prompt names the verified realpath and postflight re-checks it; the target receives the
 preflight-resolved binary (`<HOST>_BIN`).
+
+v1.4 (comprehensive review of 01d5b25..bbbb607, 2026-11-23; report docs/triangle/evidence/two-modes-review/): fixes for the
+29 findings, none changing a design decision. Call side: F2 read matching (bare basename / `cd` = `possible`), F3 transient
+pre-launch errors are retryable, F4 symlinked config dirs protected, F5 a stopped call still prints JSON and posts, and a job
+deadline that cannot fit is refused, F6 post target checked before launch plus `consult post`, F7 process group emptied before
+the busy lock is freed, F8 prompt temp file inside `host/` (Antigravity's temporary gemini dir is a known limit: the dispatcher
+cannot name it without changing the allowlisted environment), F9 `containment_breach` on every launched outcome, F10 caller
+output shows breach/coverage/over_limit, F11 Claude input null without cache-creation, F13 control characters refused in
+one-line packet fields, F18 colon ids, F19 reply-to must be a request addressed to the sender, F25/F26/F28 tests and the advisory
+`max_answer_chars`. Link side: F1 stray temp file (dot-names skipped, `store.write` cleans up, best-effort stale persistence
+with an audit entry), F12 advisory confirm/end observer-only, F14 `session_verified` is always false with `session_source`,
+F15 full link re-check under the Codex launch lock, F16 two members on one session refused, F17 wake route `none` for a Claude
+member without a session, F22 create-task help names `session-links`, F23 dead code removed, F27 MCP/CLI link tests, F28 the
+legacy test now compares against a golden generated from 01d5b25 (coordination/tests/fixtures/legacy_golden_01d5b25.json), F29
+exact assertions. Known and left as is: F24 (the cli.py reformat is mixed into the feature diff; no behaviour change), and the
+open questions of the review (real-host behaviour, same-session takeover of a live holder, one capability holder per MCP server).
+
+v1.5 (Codex repair verification of the v1.4 fixes, 2026-11-24; docs/triangle/evidence/two-modes-review/codex-verify-reviewfix.md):
+11 findings verified closed; F1 and F5 partly, plus two new defects in the repaired code, all fixed with red-before-green tests.
+F1: strict stale write before the participant write (above). F5: on a stop the CLI prints its JSON before the post, because the
+post may wait on a contended task lock for as long as job-run's SIGTERM grace. New 1: a store or OS error before the Codex
+launch is `unavailable` (retryable), not `uncertain`, so the wake attempt is not used up. New 2: the job-fit check uses the time
+left in the job (from its `started_at`), not its total deadline. Found while fixing: a refused or failed attach no longer
+leaves the process holding a newly minted capability that was never stored.

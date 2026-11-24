@@ -3,8 +3,12 @@
 FAKE_AGY_MODE: normal | hang | empty | kind_other | read_write_title | max_tokens | refusal |
                twoturn | failed_read | partial_hang
 FAKE_AGY_TOUCH=<path>: rewrite that file at session/new (simulates a host-config change).
-FAKE_AGY_LOG=<path>: write argv as JSON."""
+FAKE_AGY_LOG=<path>: write argv as JSON.
+FAKE_AGY_ENVDUMP=<path>: write the process environment as JSON (env-allowlist test)."""
 import json, os, sys, time
+_d = os.environ.get("FAKE_AGY_ENVDUMP")
+if _d:
+    json.dump(dict(os.environ), open(_d, "w"))
 if "--version" in sys.argv:
     print("fake-agy 0.0"); sys.exit(0)
 mode = os.environ.get("FAKE_AGY_MODE", "normal")

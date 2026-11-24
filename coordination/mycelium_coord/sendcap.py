@@ -155,6 +155,17 @@ def forget(
         _CAPS.pop(_key(store, task_id or "", participant_id or ""), None)
 
 
+def restore(store, task_id: str, participant_id: str, cap: str | None) -> None:
+    """Put back the capability this process held before a mint whose record was never written (an attach that
+    was refused or failed after the mint): the process keeps exactly the capability the store still matches."""
+    with _GUARD:
+        k = _key(store, task_id, participant_id)
+        if cap is None:
+            _CAPS.pop(k, None)
+        else:
+            _CAPS[k] = cap
+
+
 def public(record: dict) -> dict:
     """A participant record as shown to a caller: the capability hash is never rendered."""
     if not isinstance(record, dict) or "send_cap" not in record:

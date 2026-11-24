@@ -414,3 +414,34 @@ Probe evidence: evidence/m2-probes.json (Claude 6 runs, Codex 6, agy 5).
 - Open implementer questions, kept as limits/backlog: posted artifact_ref points into the caller's out-root (no durability
   guarantee if that folder is removed); a receipt and answer replaced together are not detected (the sha256 binds the
   answer to the receipt, not to an outside record); the packet `schema` key is optional.
+
+## [2026-11-23/24] Comprehensive review of the two modes, fixes, Codex verification — owner: "run a review on this, make sure its comprehensive", then "make the fixes then test"
+- Review (wf_82d20542-e1b, evidence/two-modes-review/comprehensive-review-2026-11-23.md): 0 blocking, 6 major, 23 minor, 1 refuted.
+  Majors: F1 a stray `.tmp` link file half-applied attach/detach and could revive a stale link; F2 Codex read over-count
+  (basename fallback, `cd` ignored); F3 transient pre-launch errors recorded as not retryable; F4 symlinked host config dirs
+  unprotected; F5 a stopped call lost its JSON and its report; F6 the post target was checked only after the paid call.
+- Fixes (wf_12b576c7-6d6): all findings fixed except F8 partly (Antigravity's temporary gemini dir on a dispatcher SIGKILL is a
+  documented limit) and F24 left (cli.py reformat, no behaviour change). Red-before-green on Betty: call batch 42 + 7 tests and
+  link batch 12 tests fail with the fixes reverted. Full suite 1057 passed, 3 skipped, 0 failed.
+- One full run failed `test_sigkilled_dispatcher_keeps_the_busy_lock_until_the_target_exits` once: a fixed 0.5 s wait against a
+  lock that is correctly held until the whole adapter group is gone → the test now polls (Betty 10/10, and under CPU load).
+- Live smokes on the fixed tree (scratch stores): call r5 — Codex/Claude/Antigravity ANSWERED with the sentinel, coverage 1/1; a
+  bad `--post-reply-to` refused before launch (no call dir); a good `--post-task/--post-reply-to` posted the report; the new
+  `consult post` CLI posted a finished call. Link r5 — Codex confirm + linked send/wake (2/2 first attempt), rebind → stale with
+  no launch, Antigravity observer over ACP confirm + reply-via-link, host config unchanged.
+- Codex repair verification (gpt-5.6-sol high, evidence/two-modes-review/codex-verify-reviewfix.md): F2, F3, F4, F6, F7, F9, F12,
+  F13, F15, F16, F19 CLOSED; F1 PARTLY (a failed stale write followed by a same-session re-attach could revive a link); F5 PARTLY
+  (the post ran before the JSON and could outlast job-run's 5 s SIGTERM grace); 2 new: a store/OS error before the Codex launch
+  was recorded `uncertain` (attempt used up), and the job-fit check used the job's total deadline, not the time left.
+- Fixes by the lead: `Links.prepare_change` writes a readable link stale BEFORE the participant record and refuses the
+  attach/detach with nothing applied if that write fails; attach restores the process's previous send capability when the
+  write step fails (found while fixing: a refused attach would otherwise leave the process holding a key the store never
+  recorded); pre-launch store/OS errors → `unavailable`; time left from the job's `started_at`; on a stop the JSON is printed
+  first, then the post. 5 tests: 5 fail with the fixes reverted, 5 pass with them (Betty).
+- Live link r6 on the final code: headless Codex confirm accepted (24.1 s), rebind → link stale on disk immediately, linked send
+  refused, one `link_stale` audit entry.
+- Full suite on the final tree: BETTY_RESULT
+- Known flaky (pre-existing, untouched code): `test_jobs.py::test_join_stops_on_paused_execution_and_on_stop_policy_is_honored`
+  failed once ('launched' read before the supervisor recorded 'running'); passed in the runs before and after.
+- Evidence hygiene: leak scan over all 1,000 evidence files found 0 capability-shaped strings; three older raw Claude stream
+  logs (signature fields) were removed.
