@@ -3623,6 +3623,94 @@ def test_f2_cli_route_refuses_an_out_root_open_to_other_users(world):
     assert os.listdir(out) == []
 
 
+# ------------------------------------------------------------------ live smoke 2026-11-24: owned out roots
+@pytest.fixture
+def umask022():
+    """Pin the umask: Betty's 002 and the Mac's 022 would otherwise give these tests different meanings."""
+    old = os.umask(0o022)
+    try:
+        yield
+    finally:
+        os.umask(old)
+
+
+def _mode(p) -> int:
+    return os.lstat(p).st_mode & 0o7777
+
+
+def test_f2b_a_call_without_a_store_never_leaves_the_default_out_root_open(world, monkeypatch, umask022):
+    # the lane of a call made without a store lives under the default out root; creating it must not open that root
+    monkeypatch.setenv("TMPDIR", str(world / "tmp"))
+    monkeypatch.setattr(tempfile, "tempdir", str(world / "tmp"))
+    rec = consult.run_call(
+        "claude",
+        write_packet(world, make_packet(world)),
+        out_root=str(world / "out"),
+        env=caller_env(world),
+        path=os.environ["PATH"],
+        extra_env=fake_bin(world, "claude", "normal"),
+    )
+    assert rec["outcome"] == "ANSWERED", rec
+    assert _mode(consult.default_out_root()) == 0o700
+    assert _mode(world / "out") == 0o700
+
+
+def test_f2b_mcp_route_makes_an_owned_read_only_out_root_private_and_the_call_runs(mw, umask022):
+    root = Path(mw.out_root)
+    root.mkdir(mode=0o700)
+    root.chmod(0o755)
+    (root / "locks").mkdir(mode=0o700)  # what an earlier build's lock path left behind (the live Mac, 2026-11-23)
+    (root / consult.PACKET_STAGE_DIR).mkdir(mode=0o700)
+    (root / consult.PACKET_STAGE_DIR).chmod(0o755)
+    r = _start(mw, "f2b")
+    res = r if r["state"] == "ended" else _collect("f2b")
+    assert res["outcome"] == "ANSWERED", res
+    assert _mode(root) == 0o700 and _mode(root / consult.PACKET_STAGE_DIR) == 0o700
+
+
+def test_f2b_cli_route_makes_an_owned_read_only_out_root_private_and_the_call_runs(world, umask022):
+    out = world / "out"
+    out.mkdir()
+    out.chmod(0o755)
+    rec = call(world)
+    assert rec["outcome"] == "ANSWERED", rec
+    assert _mode(out) == 0o700
+
+
+@pytest.mark.parametrize("mode", [0o775, 0o757, 0o1777])
+def test_f2b_an_out_root_others_could_write_is_still_refused_and_left_unchanged(mw, mode, umask022):
+    root = Path(mw.out_root)
+    root.mkdir(mode=0o700)
+    root.chmod(mode)
+    r = _start(mw, "f2w")
+    assert r["outcome"] == "NOT_STARTED" and r["job_id"] is None and "private" in r["reason"], r
+    assert "remove it or use another out root" in r["reason"]
+    assert _mode(root) == mode and _jobs(mw.w) == []
+
+
+def test_f2b_tightening_never_follows_a_symlink_or_touches_another_users_directory(world, monkeypatch, umask022):
+    target = world / "target"
+    target.mkdir()
+    target.chmod(0o755)
+    link = world / "link"
+    link.symlink_to(target)
+    consult.tighten_own_dir(str(link))
+    assert _mode(target) == 0o755 and "not a real directory" in consult.private_dir_problem(str(link))
+    me = os.getuid()
+    monkeypatch.setattr(os, "getuid", lambda: me + 1)  # this directory now belongs to "another user"
+    consult.tighten_own_dir(str(target))
+    why = consult.private_dir_problem(str(target))
+    monkeypatch.undo()
+    assert _mode(target) == 0o755 and "private" in why
+
+
+def test_f2b_make_dirs_private_creates_every_missing_parent_private(world, umask022):
+    leaf = world / "a" / "b" / "c"
+    consult.make_dirs_private(str(leaf))
+    consult.make_dirs_private(str(leaf))  # idempotent
+    assert [_mode(world / p) for p in ("a", "a/b", "a/b/c")] == [0o700, 0o700, 0o700]
+
+
 def test_f3_a_supervisor_killed_under_a_live_server_is_never_running_forever(mw):
     mw.set_mode("hang")
     pkt = make_packet(mw.w)
