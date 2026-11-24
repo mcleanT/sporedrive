@@ -1,13 +1,20 @@
 # SporeDrive
 
-SporeDrive is local workflow infrastructure for **supervised coding with Codex and Claude Code**.
-One session supervises, and one executor session is the only writer of a repository worktree. The
-single writer is a workflow policy backed by each host's own permissions; SporeDrive does not
-enforce it at the filesystem level. The
-two coordinate through a durable record on disk rather than through copy-paste between chat windows.
+SporeDrive is local workflow infrastructure for **supervised coding with Codex and Claude Code**,
+with **Antigravity** as an optional adviser.
 
-It is aimed at people who already run both Codex and Claude Code on a Mac and want long or
-multi-step work to be:
+- **The pair.** One session supervises, and one executor session is the only writer of a
+  repository worktree. The single writer is a workflow policy backed by each host's own
+  permissions; SporeDrive does not enforce it at the filesystem level.
+- **The triangle.** Claude Code, Codex and Antigravity can also consult each other, ask for
+  reviews and send reports. Antigravity is meant as an adviser: with its coordination server
+  started in advisory mode, its coordination tools can watch, read and comment but not drive work.
+
+All sessions coordinate through a durable record on disk rather than through copy-paste between
+chat windows. Each host can take part from its CLI or its desktop app.
+
+It is aimed at people who already run Codex and Claude Code, and optionally Antigravity, on a Mac.
+They want long or multi-step work to be:
 
 - **bounded**: the number of dispatches and reviews has a limit;
 - **addressable**: a message reaches one specific session;
@@ -75,15 +82,95 @@ Five states are kept separate on purpose:
 A stored message does not wake an idle session. There is no background dispatcher, daemon or
 scheduler.
 
+## Three hosts: Claude Code, Codex and Antigravity
+
+Beyond the supervisor/executor pair, any of the three hosts can ask another for a second opinion,
+a review or a report.
+
+- **Per task (opt-in):** the extra message kinds (`triangle-kinds`), headless Codex wake
+  (`codex-exec-wake`), send capability (`send-capability`) and link mode (`session-links`). A task
+  created without them behaves as before.
+- **Per process:** advisory containment.
+- **Per host, once installed:** the stale-write guard.
+- **No task needed:** call mode is a CLI command.
+
+| Host | Coordination roles | Reviews | How an idle session is reached |
+|---|---|---|---|
+| Claude Code | supervisor, executor or observer | gives them through call mode or review messages | the cmux bridge types into the one bound session |
+| Codex | supervisor, executor or observer | gives them through call mode or review messages | `codex exec resume` on the stored thread, only on tasks with `codex-exec-wake` and a participant attached with `wake=headless` |
+| Antigravity | observer (adviser) when run in advisory mode | gives them through call mode or non-actionable messages | no wake route; it reads its inbox on its next turn |
+
+There are two ways to talk:
+
+- **Call mode (one-off, headless).** `mycelium-coord consult call --target codex|claude|antigravity`
+  starts a brand-new session of the target.
+  - The session gets one written packet, answers once and is discarded.
+  - It is read-only. For Antigravity this is enforced only at its permission prompt.
+  - Every call reports one outcome: `ANSWERED`, `NOT_STARTED`, `REFUSED`, `UNAVAILABLE` or
+    `TIMED_OUT`.
+  - Once a call directory exists, a receipt records the outcome. It also records which named files
+    the session was seen to read (a heuristic) and flags any change to those files or to host
+    config.
+  - The answer can be posted back to a task as a report.
+- **Link mode (ongoing collaboration).** One session proposes a link and the partner confirms it.
+  Both are pinned to their native session ids.
+  - A linked send or wake is addressed only to the pinned partner. The task record itself stays
+    shared.
+  - A link goes stale, and never retargets, when a member detaches or a different session takes
+    the participant.
+
+Three safeguards back these modes:
+
+- **Advisory containment.** It applies to a coordination process started with
+  `MYCELIUM_COORD_ADVISORY=1`, which is how Antigravity is meant to be registered. Such a process
+  is limited to the following.
+  - **It may:**
+    - read;
+    - create an unmanaged task;
+    - attach as an observer;
+    - as that observer, send non-actionable messages: questions, progress, review findings,
+      acknowledgments, consult requests and reports;
+    - acknowledge messages, move its cursor and detach;
+    - confirm or end a link it was invited to.
+  - **The core refuses** every authority or drive operation, whatever route calls it:
+    - other roles and actionable sends;
+    - checkpoint publish and execution changes;
+    - wakes and bridge notifications;
+    - job, worker and consult launches.
+  - Its MCP server also hides the tools outside its allowlist, where FastMCP allows it.
+- **Send capability.** Every identity-bearing write is accepted only from the process that holds
+  that participant's capability: sends, acknowledgments, cursor moves, checkpoint publishes,
+  detaches, wakes, bridge notifications and link changes.
+  - The capability is minted at attach. The CLI keeps it in a `--cap-file`.
+  - It applies on tasks with `send-capability` and always in an advisory process.
+  - Link mode requires it.
+- **Stale-write guard** (`writeguard.py`, a hook for all three hosts). It refuses a tool-based
+  whole-file write over a file the session has not read, or that changed since it last read it.
+  The session re-reads and retries.
+  - On Codex it checks `apply_patch` Add File and Move to an existing path. On Antigravity it checks
+    the write-file tools. On Claude Code it refuses nothing, because Claude Code already refuses
+    stale edits itself.
+  - It never refuses a shell overwrite on any host. Claude Code and Codex get a warning, and
+    Antigravity logs one.
+  - It never refuses appends.
+  - It was checked against the hooks and skills of Mycelium 0.9.3 to 0.9.7. The details and known
+    limits are in
+    [WRITE_GUARD_SPEC.md](docs/triangle/WRITE_GUARD_SPEC.md#running-alongside-mycelium-compat-pass-2026-11-24).
+
+Full reference: [docs/triangle/FEATURES.md](docs/triangle/FEATURES.md).
+
 ## Components
 
 | Component | Where | What it does |
 |---|---|---|
 | Instruction and skill policy | `src/claude/`, `src/codex/` | Global instruction files (`CLAUDE.md`, `AGENTS.md`), the Claude `codex-review` skill and `codex_ask` reviewer wrapper, and the Codex `cmux-driver` skill (driver protocol, runbook, plan template). |
 | Mycelium coordination | `coordination/mycelium_coord/` | Store for tasks, messages, checkpoints and execution allowances. Exposed as a CLI (`coordination/bin/mycelium-coord`) and `coord_*` / `execution_*` MCP tools. |
+| Triangle features | `coordination/mycelium_coord/` (`consult.py`, `links.py`, `sendcap.py`, `wake.py`) | Call mode, link mode, send capability and the per-host wake routes. Advisory containment lives in the core (`model.py`) and the MCP allowlist (`mcp_server.py`). |
+| Call-mode adapters | `src/consult/` | One headless launcher per host, each restricted to reading: `codex_call.sh`, `claude_ask.sh`, `agy_ask.py`. |
+| Stale-write guard | `coordination/mycelium_coord/writeguard.py`, `docs/triangle/proposed/writeguard-hooks/` | A standalone hook script and per-host registration templates. Setup does not install it. |
 | cmux bridge | `bridge/cmux_bridge/` | A `codex-claude-bridge` MCP server. It binds to one Claude session in the cmux terminal app, then submits notifications into it. Before each Enter keypress it re-checks the task's pause and closure gate. |
-| Lifecycle hooks | `mycelium-source/` plus `core-overlay/` | Bundled Mycelium plugin source. Its SessionStart, PostToolUse and Stop hooks keep optional "living repository" bookkeeping (`.living/` logs, learnings, handoffs). |
-| Installer and exporter | `scripts/wfctl.py`, `scripts/export_coordination.py` | `wfctl` installs the global instruction files and skills, with snapshots and rollback. The exporter builds one integrated plugin from the bundled sources. |
+| Lifecycle hooks | `mycelium-source/` plus `core-overlay/` | Bundled Mycelium plugin source. Its SessionStart, PostToolUse and Stop hooks keep optional "living repository" bookkeeping (`.living/` logs, learnings, handoffs). The overlay replaces whole core hook files and is written for Mycelium 0.6.0, the bundled source's release. |
+| Installer and exporter | `scripts/wfctl.py`, `scripts/export_coordination.py` | `wfctl` installs the global instruction files and skills, with snapshots and rollback. The exporter builds one integrated plugin from a Mycelium source plus the coordination package. It refuses to apply the overlay to any Mycelium release other than 0.6.0. |
 
 State is split between your machine and the model services:
 
@@ -178,6 +265,10 @@ Cloning installs nothing. Setup is four distinct steps; details and exact comman
 2. **Export the integrated plugin.** Run
    `python3 scripts/export_coordination.py --source mycelium-source --target <dir>`.
    Always pass `--source` explicitly.
+   - The export applies `core-overlay/` by default, and the overlay fits only Mycelium 0.6.0.
+   - To build on a newer Mycelium source, add `--no-overlay`. Without it, the exporter refuses
+     and leaves the target untouched.
+   - Coordination does not need the overlay.
 3. **Activate it on each host** from the local export directory:
    - Claude: install the plugin from the local marketplace.
    - Codex: install the plugin, then trust all seven hook registrations in `/hooks`.
@@ -185,6 +276,24 @@ Cloning installs nothing. Setup is four distinct steps; details and exact comman
    - Register the cmux bridge separately for Codex.
 4. **Initialize each target repository** as a Mycelium project. On Claude Code, this is what
    registers the lifecycle hooks for that repository.
+
+Two optional steps are manual, and the installer does neither:
+
+- **Antigravity as an adviser.** Register the coordination MCP server with Antigravity with
+  `MYCELIUM_COORD_ADVISORY=1` in the server's environment.
+  - `agy mcp add` writes `~/.gemini/config/mcp_config.json`, which the CLI and the desktop app
+    both read.
+  - Headless `agy -p` runs also need explicit `mcp(<server>/<tool>)` permission grants. Without
+    them the CLI auto-denies the tools, exits 0 and does nothing.
+  - This has been exercised only on scratch stores.
+- **The stale-write guard.** Copy the matching template from
+  `docs/triangle/proposed/writeguard-hooks/` into each host's hook configuration.
+  - Replace `<ABS_PYTHON>` and `<ABS_PATH_TO>` with real absolute paths.
+  - On Antigravity the template goes in a workspace's `.agents/hooks.json`. Antigravity blocks a
+    tool call when its hook cannot run, so a wrong path blocks the matched tools.
+  - On Codex, append its hook groups after the existing ones. Codex keys hook trust by position,
+    so inserting groups disturbs existing approvals.
+  - The `MYCELIUM_WRITE_GUARD` variable sets the mode: `off`, `warn` or `enforce`.
 
 ## Limits and maturity
 
@@ -204,18 +313,44 @@ This is a working personal toolchain published as-is. It is not a production ser
 - **The installed build must be exact.** Installing or re-exporting affects only fresh sessions.
   Check what a session actually loaded before trusting it; see the health checks in
   [docs/installation.md](docs/installation.md#health-checks).
+- **The triangle: containment, not authentication.**
+  - Advisory containment and send capability stop a contained process from driving work through
+    the coordination tools. They do not authenticate who a session is.
+  - Containment depends on the server's environment variable, not on which host is calling.
+  - The store is plain files owned by your user. An agent with shell access can get around
+    containment by running the CLI without the variable or by editing the store.
+  - In call mode, a Codex or Antigravity target can read any file your user account can read.
+    Only Claude is confined to its folder.
+  - On the Claude bridge route, a rebind just before the send can deliver a linked message to the
+    new session; see FEATURES.md.
+  - The record of which files a call read is a heuristic. When unsure, it reports no value plus a
+    lower bound.
+- **Stale-write guard limits.**
+  - It is not installed by setup.
+  - Shell overwrites are only warned about or logged.
+  - Never run live:
+    - the Antigravity IDE and desktop app routes;
+    - the Claude Code shell-warning hook;
+    - Codex hook ordering when one hook denies.
+  - With Mycelium 0.9.7 or later on Codex, a refused `apply_patch` leaves Mycelium's file-change
+    records in that repository marked "shared" rather than credited to one action for up to a
+    day. The changes are still recorded.
 
 ## Repository map
 
 ```
 src/claude/, src/codex/     instruction files and skills installed by wfctl
-coordination/               mycelium_coord package, CLI launcher, coordination skill
+src/consult/                call-mode adapters for Codex, Claude Code and Antigravity
+coordination/               mycelium_coord package (incl. triangle features and write guard),
+                            CLI launcher, coordination skill, tests
 bridge/                     cmux_bridge MCP server and its offline tests
-mycelium-source/            bundled Mycelium lifecycle plugin source (pinned; own LICENSE)
-core-overlay/               repo-owned hook files that replace source hooks at export
-scripts/                    wfctl.py, export_coordination.py, smoke_check.sh, export tests
+mycelium-source/            bundled Mycelium lifecycle plugin source (0.6.0; pinned; own LICENSE)
+core-overlay/               repo-owned hook files that replace source hooks at export (0.6.0 only)
+scripts/                    wfctl.py, export_coordination.py, smoke_check.sh, script tests
 tests/                      installer tests
 docs/                       installation and operations guides
+docs/triangle/              triangle features, two-modes design, write-guard spec, build log,
+                            proposed hook templates
 PROVENANCE.md, VERSION      source provenance and the instruction-contract version
 ```
 
@@ -227,8 +362,11 @@ All of these run offline, with no cmux, network or model calls:
 python3 -m pytest tests -q                                   # installer
 ( cd bridge && python3 -m pytest tests -q )                  # bridge
 ( cd coordination && python3 -m pytest tests -q )            # coordination package
-python3 -m pytest -q scripts/test_export_coordination_hooks.py scripts/test_export_stop_budget.py
+python3 -m pytest -q scripts                                 # exporter and script tests
 ```
+
+The coordination tests include the triangle features, the write guard and the call-mode adapters,
+which run against fake hosts.
 
 Two other checks touch real sessions and are not routine tests:
 
@@ -243,8 +381,8 @@ Run both only deliberately.
 
 - **MIT:** the SporeDrive-authored parts (`src/`, `coordination/`, `bridge/`, `scripts/`, `tests/`,
   docs) are MIT-licensed; see [LICENSE](LICENSE).
-- **Derived from Mycelium:** `core-overlay/` holds modified copies of Mycelium hook files, which
-  remain under Mycelium's own license.
+- **Derived from Mycelium:** `core-overlay/` holds modified copies of Mycelium 0.6.0 hook files,
+  which remain under Mycelium's own license.
 - **Upstream Mycelium:** `mycelium-source/` is Mycelium lifecycle source pinned at commit
   `f2b0083`. It carries its own upstream `LICENSE` (MIT, Mycelium Contributors) and `README.md`.
 - **History:** [PROVENANCE.md](PROVENANCE.md) records what was included or excluded and why.
@@ -259,3 +397,9 @@ Run both only deliberately.
   [bridge MCP contract](src/codex/skills/cmux-driver/references/bridge-mcp.md).
 - [Mycelium coordination reference](src/codex/skills/cmux-driver/references/mycelium-coordination.md)
   and [coordination skill](coordination/skill/SKILL.md).
+- [docs/triangle/FEATURES.md](docs/triangle/FEATURES.md): advisory containment, wake routes, send
+  capability, call mode and link mode, with every refusal code.
+- [docs/triangle/TWO-MODES-DESIGN.md](docs/triangle/TWO-MODES-DESIGN.md): why there are two modes.
+- [docs/triangle/WRITE_GUARD_SPEC.md](docs/triangle/WRITE_GUARD_SPEC.md): the stale-write guard,
+  per-host facts, and how it runs alongside Mycelium.
+- [src/consult/README.md](src/consult/README.md): the call-mode adapters, exit codes and receipts.
