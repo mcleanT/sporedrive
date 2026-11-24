@@ -23,6 +23,7 @@ from .model import (
     STATE_DELIVERED,
     STATE_PERSISTED,
     FEATURE_SEND_CAPABILITY,
+    FEATURE_SESSION_LINKS,
     FEATURE_TRIANGLE_KINDS,
     PROTOCOL_FEATURES,
     TRIANGLE_KINDS,
@@ -119,6 +120,13 @@ CORRELATION_EXEMPT_KINDS = ("acknowledgment", "completion_receipt")
 class Coordinator:
     def __init__(self, store: CoordStore | None = None):
         self.store = store or CoordStore()
+
+    @property
+    def links(self):
+        """Mode 2 link manager (links.py); inert on a task without the session-links feature."""
+        from .links import Links
+
+        return Links(self)
 
     # ---- lock name: the task_id itself (validated, <=120), one coarse lock per task ----
     def _lock(self, task_id: str):
@@ -354,6 +362,14 @@ class Coordinator:
                     task_id,
                     f"protocol_features must be a list drawn from {PROTOCOL_FEATURES}",
                 )
+        if protocol_features and FEATURE_SESSION_LINKS in protocol_features and (
+            FEATURE_SEND_CAPABILITY not in protocol_features
+        ):
+            raise ProtocolError(
+                "session_links_requires_send_capability",
+                task_id,
+                f"protocol feature {FEATURE_SESSION_LINKS!r} requires {FEATURE_SEND_CAPABILITY!r} on the same task",
+            )
         if message_budget is not None:
             ok = isinstance(message_budget, dict) and message_budget and all(
                 k in ("per_correlation", "per_sender")
@@ -680,6 +696,7 @@ class Coordinator:
                         cap_event = "takeover"
                 p["send_cap"] = sendcap.mint(self.store, task_id, participant_id)
             self.store.write(rel, p)
+            self.links.participant_changed(task_id, participant_id)  # a different native session -> stale
             # Bind the selection to this native session so startup/compaction resolve to the
             # right participant even with two sessions in one worktree (native-routing review 1).
             sid = (host or {}).get("session")
@@ -717,6 +734,7 @@ class Coordinator:
             p["detached_at"] = utcnow()
             p.pop("send_cap", None)  # revoke: no capability matches a detached record (review 4)
             self.store.write(rel, p)
+            self.links.participant_changed(task_id, participant_id)  # a detached member -> stale
             sendcap.forget(self.store, task_id, participant_id)
             self.store.append_receipt(
                 f"{_task_root(task_id)}/audit.jsonl",
@@ -823,6 +841,7 @@ class Coordinator:
         host: dict | None = None,
         execution_action_id: str | None = None,
         actionable: bool | None = None,
+        link_id: str | None = None,
     ) -> dict:
         """Persist an addressed message. Idempotent by (message_id, content): a repeat with the SAME
         content returns the stored message and does NOT re-append; a repeat with the SAME id but
@@ -900,6 +919,10 @@ class Coordinator:
                     "idempotency_conflict",
                     message_id,
                     "message_id reused with different content; a payload change requires a new id",
+                )
+            if link_id is not None:  # mode 2, first-time sends only (a replay returned above): exactly the partner
+                self.links.check_send(
+                    task_id, link_id, sender, recipient, kind, actionable=effective_actionable
                 )
             # triangle kinds are opt-in per task (an old-version sender would refuse them; every
             # reader tolerates them), and consult_request/report are never work requests.

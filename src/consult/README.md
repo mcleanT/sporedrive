@@ -22,6 +22,17 @@ Off-bus, read-only second opinions. Neither adapter attaches to the coordination
 - Receipt records `effort_requested`, `model_requested`, `plugins_at_init`, `messaging_socket_path` (null under `--safe-mode` in the live run; a non-null value is the local inter-session socket, an open off-bus item), `hook_events_seen`.
 - Limits: the claude run may still create `~/.claude/projects/<cwd>/memory` despite `--no-session-persistence` (observed earlier, not re-measured under `--safe-mode`).
 
+## codex_call.sh (call mode, Codex)
+`echo PROMPT | codex_call.sh --out FILE [--cwd DIR] [--timeout 600] [--model M] [--effort E]` (env `CODEX_BIN`, default `/opt/homebrew/bin/codex`; `CODEX_CALL_MODEL`, `CODEX_CALL_EFFORT`). Runs `codex exec --ignore-user-config --ephemeral --skip-git-repo-check --sandbox read-only --disable hooks --json -C <cwd> -m M -c model_reasoning_effort=E -o <out>.last -`, prompt on stdin, hard deadline by `alarm`. Exit codes and the answer-file rule are the same as below; ANSWERED needs exit 0, a `turn.completed` event in the stream and a non-empty `-o` file. Side files: `<out>.stream.jsonl`, `<out>.stderr`, `<out>.last`, `<out>.receipt.json` (adds `usage` from `turn.completed.usage`, `session_id`, `tool_calls` from `command_execution`). Meant to be run by `mycelium-coord consult call`, not by hand.
+
+## Call mode CLI (mycelium-coord consult call)
+`mycelium-coord consult call --target codex|claude|antigravity --packet FILE [--out-root DIR] [--post-to TASK:MSG --sender PID --cap-file F]` (also `--call-id`, `--host-bin`, `--target-path`). Foreground. Builds a prompt from the packet (`consult-packet/1`), starts the matching adapter above with an exact environment allowlist (see docs/triangle/FEATURES.md, "Call mode"), and prints `{outcome, retryable, usable, exit, reason, call_id, call_dir, receipt}`; exit 0 only when ANSWERED. `--post-to` posts one `report` after the call (answer as `artifact_ref`, receipt sha256 as evidence). Tests: `coordination/tests/test_consult_call.py` (fake hosts, Betty only).
+
+## Usage and observed effort (receipts)
+`claude_ask.sh`, `agy_ask.py` and `codex_call.sh` receipts carry two nullable fields: `usage` (claude: `result.usage` input/cache_read/cache_creation/output tokens; codex: `turn.completed.usage`; agy: always null) and `effort_observed` (null unless the host reports it). Null means not reported, never 0.
+
+Call-mode receipts (`mycelium-coord consult call`, `tokens`): for Claude, `tokens.input` = `input_tokens` + `cache_creation_input_tokens` (everything sent that was not read from cache), `tokens.cached_input` = `cache_read_input_tokens`, and `tokens.cache_creation_input` repeats the cache-write part on its own; each is null when the host did not report it. Codex (`input_tokens`, `cached_input_tokens`) and Antigravity (always null) are unchanged and carry no `cache_creation_input` key. The receipt also records `host_bin_override_path` (the override, if any), `host_bin_resolved` (the binary preflight accepted, which is passed to the adapter through CODEX_BIN / CLAUDE_BIN / AGY_BIN so both use the same one) and `path_passed` (the PATH value the target got).
+
 ## Output hygiene (both)
 At start `<out>`, `<out>.receipt.json` and `<out>.partial` are deleted. `<out>` is written only when ANSWERED; partial text goes to `<out>.partial`. A CANNOT-EVALUATE receipt is written on every exit path once `--out` is known, including argument errors and unsafe dirs.
 

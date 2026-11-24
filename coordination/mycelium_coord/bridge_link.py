@@ -218,6 +218,7 @@ def notify_via_bridge(
     expected_revision: int,
     accept_timeout_s: float = 12.0,
     execution_action_id: str | None = None,
+    link_pin: dict | None = None,
 ) -> dict:
     msg = co.get_message(task_id, message_id)
     if not msg:
@@ -268,6 +269,17 @@ def notify_via_bridge(
 
     # Resolve the addressed recipient and verify the binding BEFORE any send (adapter review 1).
     recip = _resolve_recipient(co, task_id, msg)
+    if link_pin is not None:
+        # a link wake reaches only the pinned partner session: compare the record this delivery actually
+        # uses with the pin the link check returned (never retargets to a newcomer)
+        from .links import pin_of
+
+        if pin_of(recip) != link_pin:
+            raise ProtocolError(
+                "link_stale",
+                str(msg.get("recipient") or ""),
+                "the recipient is no longer on the session the link pinned; never retargeted",
+            )
     binding = _read_binding(binding_id)
     if binding is None:
         raise ProtocolError(

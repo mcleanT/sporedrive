@@ -86,7 +86,8 @@ def main():
          "session_id": None, "started_at": now(), "ended_at": None, "duration_s": None,
          "outcome": "CANNOT-EVALUATE", "reason": None, "answer_chars": 0, "stop_reason": None,
          "tool_calls": [], "files_read": [], "no_successful_read": True, "permissions_rejected": [],
-         "permissions_granted": [], "host_config_unchanged": None, "gemini_dir": None, "kept": False}
+         "permissions_granted": [], "host_config_unchanged": None, "gemini_dir": None, "kept": False,
+         "usage": None, "effort_observed": None}  # agy reports neither: null, never 0
     before = host_hashes()
     keep = [False]
     tcs = {}

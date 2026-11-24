@@ -30,6 +30,7 @@ import subprocess
 import time
 
 from . import bridge_link, sendcap
+from .links import pin_of as _pin_of
 from .store import StoreError
 from .execution import (
     ExecutionManager,
@@ -268,6 +269,8 @@ def _route_claude(ctx) -> tuple[str, dict]:
         accept_timeout_s=kw.get("accept_timeout_s", 12.0),
         execution_action_id=kw.get("execution_action_id"),
     )
+    if ctx.get("link_pin") is not None:  # only a link wake carries a pin; other calls are byte-identical
+        args["link_pin"] = ctx["link_pin"]
     # common managed pause/expiry/draining/closed gate, immediately before the route's mutation
     reason = _execution_gate(ctx["em"], ctx["task_id"], ctx["msg"], claim=False)
     if reason:
@@ -427,6 +430,9 @@ def _codex_locked(ctx, thread: str) -> tuple[str, dict]:
         with co._lock(task_id):
             fresh = co.store.read(f"tasks/{task_id}/participants/{pid}.json") or {}
             fh = fresh.get("host") or {}
+            if ctx.get("link_pin") is not None and _pin_of(fresh) != ctx["link_pin"]:
+                # same lock as the launch: a rebind after the link check can never be launched against
+                return _refused("link_stale"), {}
             if not (
                 not fresh.get("detached")
                 and fh.get("host") == "codex"
@@ -515,6 +521,7 @@ def wake_recipient(
     accept_timeout_s: float = 12.0,
     execution_action_id: str | None = None,
     timeout_s: float | None = None,
+    link_id: str | None = None,
 ) -> dict:
     """Wake the single recipient of ``message_id``. Returns the stored receipt (dict with ``outcome``).
     The Claude route needs the bridge arguments; they identify a bridge binding, not a target (the
@@ -536,7 +543,11 @@ def wake_recipient(
     rel = _receipt_rel(task_id, message_id)
     prior = co.store.read(rel)
     if prior and prior.get("outcome") in (ACCEPTED, UNCERTAIN):
-        return {**prior, "idempotent_replay": True}
+        return {**prior, "idempotent_replay": True}  # a replay never re-runs the link gate
+    link_pin = None
+    if link_id is not None:  # mode 2: same exact-partner / not-stale check, then the route below is unchanged
+        _lk = co.links.check_wake(task_id, link_id, sender, str(msg.get("recipient") or ""))
+        link_pin = co.links.member_pin(_lk, str(msg.get("recipient") or ""))
 
     task = co._require_task(task_id)
     rid = _request_id(task_id, message_id)
@@ -588,6 +599,9 @@ def wake_recipient(
         return record(_refused("recipient_not_attached"))
     if recip.get("detached"):
         return record(_refused("recipient_detached"))
+    if link_pin is not None and _pin_of(recip) != link_pin:
+        # the link check and this read are separate lock sections: a rebind in between must not be woken
+        return record(_refused("link_stale"))
     host_kind = (recip.get("host") or {}).get("host")
     route_name = host_kind if host_kind in ROUTES else "unknown"
     if sender == recipient_id:
@@ -638,6 +652,7 @@ def wake_recipient(
             "msg": msg,
             "recip": recip,
             "sender": sender,
+            "link_pin": link_pin,
             "route_args": {
                 "binding_id": binding_id,
                 "controller_id": controller_id,

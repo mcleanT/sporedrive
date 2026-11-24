@@ -63,7 +63,15 @@ FEATURE_CODEX_EXEC_WAKE = "codex-exec-wake"
 # notify) must come from the process that attached that participant (proposal step 3, "send binding").
 # An advisory process is always held to this rule, on every task. See coord.py "Send capability".
 FEATURE_SEND_CAPABILITY = "send-capability"
-PROTOCOL_FEATURES = (FEATURE_TRIANGLE_KINDS, FEATURE_CODEX_EXEC_WAKE, FEATURE_SEND_CAPABILITY)
+# Opt-in: mode 2 "link" (links.py): two named live sessions pinned to one task. REQUIRES send-capability on the
+# same task, so every link operation is capability-checked.
+FEATURE_SESSION_LINKS = "session-links"
+PROTOCOL_FEATURES = (
+    FEATURE_TRIANGLE_KINDS,
+    FEATURE_CODEX_EXEC_WAKE,
+    FEATURE_SEND_CAPABILITY,
+    FEATURE_SESSION_LINKS,
+)
 
 # Advisory (consult/review/Antigravity) processes may read, attach as observer and send
 # non-actionable messages, but never exercise owner authority or drive other sessions.

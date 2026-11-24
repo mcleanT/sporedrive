@@ -49,7 +49,7 @@ import json,sys
 out,start,reason,code,eff,model=sys.argv[1:7]
 json.dump({"adapter":"claude_ask","host":"claude","outcome":"CANNOT-EVALUATE","reason":reason,"exit":int(code),"started_at":start,
  "answer_chars":0,"no_successful_read":True,"files_read":[],"tool_calls":[],"effort_requested":eff,"model_requested":model,
- "host_config_unchanged":None},open(out+".receipt.json","w"),indent=1)
+ "host_config_unchanged":None,"usage":None,"effort_observed":None},open(out+".receipt.json","w"),indent=1)
 PY
   fi
   exit "$1"
@@ -112,6 +112,10 @@ mcp=(init or {}).get("mcp_servers"); tools=(init or {}).get("tools")
 plugins=(init or {}).get("plugins")
 nonbuiltin=[p for p in (plugins or []) if not (isinstance(p,dict) and (p.get("path")=="builtin" or str(p.get("source","")).endswith("@builtin")))]
 sock=(init or {}).get("messaging_socket_path")
+# Nullable usage / observed effort: null (never 0) when the stream does not carry them.
+_u=(res or {}).get("usage") if isinstance((res or {}).get("usage"),dict) else None
+usage=None if _u is None else {k:_u.get(k) for k in ("input_tokens","cache_read_input_tokens","cache_creation_input_tokens","output_tokens")}
+effort_obs=(init or {}).get("effort") or (init or {}).get("reasoning_effort") or None
 mcp_ok = init is not None and mcp==[]
 tools_ok = init is not None and set(tools or [])=={"Read","Grep","Glob"}
 code=0; reason="ok"
@@ -148,7 +152,7 @@ rec={"adapter":"claude_ask","host":"claude","claude_version":ver,"model_reported
  "permissions_granted":[],"host_config_unchanged":unchanged=="1","gemini_dir":None,"kept":True,
  "mcp_servers_at_init":mcp,"tools_at_init":tools,"plugins_at_init":plugins,"messaging_socket_path":sock,
  "isolation_flags":"--safe-mode --restricted --strict-mcp-config --mcp-config {} --tools Read,Grep,Glob --include-hook-events",
- "hook_events_seen":hookev,"cwd":cwd,"stream":raw}
+ "hook_events_seen":hookev,"cwd":cwd,"stream":raw,"usage":usage,"effort_observed":effort_obs}
 json.dump(rec,open(out+".receipt.json","w"),indent=1)
 print(json.dumps({"outcome":rec["outcome"],"exit":code,"receipt":out+".receipt.json"}))
 sys.exit(code)

@@ -1,4 +1,4 @@
-# Two communication modes for the triangle — design v1.2 (2026-11-23, owner approved build: "go ahead - handle it")
+# Two communication modes for the triangle — design v1.3 (2026-11-23, owner approved build: "go ahead - handle it")
 
 Owner requirement (verbatim, 2026-11-23): "we need to have 2 different modes of communication. in one, we create a
 transient, headless session for the respective calls, this is especailly relevant for reviews. in the other, we have a
@@ -157,7 +157,7 @@ Member role `observer`; sends limited to `ADVISORY_ALLOWED_SEND_KINDS` (model.py
 - New: `mycelium_coord/consult.py` (packet, preflight, env allowlist, dispatch, outcome mapping, receipt, post),
   `mycelium_coord/links.py`, `src/consult/codex_call.sh`.
 - Changed: model.py (feature + validators), coord.py (link methods, `link_id` on send), mcp_server.py (link tools;
-  allowlist entries for link confirm/end; no consult tool), cli.py (`consult call`, `link …`), wake.py (link check
+  allowlist entries for link confirm/end; no consult launch tool — `consult_post` is post-only), cli.py (`consult call`, `link …`), wake.py (link check
   before routing),
   claude_ask.sh / agy_ask.py (nullable usage + observed-effort fields only).
 - Untouched: execution.py, sendcap.py, store.py, jobs.py, installed codex_ask.sh, tasks without `session-links`.
@@ -171,7 +171,9 @@ Member role `observer`; sends limited to `ADVISORY_ALLOWED_SEND_KINDS` (model.py
 - Live smokes on a scratch store (never the live store); pass read from stored receipts/board, not exit codes:
   - Call, once per target host: positive control (answer quotes a sentinel only in a named file); one forced timeout;
     one missing-file packet; receipt outcome correct; env_keys_passed has only the allowlist plus the three set
-    `MYCELIUM_*` keys; Codex: read extraction lists the named file (else the smoke fails, not "coverage 0");
+    `MYCELIUM_*` keys; Codex: read extraction lists the named file, either as a counted read ("argument") or as a flagged
+    "possible" read; when only "possible", `coverage.read` is null with `read_lower_bound` — never a measured 0
+    (else the smoke fails) (v1.3);
     no-recursion: a target told to run `mycelium-coord consult call` is refused (`MYCELIUM_CONSULT_TARGET`). A "sentinel in an unnamed
     file is absent" check tests model restraint, not confinement, and is labelled so.
   - Link: Claude ↔ headless Codex (send, wake, ack in store); headless wake does not stale the link (≤3 attempts;
@@ -200,3 +202,10 @@ this revision (v1.1) by the edits in §1, §2.1, §2.2, §2.4, §3.2, §5. No fu
 v1.2 (after owner approval): pre-build probe (evidence/two-modes-probe) fixed the environment list and added
 `--skip-git-repo-check`; restored a post-only MCP tool (`consult_post`) because MCP-attached callers cannot supply a
 `--cap-file`; Antigravity link member over ACP with per-session MCP (no host-config edit); bounded headless-Codex smoke.
+
+v1.3 (during build, lead decision under "handle it"): the call-mode verifier showed that a file name appearing in a
+command line does not prove the file was read (pipes, `xargs`, `rg --files`, grep patterns). Codex read extraction now
+counts only a direct reader operand; anything else is "possible" and makes coverage a lower bound. The live smoke had
+read the named file through `rg --files | xargs sh -c 'sed …'`, which is now "possible", so the §5 Codex gate accepts
+a counted or a flagged read and fails only on a silent measured 0. The packet prompt now asks targets to read named
+files directly by path. Coverage stays a heuristic, never a gate on the answer itself.

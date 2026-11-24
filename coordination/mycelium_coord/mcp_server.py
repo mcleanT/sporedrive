@@ -16,7 +16,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
-from . import schedule
+from . import consult, schedule
 from .coord import Coordinator
 from .execution import ExecutionManager
 from .jobs import DEFAULT_TAIL_BYTES, JOIN_MAX_S, JobManager
@@ -183,6 +183,7 @@ async def coord_send(
     host: dict | None = None,
     execution_action_id: str | None = None,
     actionable: bool | None = None,
+    link_id: str | None = None,
 ) -> dict:
     """Persist an addressed message. Idempotent by (message_id, content); a same-id different-content
     send is rejected. Exactly one of text / artifact_ref. A completion_receipt requires reply_to and
@@ -211,6 +212,8 @@ async def coord_send(
             compatible reservation via execution_action_id); False marks a status/notice that never
             wakes a completed/closed executor. Default (None) derives it from kind — task-like kinds
             are actionable. A trusted-agent disposition, not a free-text parse.
+        link_id: Mode 2: send inside this active session link; recipient must be exactly the partner
+            participant (a role or 'all' is refused link_requires_exact_recipient; a stale link link_stale).
     """
     return await asyncio.to_thread(
         lambda: _wrap(
@@ -230,6 +233,7 @@ async def coord_send(
                 host=host or {},
                 execution_action_id=execution_action_id,
                 actionable=actionable,
+                link_id=link_id,
             ),
         )
     )
@@ -645,6 +649,67 @@ async def coord_notify_via_bridge(
     )
 
 
+@mcp.tool(title="Coord Link Propose", annotations=_WRITE)
+async def coord_link_propose(task_id: str, link_id: str, from_pid: str, to_pid: str) -> dict:
+    """Mode 2 (link): propose pinning two attached participants of a task into one collaboration link. The task
+    needs the session-links and send-capability features. host + native session are copied from the two stored
+    attach records, never from the caller. Not available in an advisory process. An Antigravity member must be
+    attached as observer. The link shares the whole task, as participants already do; it designates the recipient
+    of a send, it does not make the board private.
+
+    Args:
+        task_id: Task id.
+        link_id: New link id.
+        from_pid: Proposing participant (this process must hold its send capability).
+        to_pid: Partner participant (must confirm).
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap("coord_link_propose", lambda: _co().links.propose(task_id, link_id, from_pid, to_pid))
+    )
+
+
+@mcp.tool(title="Coord Link Confirm", annotations=_WRITE)
+async def coord_link_confirm(task_id: str, link_id: str, participant_id: str) -> dict:
+    """Mode 2 (link): the proposed partner confirms; capability-checked. Records each member's wake route truthfully.
+    A stale link (a member detached or a different native session holds it) is refused link_stale.
+
+    Args:
+        task_id: Task id.
+        link_id: Link id.
+        participant_id: The partner participant confirming (this process must hold its send capability).
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap("coord_link_confirm", lambda: _co().links.confirm(task_id, link_id, participant_id))
+    )
+
+
+@mcp.tool(title="Coord Link End", annotations=_WRITE)
+async def coord_link_end(task_id: str, link_id: str, participant_id: str, reason: str | None = None) -> dict:
+    """Mode 2 (link): either member ends the link; capability-checked.
+
+    Args:
+        task_id: Task id.
+        link_id: Link id.
+        participant_id: The member ending it.
+        reason: Short reason.
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap("coord_link_end", lambda: _co().links.end(task_id, link_id, participant_id, reason))
+    )
+
+
+@mcp.tool(title="Coord Link Get", annotations=_READ)
+async def coord_link_get(task_id: str, link_id: str) -> dict:
+    """Mode 2 (link): read one link. Its state reads stale when a member is detached or a different native
+    session holds the participant.
+
+    Args:
+        task_id: Task id.
+        link_id: Link id.
+    """
+    return await asyncio.to_thread(lambda: _wrap("coord_link_get", lambda: _co().links.get(task_id, link_id)))
+
+
 @mcp.tool(title="Coord Wake", annotations=_WRITE)
 async def coord_wake(
     task_id: str,
@@ -656,6 +721,7 @@ async def coord_wake(
     accept_timeout_s: float = 12.0,
     execution_action_id: str | None = None,
     timeout_s: float | None = None,
+    link_id: str | None = None,
 ) -> dict:
     """Wake the ONE recipient of a stored message through its host route; the target comes only from the
     recipient's stored participant record. Outcome: accepted | uncertain | unavailable | not_supported |
@@ -676,6 +742,7 @@ async def coord_wake(
         accept_timeout_s: Claude route only: seconds to wait for bridge correlation.
         execution_action_id: Claude route only: managed dispatch reservation.
         timeout_s: Codex route only: run timeout in seconds, finite in (0, 900] (default 240); anything else is rejected before any side effect.
+        link_id: Mode 2: the same exact-partner / not-stale link check before the normal route.
     """
     from .wake import wake_recipient
 
@@ -693,6 +760,7 @@ async def coord_wake(
                 accept_timeout_s=accept_timeout_s,
                 execution_action_id=execution_action_id,
                 timeout_s=timeout_s,
+                link_id=link_id,
             ),
         )
     )
@@ -1664,6 +1732,38 @@ async def job_output(
     )
 
 
+@mcp.tool(title="Consult Post", annotations=_WRITE)
+async def consult_post(
+    task_id: str,
+    sender: str,
+    reply_to: str,
+    call_dir: str,
+    message_id: str | None = None,
+) -> dict:
+    """Post ONE `report` for a finished consult call (mode 1). Launches nothing: it reads receipt.json (and
+    answer.md when ANSWERED) from the call directory the `mycelium-coord consult call` CLI made, re-hashes the
+    answer against the receipt's recorded sha256 (a tampered answer is refused: consult_answer_sha_mismatch) and
+    sends one report from this server process, which holds the sender's send capability. ANSWERED: the answer file
+    is the artifact_ref and the receipt sha256 is the evidence. Any other outcome: a report stating the outcome
+    (CANNOT-EVALUATE), never an empty answer. Idempotent by message_id. Not available in advisory processes.
+
+    Args:
+        task_id: Task id.
+        sender: Attached participant id posting the report (this server process must hold its capability).
+        reply_to: message_id of the review_request / consult_request being answered; the report goes to its sender.
+        call_dir: The finished call's directory (the `call_dir` printed by `consult call`).
+        message_id: Optional idempotency key; default derived from the call id.
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap(
+            "consult_post",
+            lambda: consult.post_report(
+                _co(), task_id=task_id, sender=sender, reply_to=reply_to, call_dir=call_dir, message_id=message_id
+            ),
+        )
+    )
+
+
 # Advisory allowlist: the ONLY tools an advisory process exposes. The core gate is the real control.
 ADVISORY_ALLOWED_TOOLS = frozenset((
     "coord_create_task", "coord_attach", "coord_send", "coord_inbox", "coord_read_message", "coord_wait",
@@ -1671,7 +1771,7 @@ ADVISORY_ALLOWED_TOOLS = frozenset((
     "coord_resume", "coord_participants", "coord_list_tasks", "coord_find_recipients",
     "coord_list_sessions", "coord_detach", "execution_read", "execution_status", "execution_receipt",
     "execution_evidence", "sched_plan", "sched_verify", "job_status", "job_join",
-    "job_list", "job_output",
+    "job_list", "job_output", "coord_link_confirm", "coord_link_end", "coord_link_get",
 ))
 
 

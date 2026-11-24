@@ -380,3 +380,28 @@ Probe evidence: evidence/m2-probes.json (Claude 6 runs, Codex 6, agy 5).
   Codex config byte check: the ONLY change is the approved ws trust block. ~/.claude.json and Claude Desktop config not hashed.
 - UI notes: `claude --desktop` must bypass the cmux shim and needs a TTY; Antigravity composer needs type_text x,y; Return sends
   in all three apps. Leak scan clean (thinking-block signatures redacted).
+
+## [2026-11-23] Two communication modes (call + link) — owner: "we need to have 2 different modes of communication … go ahead - handle it"
+- Design: TWO-MODES-DESIGN.md v1.3. Call = a fresh headless session per request (`consult call`, CLI-only launch; MCP
+  `consult_post` posts a finished call's answer as a report and launches nothing). Link = two named live sessions pinned to
+  one task (feature `session-links`, requires `send-capability`); linked send/wake reach only the pinned native session and
+  refuse `link_stale` after a rebind; the whole task is shared; Antigravity members are observers.
+- Build/verify rounds (sonnet implementers, opus verifiers, one Codex review + one Codex repair verification):
+  - call build (wf_58d6a833-644) → live call smoke found 2 defects (Codex read through `xargs` reported as 0; recursion guard after
+    store init) → fixed with the link build (wf_df4d865d-6af).
+  - opus verifiers: 11 findings, 4 blocking (dispatcher stop orphaned the target; launched failure classed NOT_STARTED; coverage
+    heuristic reported as a count; wake link check not atomic) → repaired, rechecked closed. 10 minor fixes followed.
+  - Codex review (gpt-5.6-sol high): no link/advisory/legacy blockers; 5 call-mode blockers (post-launch OSError → NOT_STARTED +
+    orphan; stop signal could lose the receipt; 3-contender lock recovery race; absent token/coverage parts as exact 0; CLI
+    --root store unprotected + symlink TOCTOU) → repaired; Codex verification: 4 CLOSED, 1 PARTLY → closed by the lead.
+- Betty full suite: 928 → 947 → 973 → 993 passed (3 skipped, 0 failed); final run in evidence/betty/two-modes-final-full-suite.txt.
+- Live smokes (scratch stores only): call r3 — Codex, Claude, Antigravity ANSWERED with the sentinel, coverage 1/1; Codex timeout
+  TIMED_OUT with coverage null + lower bound; a target that tried `consult call` got REFUSED (recursion). Link — Claude ↔ headless
+  Codex confirm/send/wake/ack, link stays active across 2 headless re-attaches (2/2 first attempt); Antigravity observer over ACP
+  (per-session MCP, host config unchanged) confirm/read/reply-via-link/ack; rebind → stale, linked send and wake refused with no
+  launch; identical replay returns the stored message; ended link refuses. (evidence/two-modes-call-smoke, two-modes-link-smoke)
+- Found during the smoke: the Codex-oriented "read named files with sed/cat/nl" prompt line made Antigravity try a rejected
+  shell `cat` and end with an empty answer (recorded UNAVAILABLE, not ANSWERED) → the line is now Codex-only.
+- Limits kept: Codex/Antigravity targets can read any user-readable file (only Claude is folder-restricted); board reads are not
+  gated per member; files-read coverage is a heuristic (null + lower bound when unsure); Claude bridge route has an unlocked
+  pin-check→send window; stored messages do not carry link_id (backlog).
