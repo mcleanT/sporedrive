@@ -175,18 +175,22 @@ over. Code: `coordination/mycelium_coord/consult.py`; hosts: `src/consult/{codex
   shell) and runs it as the detached owned job `consult-<call_id>`, so the call survives the server exiting. The
   executable, PATH, out root, lane, cwd and environment are never taken over MCP. Gates, in order, each before anything is
   created: recursion (`MYCELIUM_CONSULT_TARGET`) -> REFUSED; restricted (advisory) process -> `advisory_process_refused`
-  (both tools are also hidden there; every called session is restricted, so a called session cannot start another call);
+  (both tools are also hidden there; a called session is launched with no coordination MCP server, which is what stops it
+  starting another call: these environment-based refusals are a backstop, since a host may filter the environment it gives
+  its MCP servers); an out root or `packets/` that is a symlink, not owned by this user or open to group/other ->
+  NOT_STARTED `out root not private`; a call_id starting with `-` -> NOT_STARTED;
   packet over 64 KiB or invalid -> NOT_STARTED; `deadline_s` + 30 + 60 over the 6 h job limit -> NOT_STARTED
   `deadline_too_long`; optional post check (posts nothing) -> NOT_STARTED; an existing call directory this store's jobs did
   not make -> `consult_call_id_conflict`. The same call_id with the same packet replays; a different packet is
   `consult_call_id_conflict`. `consult_start` returns within about 2 s (`started` / `replayed` / `ended`); a busy lane
-  shows inline as REFUSED `busy`, retryable. `consult_result` waits at most 25 s inside the tool (host yield minus 5 s),
+  shows inline as REFUSED `busy`, retryable. `consult_result` waits inside the tool 25 s by default (host yield minus 5 s, at most 50 s),
   takes the call directory from the job's own argv (not from its own TMPDIR), and trusts a receipt only when its call id
   and packet sha256 match the job; a job that ended without one is `ended_without_receipt`, usable false. The answer is
   re-hashed against the receipt and paged (at most 3,000 bytes a page; whole response at most 4 KB). Post with
   `consult_post` and the returned `call_dir`. No cancel over MCP: the packet's deadline bounds the call (a shell can run
-  `job-cancel consult-<call_id>`). An MCP-started call uses the user-id lane, shared with CLI calls made without
-  `--sender`. Servers must share one coordination store to collect each other's calls. Unit-tested with fake hosts; live
+  `job-cancel consult-<call_id>`). An MCP-started call uses the user-id lane of its coordination store (`<store>/consult-locks`, not
+  TMPDIR), shared with CLI calls on that store made without `--sender`. The job runs with the MCP server's permissions, not
+  the host shell's sandbox or approval policy; host approval of the `consult_start` tool call is the control. Servers must share one coordination store to collect each other's calls. Unit-tested with fake hosts; live
   smokes from each app are pending.
 - With posting requested, everything the post needs is checked BEFORE the call is launched (task exists and has
   `triangle-kinds`, the reply-to message exists, is a review_request/consult_request addressed to the sender, the sender is

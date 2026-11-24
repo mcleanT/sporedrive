@@ -91,11 +91,18 @@ Each also has an MCP tool. There are two ways to talk:
   `mycelium-coord consult call --target codex|claude|antigravity`. Either starts a brand-new
   session of the target.
   - Over MCP the call runs as a background job. In tests it kept running when the server process
-    was killed; whether it survives quitting each app is not yet proven. `consult_result` waits at
-    most 25 s per call; call it again while the call runs. There is no cancel over MCP: the
+    was killed; whether it survives quitting each app is not yet proven. `consult_result` waits 25 s
+    per call by default (the host's tool yield minus 5 s, never more than 50 s); call it again
+    while the call runs. There is no cancel over MCP: the
     packet's deadline ends the call.
-  - A restricted connection cannot start calls. Every called session is restricted, so a called
-    session cannot start another call.
+  - A restricted connection cannot start calls. A called session is launched with no coordination
+    MCP server, so it has no way to start another call; the refusals of a restricted or called
+    session are a backstop that depends on the host passing its environment to the server.
+  - The call job runs with the MCP server's own permissions, not the app's shell sandbox or shell
+    approval policy. Approving the `consult_start` tool call is the control; hosts can require it.
+  - One call at a time per caller and target, shared by every server and CLI on one coordination
+    store. Call files live in a directory that must be private to the user, or the call is not
+    started.
   - The MCP route is covered by unit tests with stand-in hosts. Live runs from each app are still
     pending.
   - The session gets one written packet, answers once and is discarded.

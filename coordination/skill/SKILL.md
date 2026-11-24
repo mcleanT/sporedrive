@@ -106,7 +106,9 @@ MCP (both hosts) exposes only the read-only routes: `job_status`, `job_join` (25
 route), `job_list`, `job_output`, `wait_plan`, `execution_receipt`, `execution_evidence`, `sched_plan`,
 `sched_verify`. There is no MCP launch route for jobs, apart from `consult_start`'s one fixed consult
 job (below): a job is started by the owned CLI from the
-host-authorized shell so its processes inherit that shell's permissions. A managed job runs under one
+host-authorized shell so its processes inherit that shell's permissions. The `consult_start` job is the
+exception: the MCP server spawns it, so it runs with the server's permissions, outside the host shell's
+sandbox and approval policy, and host approval of the `consult_start` tool call is the only host control. A managed job runs under one
 open work reservation (re-checked immediately before the actual launch), keeps an immutable request
 record (identity, argv, cwd, deadline, reservation) and complete stdout/stderr on disk under the state
 root; a replayed `job-run` with the same id and content never launches twice, and a different content

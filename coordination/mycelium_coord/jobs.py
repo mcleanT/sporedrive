@@ -86,6 +86,18 @@ def _pid_alive(pid) -> bool:
     return True
 
 
+# Supervisors this process spawned, by pid. A long-lived parent (the MCP server) must reap its own supervisor: a
+# supervisor killed before it recorded an outcome is otherwise a zombie, and kill(pid, 0) succeeds on a zombie.
+_SUPERVISORS: dict = {}
+
+
+def _supervisor_alive(pid) -> bool:
+    proc = _SUPERVISORS.get(int(pid))
+    if proc is not None:
+        return proc.poll() is None  # reaps our own child; once reaped it stays reported dead
+    return _pid_alive(pid)
+
+
 def _proc_start(pid):
     """The kernel's start time of ``pid`` as ``ps`` prints it: ownership evidence recorded at launch
     and re-read before any recovery signal, so a recycled pid is never mistaken for the owned child.
@@ -216,7 +228,7 @@ class JobManager:
         the retained attempt stays visible."""
         out = dict(st)
         sup = st.get("supervisor_pid")
-        alive = _pid_alive(sup) if sup else False
+        alive = _supervisor_alive(sup) if sup else False
         out["supervisor_alive"] = alive
         status = st.get("status")
         if status in TERMINAL:
@@ -440,6 +452,7 @@ class JobManager:
             )
         finally:
             log.close()
+        _SUPERVISORS[proc.pid] = proc
         return proc.pid
 
     # ------------------------------------------------------------------ join (bounded, in-tool)

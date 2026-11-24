@@ -26,6 +26,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -203,6 +204,26 @@ def default_out_root() -> str:
 
 def default_lock_dir() -> str:
     return os.path.join(default_out_root(), "locks")
+
+
+def store_lock_dir(store_root: str) -> str:
+    """The busy-lane directory of a coordination store. Every server and CLI on one store shares it, whatever TMPDIR
+    each host gave its process (the TMPDIR-derived ``default_lock_dir`` is only for a call made without a store)."""
+    return os.path.join(str(store_root), "consult-locks")
+
+
+def private_dir_problem(path: str):
+    """None when ``path`` is a real directory (not a symlink) owned by this user with no group/other access; else why
+    not. A call's files (packet, receipt, answer, lock) live there, so another user must not be able to swap them."""
+    try:
+        st = os.lstat(path)
+    except OSError as e:
+        return f"{path}: {e}"
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        return f"{path} is not a real directory"
+    if st.st_uid != os.getuid() or st.st_mode & 0o077:
+        return f"{path} is not private to this user (owner uid {st.st_uid}, mode {stat.S_IMODE(st.st_mode):o})"
+    return None
 
 
 def consult_dir() -> str:
@@ -1433,6 +1454,9 @@ def _run_call(
         return finish(
             "NOT_STARTED", f"cannot create out root {out_root}: {e}", _os_retryable(e)
         )
+    why = private_dir_problem(out_root)
+    if why:
+        return finish("NOT_STARTED", f"out root not private: {why}", False)
     call_dir = os.path.join(out_root, call_id)
     try:
         os.mkdir(
@@ -1515,7 +1539,7 @@ def _run_call(
         _write_atomic(os.path.join(call_dir, "packet.json"), blob.decode("utf-8"))
         _write_atomic(os.path.join(call_dir, "prompt.txt"), prompt)
         lock = CallLock(
-            lock_dir or default_lock_dir(),
+            lock_dir or (store_lock_dir(store_root) if store_root else default_lock_dir()),
             caller or ("uid%d" % os.getuid()),
             target,
             call_id,
@@ -2046,6 +2070,9 @@ def _stage_packet(out_root: str, call_id: str, blob: bytes) -> str:
     different bytes is consult_call_id_conflict (a call id is never re-aimed)."""
     d = os.path.join(out_root, PACKET_STAGE_DIR)
     os.makedirs(d, mode=0o700, exist_ok=True)
+    why = private_dir_problem(d)
+    if why:
+        raise OSError(errno.EPERM, f"out root not private: {why}")
     p = os.path.join(d, call_id + ".json")
     try:
         fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
@@ -2099,10 +2126,11 @@ def start_call(
     if target not in TARGETS:
         return _start_refused("NOT_STARTED", f"argument: unknown target {target!r}", None)
     if (not isinstance(call_id, str) or not valid_id(call_id) or len(call_id) > _CALL_ID_MAX
-            or call_id in (".", "..")):
+            or call_id in (".", "..") or call_id.startswith("-")):
         return _start_refused(
             "NOT_STARTED",
-            f"argument: invalid call_id {call_id!r} ([A-Za-z0-9._:-], 1-{_CALL_ID_MAX} characters, not . or ..)",
+            f"argument: invalid call_id {call_id!r} ([A-Za-z0-9._:-], 1-{_CALL_ID_MAX} characters, not . or .., "
+            "not starting with -)",
             None,
         )
     post = post or {}
@@ -2149,6 +2177,10 @@ def start_call(
         os.makedirs(out_root, mode=0o700, exist_ok=True)
     except OSError as e:
         return _start_refused("NOT_STARTED", f"cannot create out root {out_root}: {e}", call_id, _os_retryable(e))
+    for d in (out_root, os.path.join(out_root, PACKET_STAGE_DIR)):
+        why = private_dir_problem(d) if os.path.lexists(d) else None
+        if why:
+            return _start_refused("NOT_STARTED", f"out root not private: {why}", call_id)
     job_id = CALL_JOB_PREFIX + call_id
     if _call_dir_taken(jm, out_root, call_id):
         raise ProtocolError(

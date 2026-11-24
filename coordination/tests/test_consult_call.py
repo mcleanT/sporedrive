@@ -405,8 +405,9 @@ def test_prompt_is_a_deterministic_rendering_of_packet_fields_only(world):
 
 
 def test_existing_call_directory_is_refused_and_left_alone(world):
+    (world / "out").mkdir(mode=0o700)  # a private out root (one open to group/other is refused before this check)
     d = world / "out" / "mine"
-    d.mkdir(parents=True)
+    d.mkdir()
     (d / "keep.txt").write_text("keep")
     rec = call(world, call_id="mine")
     assert (
@@ -3240,7 +3241,8 @@ def test_t4b_advisory_core_gate_refuses_before_anything_is_created(mw, monkeypat
 
 
 def test_t4c_the_fixed_argv_run_with_the_advisory_env_is_refused_by_the_cli(mw):
-    os.makedirs(os.path.join(mw.out_root, "packets"), mode=0o700)
+    os.makedirs(mw.out_root, mode=0o700)  # makedirs gives intermediate directories the umask's mode, not 0o700
+    os.mkdir(os.path.join(mw.out_root, "packets"), mode=0o700)
     pk = os.path.join(mw.out_root, "packets", "t4c.json")
     Path(pk).write_text(json.dumps(make_packet(mw.w)))
     argv = consult.dispatch_argv("claude", pk, mw.out_root, "t4c", mw.jm.store.root)
@@ -3289,7 +3291,7 @@ def test_t6_job_deadline_has_the_margin_and_a_call_near_its_deadline_answers(mw)
 
 
 def test_t7_busy_lane_is_refused_retryable_and_controls_proceed(mw):
-    held = consult.CallLock(consult.default_lock_dir(), "uid%d" % os.getuid(), "claude", "other-call")
+    held = consult.CallLock(consult.store_lock_dir(mw.jm.store.root), "uid%d" % os.getuid(), "claude", "other-call")
     held.acquire()
     try:
         r = _start(mw, "t7a")
@@ -3512,7 +3514,7 @@ def test_t17_an_mcp_started_target_gets_only_the_allowlisted_environment(mw, mon
     assert "FOO_TOKEN" not in dumped and dumped[consult.COORD_DIR_ENV] == os.path.join(res["call_dir"], "coord")
 
 
-@pytest.mark.parametrize("cid", ["..", "x" * 113])
+@pytest.mark.parametrize("cid", ["..", "x" * 113, "-x", "--host"])
 def test_t19_an_invalid_call_id_is_not_started_and_creates_nothing(mw, cid):
     r = _start(mw, cid)
     assert r["outcome"] == "NOT_STARTED" and r["reason"].startswith("argument: invalid call_id"), r
@@ -3575,3 +3577,63 @@ def test_t23_answered_on_stdout_without_a_receipt_is_never_an_outcome(mw):
     r = _tool("consult_result", {"call_id": "t23"})
     assert r["state"] == "ended_without_receipt" and r["outcome"] is None and r["usable"] is False
     assert "without a receipt" in r["reason"]
+
+
+# ------------------------------------------------------------------ review round 2 (F1, F2, F3, F5)
+def test_f1_the_busy_lane_does_not_depend_on_the_servers_tmpdir(mw, monkeypatch):
+    mw.set_mode("hang")
+    pkt = make_packet(mw.w)
+    pkt["limits"]["deadline_s"] = 60
+    _start(mw, "f1a", pkt)
+    _wait_started(mw.w)
+    other = mw.w / "tmp2"
+    other.mkdir()
+    monkeypatch.setenv("TMPDIR", str(other))  # a second host's server: same store, another TMPDIR
+    monkeypatch.setattr(tempfile, "tempdir", str(other))
+    r = _start(mw, "f1b", pkt)
+    res = r if r["state"] == "ended" else _tool("consult_result", {"call_id": "f1b", "wait_s": 25})
+    assert res["outcome"] == "REFUSED" and res["retryable"] is True and res["reason"].startswith("busy"), res
+
+
+@pytest.mark.parametrize("case", ["open_mode", "symlink", "open_packets"])
+def test_f2_an_out_root_not_private_to_this_user_is_not_started_and_nothing_launches(mw, case):
+    root = Path(mw.out_root)
+    if case == "symlink":
+        real = mw.w / "private_elsewhere"
+        real.mkdir(mode=0o700)
+        root.symlink_to(real)
+    else:
+        root.mkdir(mode=0o700)
+        if case == "open_mode":
+            root.chmod(0o777)
+        else:
+            (root / consult.PACKET_STAGE_DIR).mkdir()
+            (root / consult.PACKET_STAGE_DIR).chmod(0o777)
+    r = _start(mw, "f2")
+    assert r["outcome"] == "NOT_STARTED" and r["job_id"] is None and "private" in r["reason"], r
+    assert _jobs(mw.w) == [] and not list(Path(os.path.realpath(root)).glob("packets/*"))
+
+
+def test_f2_cli_route_refuses_an_out_root_open_to_other_users(world):
+    out = world / "out"
+    out.mkdir()
+    out.chmod(0o777)
+    rec = call(world)
+    assert rec["outcome"] == "NOT_STARTED" and "private" in rec["reason"], rec
+    assert os.listdir(out) == []
+
+
+def test_f3_a_supervisor_killed_under_a_live_server_is_never_running_forever(mw):
+    mw.set_mode("hang")
+    pkt = make_packet(mw.w)
+    pkt["limits"]["deadline_s"] = 60
+    _start(mw, "f3", pkt)
+    _wait_started(mw.w)
+    os.kill(mw.jm.read_status("consult-f3")["supervisor_pid"], signal.SIGKILL)  # this process is its parent
+    res = None
+    for _ in range(50):
+        res = consult.call_result(mw.jm, "f3")
+        if res["state"] != "running":
+            break
+        time.sleep(0.1)
+    assert res["state"] == "ended_without_receipt" and res["job_status"] == "unknown" and res["usable"] is False, res
