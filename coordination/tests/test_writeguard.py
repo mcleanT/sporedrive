@@ -224,7 +224,7 @@ def test_signature_rules_agy(env):
     assert is_deny("antigravity", pre(f))
     # (b) read, unchanged -> allow
     post("read_file", f)
-    assert pre(f) == {"decision": "allow"}
+    assert pre(f) is None
     # (c) another writer appends -> deny, file untouched
     f.write_text("one\nEXTERNAL-LINE\n")
     out = pre(f)
@@ -236,13 +236,13 @@ def test_signature_rules_agy(env):
     assert f.read_text() == "one\nEXTERNAL-LINE\n"
     # re-read, then allowed
     post("read_file", f)
-    assert pre(f) == {"decision": "allow"}
+    assert pre(f) is None
     # (d) new file allowed; own write then rewrite allowed
     nf = proj / "new.txt"
-    assert pre(nf) == {"decision": "allow"}
+    assert pre(nf) is None
     nf.write_text("mine")
     post("write_file", nf)
-    assert pre(nf) == {"decision": "allow"}
+    assert pre(nf) is None
     # failed post (error set) records nothing
     g = proj / "g.txt"
     g.write_text("g")
@@ -265,8 +265,7 @@ def test_other_session_does_not_share_record(env):
             "pre",
             agy("PreToolUse", "write_file", f, proj, cid="A"),
             state,
-        )["decision"]
-        == "allow"
+        ) is None
     )
     assert is_deny(
         "antigravity",
@@ -286,10 +285,7 @@ def test_same_content_new_mtime_is_still_fresh(env):
     run_hook("antigravity", "post", agy("PostToolUse", "read_file", f, proj), state)
     os.utime(f, ns=(1, 1))  # touch only
     assert (
-        run_hook("antigravity", "pre", agy("PreToolUse", "write_file", f, proj), state)[
-            "decision"
-        ]
-        == "allow"
+        run_hook("antigravity", "pre", agy("PreToolUse", "write_file", f, proj), state) is None
     )
 
 
@@ -474,9 +470,9 @@ def test_modes(env):
     f.write_text("x")
     p = agy("PreToolUse", "write_file", f, proj)
     off = run_hook("antigravity", "pre", p, state, {"MYCELIUM_WRITE_GUARD": "off"})
-    assert off == {"decision": "allow"}
+    assert off is None
     warn = run_hook("antigravity", "pre", p, state, {"MYCELIUM_WRITE_GUARD": "warn"})
-    assert warn == {"decision": "allow"}
+    assert warn is None
     assert '"would_deny"' in (state / "events.log").read_text()
     cw = run_hook(
         "codex",
@@ -516,7 +512,7 @@ def test_fail_open_on_injected_exception(env, monkeypatch, capsys):
 
     monkeypatch.setattr(wg, "handle", boom)
     for host, expect in [
-        ("antigravity", {"decision": "allow"}),
+        ("antigravity", None),
         ("claude", None),
         ("codex", None),
     ]:
@@ -550,14 +546,14 @@ def test_fail_open_on_garbage_and_missing_fields(env):
         text=True,
         env=dict(os.environ, MYCELIUM_WRITE_GUARD_DIR=str(state)),
     )
-    assert p.returncode == 0 and json.loads(p.stdout) == {"decision": "allow"}
+    assert p.returncode == 0 and p.stdout.strip() == ""  # agy allow = empty stdout
     assert (state / "errors.log").exists()
     assert run_hook(
         "antigravity",
         "pre",
         {"hookEventName": "PreToolUse", "toolCall": {"name": "write_file", "args": {}}},
         state,
-    ) == {"decision": "allow"}
+    ) is None
 
 
 def test_post_output_shapes(env):
@@ -661,7 +657,7 @@ def test_shell_overwrite_warns_never_denies(env):
         "hookEventName": "PreToolUse",
         "toolCall": {"name": "run_command", "args": {"CommandLine": "echo q > f.txt"}},
     }
-    assert run_hook("antigravity", "pre", a, state) == {"decision": "allow"}
+    assert run_hook("antigravity", "pre", a, state) is None
 
 
 def test_shell_overwrite_records_own_write(env):
@@ -842,7 +838,7 @@ def test_unwritable_store_regular_file_allows(env, tmp_path):
     blocker = tmp_path / "blocker"
     blocker.write_text("not a dir")
     out = run_hook("antigravity", "pre", _existing_unread(proj), blocker)
-    assert out == {"decision": "allow"}
+    assert out is None
     cp = codex("PreToolUse", "*** Begin Patch\n*** Add File: f.txt\n+x\n*** End Patch", proj)
     (proj / "f.txt").write_text("one")
     out = run_hook("codex", "pre", cp, blocker)
@@ -859,7 +855,7 @@ def test_unwritable_store_readonly_dir_allows(env, tmp_path):
     ro.chmod(0o500)
     try:
         out = run_hook("antigravity", "pre", _existing_unread(proj), ro)
-        assert out == {"decision": "allow"}
+        assert out is None
         # post-path failure never raises (run_hook asserts exit code 0)
         run_hook("antigravity", "post", dict(_existing_unread(proj), hookEventName="PostToolUse",
                  toolCall={"name": "read_file", "args": {"Path": str(proj / "f.txt")}}), ro)
@@ -1779,3 +1775,87 @@ def test_templates_register_a_pre_hook_for_the_shell_tool(name, shell_tool, host
             for g in group
         )
     assert any("--event pre" in h["command"] for g in pre for h in g["hooks"])
+
+
+# ----------------------------------------------------------------------------- Mycelium compatibility (2026-11-24)
+
+
+def test_compat_agy_pre_allow_is_empty_stdout_never_braces_or_allow(env):
+    """agy reads {} on PreToolUse as a deny and {"decision":"allow"} as an auto-approval (live probe
+    2026-11-24); every allowing Pre path must print nothing at all."""
+    proj, state = env
+    f = proj / "f.txt"
+    f.write_text("one\n")
+    raw = []
+
+    def pre_raw(payload, extra=None, st=state):
+        e = dict(os.environ, MYCELIUM_WRITE_GUARD_DIR=str(st))
+        e.pop("MYCELIUM_WRITE_GUARD", None)
+        e.update(extra or {})
+        p = subprocess.run(
+            [sys.executable, str(SCRIPT), "hook", "--host", "antigravity", "--event", "pre"],
+            input=payload if isinstance(payload, str) else json.dumps(payload),
+            capture_output=True, text=True, env=e, timeout=30,
+        )
+        assert p.returncode == 0, p.stderr
+        raw.append(p.stdout)
+        return p.stdout
+
+    run_hook("antigravity", "post", agy("PostToolUse", "read_file", f, proj), state)
+    assert pre_raw(agy("PreToolUse", "write_file", f, proj)) == ""  # read, unchanged
+    assert pre_raw(agy("PreToolUse", "write_file", proj / "new.txt", proj)) == ""  # new file
+    assert pre_raw(agy("PreToolUse", "run_command", proj, proj, CommandLine="printf x > f.txt")) == ""
+    f.write_text("EXTERNAL\n")
+    unread = agy("PreToolUse", "write_file", f, proj)
+    assert pre_raw(unread, {"MYCELIUM_WRITE_GUARD": "off"}) == ""
+    assert pre_raw(unread, {"MYCELIUM_WRITE_GUARD": "warn"}) == ""
+    assert pre_raw("not json{") == ""  # fail-open path
+    blocker = state.parent / "blocker"
+    blocker.write_text("not a dir")
+    assert pre_raw(unread, st=blocker) == ""  # store unusable
+    # the deny path is unchanged
+    assert is_deny("antigravity", json.loads(pre_raw(unread)))
+    assert not any(o.strip() in ("{}",) or '"allow"' in o for o in raw)
+
+
+def test_compat_agy_post_still_prints_braces(env):
+    proj, state = env
+    f = proj / "f.txt"
+    f.write_text("x")
+    assert run_hook("antigravity", "post", agy("PostToolUse", "read_file", f, proj), state) == {}
+
+
+def test_compat_agy_ide_tool_names_are_guarded(env):
+    """Antigravity IDE names: view_file (AbsolutePath) reads, write_to_file (TargetFile) whole-file writes."""
+    proj, state = env
+    f = proj / "a.py"
+    f.write_text("one\n")
+
+    def ide(ev, name, key, path):
+        return {"conversationId": "conv-ide", "cwd": str(proj), "hookEventName": ev, "error": "",
+                "toolCall": {"name": name, "args": {key: str(path)}, "id": "x"}}
+
+    w = ide("PreToolUse", "write_to_file", "TargetFile", f)
+    assert is_deny("antigravity", run_hook("antigravity", "pre", w, state))  # never viewed
+    run_hook("antigravity", "post", ide("PostToolUse", "view_file", "AbsolutePath", f), state)
+    assert run_hook("antigravity", "pre", w, state) is None  # viewed, unchanged
+    f.write_text("one\nEXTERNAL\n")
+    assert is_deny("antigravity", run_hook("antigravity", "pre", w, state))  # changed since
+    new = ide("PreToolUse", "write_to_file", "TargetFile", proj / "b.py")
+    assert run_hook("antigravity", "pre", new, state) is None  # a new file is never refused
+
+
+@pytest.mark.parametrize("stamp", [".last-run", ".last-audit"])
+def test_compat_housekeeping_stamp_overwrite_does_not_warn(env, stamp):
+    proj, state = env
+    d = proj / ".living" / "outputs" / "knowledge-transfers"
+    d.mkdir(parents=True)
+    s = d / stamp
+    s.write_text("2026-11-01\n")  # exists, never read by this session
+    cmd = "date -u +%%F > .living/outputs/knowledge-transfers/%s" % stamp
+    assert run_hook("codex", "pre", codex_bash("PreToolUse", cmd, proj), state) is None
+    # control: the same overwrite of an ordinary unread file still warns
+    o = proj / "notes.txt"
+    o.write_text("old\n")
+    out = run_hook("codex", "pre", codex_bash("PreToolUse", "date -u +%F > notes.txt", proj), state)
+    assert "not enforced for shell" in out["hookSpecificOutput"]["additionalContext"]

@@ -24,9 +24,17 @@
 **Deny output per host (all verified to block, and the model sees the reason):**
 - Claude: stdout `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":R}}`.
 - Codex: the same JSON, which works on apply_patch.
-- agy: stdout `{"decision":"deny","reason":R}`; allow is `{"decision":"allow"}`.
+- agy: stdout `{"decision":"deny","reason":R}`; allow is EMPTY stdout on PreToolUse (`{}` on PostToolUse).
+  Live probe 2026-11-24 (agy 1.5.x, ACP and `-p`, scratch workspaces, host config unchanged): a PreToolUse hook that
+  prints `{}` BLOCKS the call ("denied by pre-tool hook") on both routes; one that prints nothing leaves agy's own
+  permission flow in place (the write landed after an approval on ACP and directly on `-p`). agy documents
+  `{"decision":"allow"}` as "Automatically allow the tool execution", i.e. a grant, which the guard must never make
+  (Mycelium's own agy adapter installs no PreToolUse handler for the same reason). On ACP an allow still reached the
+  permission prompt; the IDE/App were not probed.
 
-**agy is FAIL-CLOSED** (verified). A hook that exits non-zero, prints non-JSON or times out (default 30 s) blocks the tool call.
+**agy is FAIL-CLOSED.** Verified 2026-11-24 on `-p`: a hook whose interpreter is missing exits 127 and the matched
+tool call is blocked. The template therefore matches only the tools the guard handles. Non-JSON output and timeouts
+were not probed separately; treat them as blocking.
 
 ## Behaviour
 - **Signature** of a path: `(size, mtime_ns, sha256)`. sha256 is computed only when size ≤ 16 MiB; otherwise it is `None` and size+mtime_ns are compared. Paths are keyed by `os.path.realpath`. For a path that does not exist yet, resolve the realpath of its parent and append the basename. Relative paths resolve against the payload cwd.
@@ -67,8 +75,8 @@
 Registration templates are NOT installed:
 - `docs/triangle/proposed/writeguard-hooks/claude-settings-hooks.json`: PreToolUse matcher `Bash` (warn, and the Round 5 PRE snapshot); PostToolUse matcher `Bash|Read|Write|Edit|MultiEdit` (record).
 - `.../codex-hooks.json`: PreToolUse matcher `apply_patch|Bash`; PostToolUse matcher `apply_patch|Bash` (needs trust).
-- `.../antigravity-hooks.json`: PreToolUse matcher `*` and PostToolUse matcher `*` (top-level `writeguard` group; the script ignores tools it does not care about).
-- Every template registers a PRE hook for the host's shell tool (Claude `Bash`, Codex `Bash`, agy `run_command` via `*`). Since Round 5 this is load-bearing: the deny, `cat`, retry unlock only works because the PRE hook snapshots the file before the `cat` runs. A test (`test_templates_register_a_pre_hook_for_the_shell_tool`) reads the three templates and checks it.
+- `.../antigravity-hooks.json`: PreToolUse and PostToolUse matcher `read_file|view_file|write_file|write_to_file|edit_file|replace_file_content|multi_replace_file_content|run_command` (top-level `writeguard` group). Narrowed from `*` on 2026-11-24: agy blocks a call when a hook cannot run, so a broken interpreter under `*` would block every tool.
+- Every template registers a PRE hook for the host's shell tool (Claude `Bash`, Codex `Bash`, agy `run_command`). Since Round 5 this is load-bearing: the deny, `cat`, retry unlock only works because the PRE hook snapshots the file before the `cat` runs. A test (`test_templates_register_a_pre_hook_for_the_shell_tool`) reads the three templates and checks it.
 
 ## Acceptance (checked by file content)
 1. **Unit tests on Betty:**
@@ -165,3 +173,38 @@ Why: in Rounds 1 to 4 a shell read was recorded at POST with the file's signatur
 - **Hook host list.** `writeguard.HOSTS` stays a copy (the script is standalone); a test asserts it equals `model.HOST_KINDS` (F14).
 - **Oracle.** `test_writeguard_oracle.py` still drives `shell_effects` directly (`WG_ORACLE ...`; its coverage floor of 0.15 is unchanged). A new hook-level test drives the real hook: PRE, a real shell, POST (`WG_ORACLE_HOOK ...`). Session S1 is posted at once (control: reads must be credited), session S2 after every file was rewritten by "another session" (no read may be credited).
 - Betty results: see docs/triangle/evidence/betty/review-repair-full-suite.txt and BUILD.md.
+
+## Running alongside Mycelium (compat pass, 2026-11-24)
+Scope: every Mycelium function on Claude Code, Codex and Antigravity, checked against Mycelium main 0.9.7 and the
+hook registrations of the 0.9.3 to 0.9.6 builds. That covers all 11 skills, every hook script, and every helper script
+and tool. Scripts that write no shared file were checked by a scan of their write sites rather than read in full. Coordination tools are covered by the
+advisory allowlist, which refuses any tool not on it.
+
+Fixed in this pass:
+- agy PreToolUse allow is empty stdout. `{}` denies and `{"decision":"allow"}` grants (see "Verified host facts").
+- The guard knows the agy IDE tool names `view_file` and `write_to_file` (offline-tested only).
+- Mycelium's stamp files `.last-run` and `.last-audit` no longer raise the shell-overwrite warning.
+- `export_coordination.py` refuses the canonical core-overlay on any Mycelium other than 0.6.0, because the overlay
+  replaces whole core hook files written for 0.6.0.
+- The Codex template says to append hook groups, because Codex keys hook trust by group position.
+
+Why Mycelium and the guard do not fight:
+- Mycelium mostly appends, and the guard never refuses an append.
+- Mycelium's shared registries and indexes are rewritten by its own locked scripts, not by agent tool calls, so the guard
+  never sees them.
+- The handoff and the optional knowledge-audit `INDEX.md` are whole-file writes by the agent. The guard can deny one of
+  them once, and a re-read clears it. No loop was found.
+- Mycelium's hooks emit no permission decisions, and the guard's state lives outside every repository.
+
+Known limits (not fixable inside sporedrive):
+- **Codex with Mycelium 0.9.7 or later.** 0.9.7 adds an io-observer PreToolUse on `apply_patch`. When the guard denies
+  that call, no PostToolUse runs, so Mycelium's observation interval stays open for up to 24 h. Later file-change records
+  in that repository are then attributed "shared" instead of "sole". The changes are still recorded, and Mycelium already
+  accepts this for any denied Codex call. Builds before 0.9.7 do not observe `apply_patch` before the call. Not tested:
+  whether Codex runs Mycelium's PreToolUse at all when another hook denies.
+- **Mycelium's own cross-session races** (pre-existing, Mycelium repository). Concurrent SessionStarts can dispatch the
+  knowledge audit and transfer twice. Manually run scripts rewrite files without a lock: `init_repo`, `init_knowledge`,
+  `install_convention`, `migrate_existing_repos`, `sync_html_report`, `check_linter_versions --record` and the
+  knowledge-map build.
+- **Not live-tested:** the agy IDE and App routes, the Claude `Bash` guard hook, and Codex hook ordering when one hook
+  denies.

@@ -1,11 +1,27 @@
 {
   "writeguard": {
-    "_comment": "PROPOSED, NOT INSTALLED. Workspace-level <workspace>/.agents/hooks.json (shape verified to fire in M2 probes; matcher '*' verified, the script ignores tools it does not care about). agy is FAIL-CLOSED: the interpreter path must be absolute and exist, or matched tool calls are blocked. Replace <ABS_PYTHON> and <ABS_PATH_TO>.",
+    "_comment": "PROPOSED, NOT INSTALLED. Workspace-level <workspace>/.agents/hooks.json, under its own key so it never replaces Mycelium's plugin hooks. agy is FAIL-CLOSED (verified 2026-11-24, agy 1.5.x -p: a hook whose interpreter is missing exits 127 and the matched tool call is blocked), so the matchers name only the tools the guard handles: a broken install then blocks file reads/writes and run_command, not every tool. The guard prints NOTHING on an allowed PreToolUse (agy reads {} as a deny and {\"decision\":\"allow\"} as an auto-approval), so agy's own permission prompts are unchanged. Hook timeouts were not probed. Replace <ABS_PYTHON> and <ABS_PATH_TO> with absolute paths that exist.",
     "PreToolUse": [
-      {"matcher": "*", "hooks": [{"command": "<ABS_PYTHON> <ABS_PATH_TO>/writeguard.py hook --host antigravity --event pre", "timeout": 10}]}
+      {
+        "matcher": "read_file|view_file|write_file|write_to_file|edit_file|replace_file_content|multi_replace_file_content|run_command",
+        "hooks": [
+          {
+            "command": "<ABS_PYTHON> <ABS_PATH_TO>/writeguard.py hook --host antigravity --event pre",
+            "timeout": 10
+          }
+        ]
+      }
     ],
     "PostToolUse": [
-      {"matcher": "*", "hooks": [{"command": "<ABS_PYTHON> <ABS_PATH_TO>/writeguard.py hook --host antigravity --event post", "timeout": 10}]}
+      {
+        "matcher": "read_file|view_file|write_file|write_to_file|edit_file|replace_file_content|multi_replace_file_content|run_command",
+        "hooks": [
+          {
+            "command": "<ABS_PYTHON> <ABS_PATH_TO>/writeguard.py hook --host antigravity --event post",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }

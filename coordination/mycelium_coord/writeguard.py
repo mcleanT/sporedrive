@@ -1029,9 +1029,11 @@ def classify(host: str, payload: dict):
         tool = tc.get("name") or ""
         a = tc.get("args") or {}
         p = a.get("Path") or a.get("TargetFile") or a.get("AbsolutePath")
-        if tool == "read_file":
+        # CLI/App names first, then the IDE names (view_file/AbsolutePath, write_to_file/TargetFile), which
+        # Mycelium's Antigravity IDE adapter uses (offline-tested only; not yet seen live through this guard).
+        if tool in ("read_file", "view_file"):
             return {"kind": "read", "tool": tool, "paths": [p] if p else []}
-        if tool == "write_file":
+        if tool in ("write_file", "write_to_file"):
             return {"kind": "overwrite", "tool": tool, "paths": [p] if p else []}
         if tool in ("edit_file", "replace_file_content", "multi_replace_file_content"):
             return {"kind": "write", "tool": tool, "paths": [p] if p else []}
@@ -1044,9 +1046,19 @@ def classify(host: str, payload: dict):
 # --------------------------------------------------------------------------- output formats
 
 
+# Mycelium's housekeeping timestamp stamps (knowledge audit, knowledge transfer). Agents overwrite them with
+# `date ... > .last-run` by design and the newest stamp is the right one, so the shell-overwrite warning skips them.
+HOUSEKEEPING_STAMPS = frozenset({".last-audit", ".last-run"})
+
+
 def allow_out(host: str, event: str, context: str | None = None):
     if host == "antigravity":
-        return {"decision": "allow"} if event == "pre" else {}
+        # PreToolUse: print NOTHING. agy reads {"decision": "allow"} as an auto-approval that may skip
+        # its permission prompt, and reads a bare {} as a DENY (both verified 2026-11-24 on agy 1.5.x,
+        # ACP and -p; see docs/triangle/WRITE_GUARD_SPEC.md). Empty stdout leaves agy's own
+        # permission flow unchanged, so the guard only ever blocks and never grants.
+        # PostToolUse expects {}.
+        return None if event == "pre" else {}
     if context:
         name = "PreToolUse" if event == "pre" else "PostToolUse"
         return {
@@ -1188,6 +1200,8 @@ def handle(host: str, event: str, payload: dict, md: str):
             stale = []
             for k, p in shell_overwrites(c["command"]):
                 real = resolve(p, cwd)
+                if os.path.basename(real) in HOUSEKEEPING_STAMPS:
+                    continue  # last-writer-wins timestamp stamps; warning on them is noise
                 if os.path.isfile(real) and is_stale(host, sid, real):
                     stale.append(real)
             if stale:
@@ -1391,7 +1405,7 @@ def cmd_selftest(argv) -> int:
             failures.append("unread overwrite not denied: %s" % o)
         run("antigravity", "post", agy("PostToolUse", "read_file", target))
         o = run("antigravity", "pre", agy("PreToolUse", "write_file", target))
-        if '"allow"' not in o:
+        if o.strip():  # agy allow = empty stdout
             failures.append("read-then-overwrite not allowed: %s" % o)
         with open(target, "a") as f:
             f.write("two\n")
@@ -1403,7 +1417,7 @@ def cmd_selftest(argv) -> int:
             "pre",
             agy("PreToolUse", "write_file", os.path.join(d, "new.txt")),
         )
-        if '"allow"' not in o:
+        if o.strip():
             failures.append("new file not allowed: %s" % o)
         patch = "*** Begin Patch\n*** Add File: f.txt\n+x\n*** End Patch"
         cp = {

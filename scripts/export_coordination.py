@@ -56,6 +56,11 @@ CANONICAL_BRIDGE = REPO / "bridge"  # single canonical bridge source
 # verified against this repo, with the replaced source hash recorded for provenance.
 CANONICAL_OVERLAY = REPO / "core-overlay"
 DEFAULT_SOURCE = Path.home() / "tools" / "mycelium-lifecycle-wfi"
+# The core-overlay replaces WHOLE Mycelium core hook files. It was written against Mycelium 0.6.0
+# (mycelium-lifecycle-wfi @ 12862e5, PROVENANCE.md). Applied to a newer Mycelium it would replace that
+# release's hooks with older copies (on 0.9.x: the transaction/lock helpers the other hooks call, the
+# accepted-Stop message, the handoff headings and the directory-lock reap fix). Export refuses that.
+OVERLAY_BASE_VERSIONS = frozenset({"0.6.0"})
 DEFAULT_TARGET = Path.home() / "tools" / "mycelium-integration-wfi"
 
 MCP_SERVER_NAME = "mycelium-coord"
@@ -315,6 +320,30 @@ def closure(root: Path) -> dict:
     return dict(sorted(files.items()))
 
 
+def overlay_base_problem(source: Path, overlay) -> str | None:
+    """Why the canonical core-overlay must not be applied to ``source``, or None when it may.
+    Only the repo's own overlay is checked; a custom --overlay dir is the caller's explicit choice."""
+    if overlay is None:
+        return None
+    try:
+        if Path(overlay).resolve() != CANONICAL_OVERLAY.resolve():
+            return None
+    except OSError:
+        return None
+    try:
+        version = str(_load_json(source / ".claude-plugin" / "plugin.json").get("version", ""))
+    except Exception:  # noqa: BLE001 - an unreadable manifest is an unknown version
+        version = ""
+    if version.split("+", 1)[0] in OVERLAY_BASE_VERSIONS:
+        return None
+    return (
+        f"core-overlay was written for Mycelium {', '.join(sorted(OVERLAY_BASE_VERSIONS))}, but the source "
+        f"is {version or 'of unknown version'}: applying it would replace that release's core hooks with "
+        "older copies. Pass --no-overlay (coordination does not need the overlay), or rebase core-overlay "
+        "onto this source first."
+    )
+
+
 def _overlay_files(overlay) -> set:
     if overlay is None or not Path(overlay).is_dir():
         return set()
@@ -479,6 +508,9 @@ def export(
     ):
         if not req.exists():
             sys.exit(f"required input missing: {req}")
+    refusal = overlay_base_problem(source, overlay)
+    if refusal:
+        sys.exit("overlay refused (target untouched): " + refusal)
     _guard_target(source, target, force)
 
     stage, manifests = _stage(source, target, build_id, overlay)
@@ -542,6 +574,10 @@ def verify(target: Path, source: Path, overlay=None) -> tuple[bool, list[str]]:
         if not o.is_file() or _sha256(o) != digest:
             problems.append(f"retained != source: {rel}")
     ov = overlay if overlay is not None else (Path(rec["overlay_dir"]) if rec.get("overlay_dir") else None)
+    if rec.get("overlay_from_canonical"):
+        refusal = overlay_base_problem(source, ov)
+        if refusal:
+            problems.append("overlay base: " + refusal)
     for rel, meta in rec.get("overlay_from_canonical", {}).items():
         o = Path(ov) / rel if ov is not None else None
         if o is None or not o.is_file() or _sha256(o) != meta.get("sha256"):
