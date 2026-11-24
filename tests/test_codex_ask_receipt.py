@@ -86,6 +86,23 @@ def test_success_is_complete_ok(tmp_path):
     assert receipt["final_artifact"] is not None
 
 
+@pytest.mark.parametrize("deadline", [None, "3"])
+def test_read_only_review_disables_lifecycle_hooks(tmp_path, monkeypatch, deadline):
+    argv_file = tmp_path / "argv.txt"
+    env = dict(os.environ, PATH=f"{FAKE_CODEX_DIR}:{os.environ.get('PATH', '')}",
+               FAKE_CODEX_SCENARIO="success", FAKE_CODEX_ARGV_FILE=str(argv_file),
+               CODEX_ASK_OUTDIR=str(tmp_path))
+    args = ["bash", str(WRAPPER), "-o", str(tmp_path / "result.txt")]
+    if deadline:
+        args += ["-t", deadline]
+    result = subprocess.run(args + ["Read-only fixture review"], cwd=REPO_ROOT,
+                            env=env, text=True, capture_output=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    argv = argv_file.read_text().splitlines()
+    assert argv[argv.index("--sandbox") + 1] == "read-only"
+    assert argv[argv.index("--disable") + 1] == "hooks"
+
+
 def test_models_cache_warning_with_valid_answer_is_not_a_failure(tmp_path):
     """A nonfatal models-cache warning next to a real final answer must still report complete."""
     proc, out_file, receipt = run_wrapper(tmp_path, "warning_then_answer")

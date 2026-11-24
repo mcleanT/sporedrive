@@ -235,12 +235,20 @@ fi
 # unattributed (the actual root cause of the foreign_bash neighbor).
 if [ -d "$REPO_ROOT/.living" ]; then
   PROVENANCE_BASELINE_FILE="$STATE_DIR/mycelium-provenance-baseline.json"
+  FINGERPRINT_CACHE_FILE="$STATE_DIR/mycelium-fingerprint-cache.json"
   if [ ! -f "$PROVENANCE_BASELINE_FILE" ]; then
     SESSION_CHANGES_SCRIPT_PROV="${MYCELIUM_SESSION_CHANGES_HELPER:-$HERE/../scripts/session_file_changes.py}"
     if [ -f "$SESSION_CHANGES_SCRIPT_PROV" ]; then
+      # Rebuild a FRESH shared baseline (legacy schema, readable by preserved old
+      # runtimes; a fresh per-session ownership diff basis) but REUSE the private
+      # fingerprint cache carried over from a prior accepted Stop so an unchanged
+      # large tree is not re-hashed (seq93). --prior reads the cache for the
+      # re-hash short-circuit; --cache refreshes it. Both ignored when absent.
       python3 "$SESSION_CHANGES_SCRIPT_PROV" snapshot \
         --repo-root "$REPO_ROOT" \
-        --output "$PROVENANCE_BASELINE_FILE" >/dev/null 2>&1 \
+        --output "$PROVENANCE_BASELINE_FILE" \
+        --prior "$FINGERPRINT_CACHE_FILE" \
+        --cache "$FINGERPRINT_CACHE_FILE" >/dev/null 2>&1 \
         || rm -f "$PROVENANCE_BASELINE_FILE"
     fi
   fi
@@ -475,9 +483,13 @@ LOG_EOF
     SESSION_CHANGES_SCRIPT="${MYCELIUM_SESSION_CHANGES_HELPER:-$HERE/../scripts/session_file_changes.py}"
     SESSION_BASELINE_FILE="$STATE_DIR/session-file-baseline.json"
     if [ -f "$SESSION_CHANGES_SCRIPT" ]; then
+      # Reuse the private fingerprint cache (established/refreshed above, warm)
+      # so building this SessionStart baseline over a large clean tree does not
+      # re-hash it. --prior is ignored gracefully if the cache is absent.
       python3 "$SESSION_CHANGES_SCRIPT" snapshot \
         --repo-root "$REPO_ROOT" \
-        --output "$SESSION_BASELINE_FILE" >/dev/null 2>&1 \
+        --output "$SESSION_BASELINE_FILE" \
+        --prior "$STATE_DIR/mycelium-fingerprint-cache.json" >/dev/null 2>&1 \
         || rm -f "$SESSION_BASELINE_FILE"
     fi
   fi

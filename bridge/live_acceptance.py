@@ -1252,9 +1252,32 @@ class Runner:
             f"--add-dir {d}"
             for d in dict.fromkeys([str(tasks_dir), os.path.realpath(tasks_dir)])
         )
+        # Optional, default-preserving overrides (an early-integration dev smoke needs the disposable
+        # executor to run the changed coordination CLI, which the read-only inspect allowlist forbids).
+        # Unset -> byte-identical to the historical launch: acceptEdits + the inspect-only allowlist.
+        perm = getattr(self.a, "permission_mode", "acceptEdits")
+        extra_add = tuple(getattr(self.a, "extra_add_dirs", ()) or ())
+        if extra_add:
+            add_dir_flags = (
+                add_dir_flags
+                + " "
+                + " ".join(
+                    f"--add-dir {d}"
+                    for d in dict.fromkeys(
+                        [
+                            p
+                            for d in extra_add
+                            for p in (str(d), os.path.realpath(str(d)))
+                        ]
+                    )
+                )
+            )
+        allow_flag = (
+            "" if perm == "bypassPermissions" else f"--allowedTools '{bash_allow}' "
+        )
         cmd = (
-            f"claude --model {self.a.model} --permission-mode acceptEdits "
-            f"--allowedTools '{bash_allow}' {add_dir_flags} "
+            f"claude --model {self.a.model} --permission-mode {perm} "
+            f"{allow_flag}{add_dir_flags} "
             f"--disallowedTools Agent Workflow --session-id {self.session_uuid} "
             f"--settings {ev_dir / 'settings.json'}\n"
         )

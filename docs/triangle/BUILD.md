@@ -440,8 +440,23 @@ Probe evidence: evidence/m2-probes.json (Claude 6 runs, Codex 6, agy 5).
   first, then the post. 5 tests: 5 fail with the fixes reverted, 5 pass with them (Betty).
 - Live link r6 on the final code: headless Codex confirm accepted (24.1 s), rebind → link stale on disk immediately, linked send
   refused, one `link_stale` audit entry.
-- Full suite on the final tree: BETTY_RESULT
+- Full suite on the final pre-merge tree (f2376fc): 1061 passed, 3 skipped, 0 failed (evidence/betty/two-modes-verifyfix-full-suite.txt).
 - Known flaky (pre-existing, untouched code): `test_jobs.py::test_join_stops_on_paused_execution_and_on_stop_policy_is_honored`
-  failed once ('launched' read before the supervisor recorded 'running'); passed in the runs before and after.
+  failed once ('launched' read before the supervisor recorded 'running'); it passed in the full run before it and in the
+  f2376fc full run.
 - Evidence hygiene: leak scan over all 1,000 evidence files found 0 capability-shaped strings; three older raw Claude stream
   logs (signature fields) were removed.
+
+## [2026-11-24] Merge of origin/main into the triangle — owner: "we should open PRs to the project and merge if ready"
+- origin/main had 6 commits past our base 91546b3 (model-routed supervision, session status, `sd:` handles, Codex desktop
+  idle-wake `wake-peer`, public README). Textual conflicts in cli.py, coord.py, mcp_server.py were add/add: both sides kept.
+- Invariant check: participant records are still written only by attach/detach, so link staleness and the Codex launch-lock
+  pin check still cover every participant change.
+- main's new entry points were classified. Reads (`capability`, `handle-resolve`, `status-read`, `boundary-inbox`) are
+  unchanged. Writes/wakes got the triangle's advisory gate in the core (the MCP allowlist already hid them from advisory
+  processes): `wake_peer` and `mint_handle` are authority ops; `publish_session_status` in an advisory process is allowed only
+  for an observer that the same process attached (send capability). Host hooks are not advisory and keep publishing status
+  without the capability (they run outside the session process), so on a send-capability task a non-advisory process can
+  still publish status for any participant: status is an observation, not a message (known limit).
+- Tests: 3 added + the MCP hidden-tool list extended; with the guards removed 2 fail, with them 4 pass (Betty).
+

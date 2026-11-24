@@ -116,9 +116,59 @@ def test_mcp_advisory_tool_list_and_refusal(tmp_path):
     adv = json.loads(subprocess.run([sys.executable, "-c", code], env=env, text=True,
                                     capture_output=True, timeout=120, check=True).stdout)
     for n in ("execution_open", "execution_unpause", "execution_change_limits",
-              "execution_owner_request", "coord_notify_via_bridge", "coord_wake"):
+              "execution_owner_request", "coord_notify_via_bridge", "coord_wake",
+              # main's entry points that write or wake (merge of origin/main into the triangle)
+              "coord_wake_peer", "coord_handle_mint", "coord_session_status_publish"):
         assert n not in adv["names"], n
     assert "coord_send" in adv["names"] and "execution_read" in adv["names"]
+
+
+# ---------------------------------------------------------------- 1b. main's new entry points (merge)
+def test_merge_advisory_refuses_wake_peer_and_handle_mint_in_core(tmp_path, monkeypatch):
+    from mycelium_coord import codex_wake_link
+
+    co = _co(tmp_path)
+    _send(co, "m1", "sup", to="ex")
+    monkeypatch.setenv(ADV, "1")
+    for call in (lambda: codex_wake_link.wake_peer(co, task_id="t", message_id="m1"),
+                 lambda: co.mint_handle("t", "m1", "ex", 1)):
+        with pytest.raises(ProtocolError) as e:
+            call()
+        assert e.value.code == "advisory_process_refused"
+    monkeypatch.delenv(ADV)
+    assert co.mint_handle("t", "m1", "ex", 1)  # a non-advisory process is unaffected
+    with pytest.raises(ProtocolError) as e:  # and wake_peer reaches its own checks (ex is not a Codex member)
+        codex_wake_link.wake_peer(co, task_id="t", message_id="m1")
+    assert e.value.code != "advisory_process_refused"
+
+
+def _status(co, pid):
+    return co.publish_session_status("t", pid, native_session_id=pid, seq=0, source="test.boundary",
+                                     runtime_state="active", allocate=True)
+
+
+def test_merge_advisory_status_publish_only_for_its_own_observer(tmp_path, monkeypatch):
+    from mycelium_coord import sendcap
+
+    co = _co(tmp_path)
+    monkeypatch.setenv(ADV, "1")
+    with pytest.raises(ProtocolError) as e:
+        _status(co, "ex")  # an executor: an advisory process may not speak for it
+    assert e.value.code == "advisory_process_refused"
+    assert _status(co, "adv")  # the observer this process attached
+    sendcap.forget(co.store, "t", "adv")  # now act as another process that never attached adv
+    with pytest.raises(ProtocolError) as e:
+        _status(co, "adv")
+    assert e.value.code == "send_capability_required"
+
+
+def test_merge_status_publish_by_a_host_hook_still_works_on_a_send_capability_task(tmp_path, monkeypatch):
+    from mycelium_coord import sendcap
+
+    monkeypatch.delenv(ADV, raising=False)
+    co = _co(tmp_path, protocol_features=["send-capability"])
+    sendcap.forget()  # a hook is a separate process: it holds no capability
+    assert _status(co, "ex")
 
 
 # ---------------------------------------------------------------- 2. host-aware session ids

@@ -161,6 +161,7 @@ hook, filesystem, or lifecycle boundaries.
       lineage output.
 - [ ] Only an accepted Stop finalizes the log and registry entry and removes or
       archives active state.
+- [ ] All blocking Stop paths share a persistent per-session prompt cap, including when the host recursion flag is absent or failure text changes. Exhaustion preserves pending lifecycle evidence and never claims accepted finalization. Read-only review launchers disable lifecycle hooks per invocation.
 - [ ] Stop continuation messages identify the unmet requirement precisely and
       do not enter an infinite retry loop.
 - [ ] Stop preserves the authored content of a fresh, complete five-section

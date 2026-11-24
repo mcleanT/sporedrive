@@ -432,3 +432,11 @@ unresolved lineage instead of an unbounded delay or partial guess.
 spy and process a direct `read_csv('data/raw/sample.csv')`; require the static
 event to succeed without invoking the spy. Exercise the bound separately and
 require an unresolved result.
+
+## Unresolved Stop requirements are mistaken for a recursion guard
+
+**Failure:** A read-only reviewer observes concurrent repository changes, and a Stop hook demands writes the reviewer cannot perform. Retrying the same unresolved condition spends model turns indefinitely. A cap limited to lock contention misses reflection, ownership, lineage, and finalization errors.
+
+**Invariant:** Read-only review launchers disable lifecycle hooks per invocation. All blocking Stop paths share a persistent, per-session budget independent of host recursion flags and reason text. Exhaustion stops prompting without finalizing or erasing pending evidence. A later successful repair clears the budget.
+
+**Regression evidence:** Exercise changing reasons, absent/true recursion flags, concurrent retries, corrupt or unsafe budget state, independent sessions, and eventual repair. Verify native read-only review dispatch stays silent and a deliberately unresolved native Stop ends within the fixed allowance.
