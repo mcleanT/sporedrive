@@ -1,4 +1,4 @@
-"""Tests for src/consult adapters using fake agy / fake claude. Run on Betty only (owner rule: not on the Mac)."""
+"""Tests for src/consult adapters using fake agy / fake claude."""
 import importlib.util, json, os, subprocess, sys, tempfile, unittest
 from pathlib import Path
 

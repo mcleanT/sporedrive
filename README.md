@@ -349,8 +349,8 @@ core-overlay/               repo-owned hook files that replace source hooks at e
 scripts/                    wfctl.py, export_coordination.py, smoke_check.sh, script tests
 tests/                      installer tests
 docs/                       installation and operations guides
-docs/triangle/              triangle features, two-modes design, write-guard spec, build log,
-                            proposed hook templates
+docs/triangle/              triangle features, two-modes design, write-guard spec and the
+                            write-guard hook templates (proposed/)
 PROVENANCE.md, VERSION      source provenance and the instruction-contract version
 ```
 

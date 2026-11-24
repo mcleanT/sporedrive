@@ -2,7 +2,7 @@
 """Send capability (triangle proposal step 3, "send binding"): an identity-bearing write on a
 send-capability task, or from any advisory process, must come from the process that attached that
 participant. ``sendcap.forget()`` makes this test process look like a second process that never
-attached; real second processes are CLI subprocesses. Run on Betty only.
+attached; real second processes are CLI subprocesses.
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
-"""Review repairs 2026-11-23 (docs/triangle/evidence/review-2026-11-23): F1-F14 + reply_expected.
+"""Review repairs 2026-11-23: F1-F14 + reply_expected.
 
 Ports every adversarial-verifier reproducer (verify-SEC, verify-SP, verify-LLM). Each scenario is kept;
-only the expected refusal code/shape follows the repair (noted per test). Run on Betty only.
+only the expected refusal code/shape follows the repair (noted per test).
 """
 
 from __future__ import annotations

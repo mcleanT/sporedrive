@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mode 1 "call" (docs/triangle/TWO-MODES-DESIGN.md v1.2 2.1-2.5): packet/preflight, environment allowlist, outcome
 classes, receipt, post. Every host is a FAKE binary written per test and handed to the dispatcher on purpose
-(CLAUDE_BIN / CODEX_BIN / AGY_BIN through ``extra_env``), never found by inheritance. No model CLI runs. Run on Betty only.
+(CLAUDE_BIN / CODEX_BIN / AGY_BIN through ``extra_env``), never found by inheritance. No model CLI runs.
 """
 
 from __future__ import annotations
@@ -1932,7 +1932,7 @@ def test_sigkilled_dispatcher_keeps_the_busy_lock_until_the_target_exits(world):
             time.sleep(0.1)
         # The lock is held while ANY member of the adapter's group is alive (the adapter shell exits after its
         # child, and an orphaned group leader must be reaped by init first). Poll, do not assume a fixed delay:
-        # a fixed 0.5 s failed once on a loaded Betty node (review-fix full run 1).
+        # a fixed 0.5 s failed once on a loaded test-cluster node (review-fix full run 1).
         ok = False
         deadline = time.time() + 30
         while time.time() < deadline:

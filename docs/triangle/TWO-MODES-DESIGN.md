@@ -4,8 +4,8 @@ Owner requirement (verbatim, 2026-11-23): "we need to have 2 different modes of 
 transient, headless session for the respective calls, this is especailly relevant for reviews. in the other, we have a
 full collaboration setup, where sessinos are linked and share info."
 
-History: v0 drafted by workflow wf_656dd6f9-e85 (opus designer), adversarially reviewed (verdict: revise, 6 blocking).
-v1 applies those findings and an advisor check. v0 + review: scratchpad `twomodes/` (design-v0.md, review.json).
+History: v0 drafted by a design workflow (opus designer), adversarially reviewed (verdict: revise, 6 blocking).
+v1 applies those findings and an advisor check.
 
 ## 1. Summary
 1. **Call** — for reviews and one-shot questions. The caller hands a brand-new headless session of Codex, Claude or
@@ -77,7 +77,7 @@ connection and no coordination MCP server (Codex keeps its built-in `codex_apps`
 **Environment** (fixes jobs.py:430, which copies the whole environment): the dispatcher launches the target with an
 allowlist — PATH=`~/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin` (real binaries, never the cmux shims),
 HOME, USER, LOGNAME, LANG, TMPDIR; no auth variables are needed (v1.2 probe: all three hosts ANSWERED under exactly
-this list, evidence/two-modes-probe/README.txt; HOME is required) — strips
+this list; HOME is required) — strips
 every other `MYCELIUM_*` variable, and sets three explicitly: `MYCELIUM_COORD_ADVISORY=1` (any coordination CLI the
 target runs is adviser-limited), `MYCELIUM_COORD_DIR=<empty per-call dir>` (it cannot fall back to the default live
 store, store.py:74-75) and `MYCELIUM_CONSULT_TARGET=1` (`consult call` refuses to run inside a target: no recursion).
@@ -200,7 +200,7 @@ member (see 3.1).
   v1.4, as above).
 
 ## 5. Tests
-- Betty unit tests (nothing CPU-heavy on the Mac): packet/preflight → NOT_STARTED; total (exit, reason) mapping;
+- Unit tests on the test cluster (nothing CPU-heavy on the workstation): packet/preflight → NOT_STARTED; total (exit, reason) mapping;
   tokens absent → null; env allowlist strips `MYCELIUM_*`; busy → REFUSED; fake host exit 0 + empty → not ANSWERED;
   links: propose/confirm/end, confirm without capability refused, stale on detach and on rebind, NOT stale on same-session
   re-attach, role/`all` refused in a link, `session-links` without `send-capability` refused, legacy task output
@@ -216,27 +216,27 @@ member (see 3.1).
   - Link: Claude ↔ headless Codex (send, wake, ack in store); headless wake does not stale the link (≤3 attempts;
     a run where Codex never reaches the board counts as UNMEASURED, not a link failure; the server side is recorded
     with the wire recorder); Antigravity observer link driven over ACP with the board server passed per session
-    (`session/new` mcpServers, as evidence/m7-drill/acp_drive.py) — no host-config edit; the App's own board access is
+    (`session/new` mcpServers) — no host-config edit; the App's own board access is
     already shown by the 9/9 app test; rebind to another session → `link_stale`.
 
 ## 6. Milestones (token estimates) and owner decisions
 | # | Deliverable | Check | Est. |
 |---|---|---|---|
-| M1 | consult.py core + fake-host tests | Betty unit pass | ~200k |
+| M1 | consult.py core + fake-host tests | unit pass on the test cluster | ~200k |
 | M2 | three adapters live (codex_call new) | per-host call smoke from receipts | ~200k |
 | M3 | CLI front end + owned-job use + post (`--post-to` and MCP `consult_post`) | one report posted by an MCP-attached caller via `consult_post`, correct reply_to, on the scratch store | ~100k |
-| M4 | links + unit tests | Betty unit pass incl. legacy byte-identical | ~250k |
+| M4 | links + unit tests | unit pass on the test cluster incl. legacy byte-identical | ~250k |
 | M5 | link live smokes; one scoped Codex review of M1-M5 + one repair verification | smoke evidence + review disposition | ~200k |
 
 Owner decisions (recommended first): (1) build this on the test board — yes; (2) Antigravity starting headless calls —
 not in this build (it asks through the board instead; adding it needs a new non-authority launch path); (3) link
 sharing — whole task (no filter).
 
-Review trail: v0 review (6 blocking) → v1 → one targeted repair verification (wf_3ef486c2-c4b): B1, B2, B4, A1, A4, A5
+Review trail: v0 review (6 blocking) → v1 → one targeted repair verification: B1, B2, B4, A1, A4, A5
 closed; B3, B5, B6, A2, A3 partly closed and one new defect (MCP launch vs jobs.py CLI-only rule) — all addressed in
 this revision (v1.1) by the edits in §1, §2.1, §2.2, §2.4, §3.2, §5. No further review run.
 
-v1.2 (after owner approval): pre-build probe (evidence/two-modes-probe) fixed the environment list and added
+v1.2 (after owner approval): pre-build probe fixed the environment list and added
 `--skip-git-repo-check`; restored a post-only MCP tool (`consult_post`) because MCP-attached callers cannot supply a
 `--cap-file`; Antigravity link member over ACP with per-session MCP (no host-config edit); bounded headless-Codex smoke.
 
@@ -252,7 +252,7 @@ dir, the default store, MYCELIUM_COORD_DIR or the CLI's own `--root` store; syml
 (`named_path_symlink`); the prompt names the verified realpath and postflight re-checks it; the target receives the
 preflight-resolved binary (`<HOST>_BIN`).
 
-v1.4 (comprehensive review of 01d5b25..bbbb607, 2026-11-23; report docs/triangle/evidence/two-modes-review/): fixes for the
+v1.4 (comprehensive review of 01d5b25..bbbb607, 2026-11-23): fixes for the
 29 findings, none changing a design decision. Call side: F2 read matching (bare basename / `cd` = `possible`), F3 transient
 pre-launch errors are retryable, F4 symlinked config dirs protected, F5 a stopped call still prints JSON and posts, and a job
 deadline that cannot fit is refused, F6 post target checked before launch plus `consult post`, F7 process group emptied before
@@ -268,7 +268,7 @@ legacy test now compares against a golden generated from 01d5b25 (coordination/t
 exact assertions. Known and left as is: F24 (the cli.py reformat is mixed into the feature diff; no behaviour change), and the
 open questions of the review (real-host behaviour, same-session takeover of a live holder, one capability holder per MCP server).
 
-v1.5 (Codex repair verification of the v1.4 fixes, 2026-11-24; docs/triangle/evidence/two-modes-review/codex-verify-reviewfix.md):
+v1.5 (Codex repair verification of the v1.4 fixes, 2026-11-24):
 11 findings verified closed; F1 and F5 partly, plus two new defects in the repaired code, all fixed with red-before-green tests.
 F1: strict stale write before the participant write (above). F5: on a stop the CLI prints its JSON before the post, because the
 post may wait on a contended task lock for as long as job-run's SIGTERM grace. New 1: a store or OS error before the Codex
