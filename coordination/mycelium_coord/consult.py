@@ -34,7 +34,8 @@ import time
 
 from . import sendcap
 from .model import FEATURE_TRIANGLE_KINDS, ProtocolError, require_authority
-from .store import valid_id
+from .store import StoreError, valid_id
+from .views import encoded_size, read_bounded
 
 PACKET_SCHEMA = "consult-packet/1"
 RECEIPT_SCHEMA = "consult-receipt/1"
@@ -1880,6 +1881,26 @@ def report_flags(rec: dict) -> list[str]:
     return out
 
 
+def verified_answer(call_dir: str, rec: dict) -> tuple[str, str]:
+    """The answer file of an ANSWERED receipt, re-hashed against the receipt's recorded sha256: (abspath, sha256).
+    Raises ProtocolError consult_answer_missing / consult_answer_sha_mismatch (a tampered or swapped answer)."""
+    ap = os.path.join(call_dir, "answer.md")
+    want = (rec.get("answer") or {}).get("sha256")
+    if os.path.islink(ap) or not os.path.isfile(ap) or not isinstance(want, str):
+        raise ProtocolError(
+            "consult_answer_missing",
+            ap,
+            "ANSWERED receipt but no regular answer.md / recorded sha256",
+        )
+    if sha256_file(ap) != want:
+        raise ProtocolError(
+            "consult_answer_sha_mismatch",
+            ap,
+            "answer.md does not match the receipt's recorded sha256",
+        )
+    return os.path.abspath(ap), want
+
+
 def post_report(
     co,
     *,
@@ -1917,21 +1938,7 @@ def post_report(
     evidence = [{"file": os.path.abspath(rp), "sha256": receipt_sha}]
     kw = {"artifact_ref": None, "text": None}
     if rec["outcome"] == "ANSWERED":
-        ap = os.path.join(call_dir, "answer.md")
-        want = (rec.get("answer") or {}).get("sha256")
-        if os.path.islink(ap) or not os.path.isfile(ap) or not isinstance(want, str):
-            raise ProtocolError(
-                "consult_answer_missing",
-                ap,
-                "ANSWERED receipt but no regular answer.md / recorded sha256",
-            )
-        if sha256_file(ap) != want:
-            raise ProtocolError(
-                "consult_answer_sha_mismatch",
-                ap,
-                "answer.md does not match the receipt's recorded sha256",
-            )
-        kw["artifact_ref"] = os.path.abspath(ap)
+        kw["artifact_ref"], _sha = verified_answer(call_dir, rec)
         # a message carries exactly one of text / artifact_ref, so the plain line a reader must not miss (breach,
         # no read, over limit, coverage) travels as a second evidence entry next to the receipt hash
         evidence.append(
@@ -1968,3 +1975,342 @@ def post_report(
         host={},
         **kw,
     )
+
+
+# ------------------------------------------------------------------ MCP launch route (consult_start / consult_result)
+# The one fixed-argv MCP launch route (owner direction 2026-11-24, docs/triangle/FEATURES.md "Call mode"): the server
+# hands the existing `consult call` CLI to the owned detached-job launcher (jobs.JobManager.run) and collects the call
+# by reading the job record and the receipt. run_call, the adapters and the job supervisor are reused unchanged.
+CALL_JOB_PREFIX = "consult-"
+PACKET_STAGE_DIR = "packets"
+START_MARGIN_S = 60  # job deadline = deadline_s + DISPATCH_GRACE_S + this, so the child's job-fit check never refuses
+START_SETTLE_S = 2.0  # consult_start waits this long for a fast decided outcome (busy, preflight, binary missing)
+MAX_PACKET_BYTES = 65536
+RESULT_ANSWER_MAX = 3000  # bytes of answer text one consult_result page carries at most
+RESULT_BUDGET_BYTES = 4096  # the whole serialized consult_result response
+_CALL_ID_MAX = 120 - len(CALL_JOB_PREFIX)
+
+
+def dispatch_argv(target, packet_path, out_root, call_id, store_root, *, host_bin=None) -> list[str]:
+    """The ONE argv consult_start launches: the existing CLI, every element chosen or validated by the server, no
+    shell. ``host_bin`` is a test seam only; MCP never accepts it."""
+    argv = [
+        sys.executable, "-m", "mycelium_coord", "--root", str(store_root), "consult", "call",
+        "--target", target, "--packet", packet_path, "--out-root", out_root, "--call-id", call_id,
+    ]
+    if host_bin is not None:
+        argv += ["--host-bin", str(host_bin)]
+    return argv
+
+
+def parse_dispatch_argv(argv) -> dict | None:
+    """The fields of a job argv made by ``dispatch_argv``, or None when it is not exactly that template. The
+    interpreter (argv[0]) is not compared: another host's server may run a different one."""
+    if not isinstance(argv, list) or len(argv) not in (15, 17) or not all(isinstance(a, str) for a in argv):
+        return None
+    fixed = {1: "-m", 2: "mycelium_coord", 3: "--root", 5: "consult", 6: "call", 7: "--target", 9: "--packet",
+             11: "--out-root", 13: "--call-id", 15: "--host-bin"}
+    if any(argv[i] != v for i, v in fixed.items() if i < len(argv)):
+        return None
+    d = {"root": argv[4], "target": argv[8], "packet": argv[10], "out_root": argv[12], "call_id": argv[14],
+         "host_bin": argv[16] if len(argv) == 17 else None}
+    if d["target"] not in TARGETS or not valid_id(d["call_id"]) or not os.path.isabs(d["out_root"]):
+        return None
+    if d["packet"] != os.path.join(d["out_root"], PACKET_STAGE_DIR, d["call_id"] + ".json"):
+        return None
+    return d
+
+
+def _start_refused(outcome: str, reason: str, call_id, retryable=False) -> dict:
+    """consult_start's answer for a gate that decided before anything was created (no job, no staged file)."""
+    return {"state": "ended", "call_id": call_id, "job_id": None, "call_dir": None, "outcome": outcome,
+            "retryable": retryable, "usable": False, "reason": reason, "job_deadline_s": None,
+            "collect_with": None}
+
+
+def recursion_refusal() -> dict:
+    return _start_refused(
+        "REFUSED", f"recursion: {RECURSION_ENV} is set, consult_start refuses to run inside a target", None
+    )
+
+
+def _call_dir_taken(jm, out_root: str, call_id: str) -> bool:
+    """A call directory of this id exists that no consult_start job of this store made (a CLI call with --call-id, or
+    a server on another store sharing the TMPDIR): the dispatcher would stop at "call directory already exists"
+    WITHOUT a receipt, and the old call's receipt would be read as this call's result."""
+    return os.path.lexists(os.path.join(out_root, call_id)) and jm.read_request(CALL_JOB_PREFIX + call_id) is None
+
+
+def _stage_packet(out_root: str, call_id: str, blob: bytes) -> str:
+    """Write the packet once (0600, O_EXCL) at <out_root>/packets/<call_id>.json. The same bytes again is a replay;
+    different bytes is consult_call_id_conflict (a call id is never re-aimed)."""
+    d = os.path.join(out_root, PACKET_STAGE_DIR)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    p = os.path.join(d, call_id + ".json")
+    try:
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except FileExistsError:
+        same = False
+        if not os.path.islink(p):
+            try:
+                with open(p, "rb") as f:
+                    same = f.read() == blob
+            except OSError:
+                same = False
+        if not same:
+            raise ProtocolError(
+                "consult_call_id_conflict",
+                call_id,
+                f"call id {call_id!r} was already started with a different packet; a call id is never re-aimed",
+            )
+        return p
+    with os.fdopen(fd, "wb") as f:
+        f.write(blob)
+        f.flush()
+        os.fsync(f.fileno())
+    return p
+
+
+def start_call(
+    jm,
+    co,
+    *,
+    target: str,
+    packet,
+    call_id: str | None = None,
+    post: dict | None = None,
+    env=None,
+    out_root: str | None = None,
+    host_bin: str | None = None,
+    settle_s: float = START_SETTLE_S,
+) -> dict:
+    """Start one call as a detached owned job (MCP consult_start) and return within about ``settle_s`` seconds.
+    Gates, each deciding before anything is created: recursion (``env``, default os.environ) -> authority -> arguments
+    and packet -> deadline fit -> optional post check (``post`` = {task, reply_to, sender}; posts nothing) -> call id
+    not taken. Then the packet is staged and the fixed ``dispatch_argv`` is launched with JobManager.run (idempotent by
+    job id). ``out_root`` and ``host_bin`` are test seams; the MCP tool never passes them."""
+    from .jobs import MAX_DEADLINE_S
+
+    caller_env = os.environ if env is None else env
+    if caller_env.get(RECURSION_ENV):
+        return recursion_refusal()
+    require_authority("consult-start")
+    call_id = call_id or _new_call_id()
+    if target not in TARGETS:
+        return _start_refused("NOT_STARTED", f"argument: unknown target {target!r}", None)
+    if (not isinstance(call_id, str) or not valid_id(call_id) or len(call_id) > _CALL_ID_MAX
+            or call_id in (".", "..")):
+        return _start_refused(
+            "NOT_STARTED",
+            f"argument: invalid call_id {call_id!r} ([A-Za-z0-9._:-], 1-{_CALL_ID_MAX} characters, not . or ..)",
+            None,
+        )
+    post = post or {}
+    pv = [post.get(k) for k in ("task", "reply_to", "sender")]
+    if any(pv) and not all(pv):
+        return _start_refused("NOT_STARTED", "argument: post_task, post_reply_to and sender go together", call_id)
+    try:
+        blob = json.dumps(packet, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+                          allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError) as e:
+        return _start_refused("NOT_STARTED", f"packet_invalid: not a JSON object: {e}", call_id)
+    if len(blob) > MAX_PACKET_BYTES:
+        return _start_refused(
+            "NOT_STARTED",
+            f"packet_invalid: {len(blob)} bytes, over the {MAX_PACKET_BYTES}-byte limit (refused, never trimmed)",
+            call_id,
+        )
+    try:
+        norm = validate_packet(packet)
+    except ConsultError as e:
+        return _start_refused(e.outcome, e.reason, call_id, e.retryable)
+    dl = norm["limits"]["deadline_s"]
+    job_deadline = dl + DISPATCH_GRACE_S + START_MARGIN_S
+    if job_deadline > MAX_DEADLINE_S:
+        return _start_refused(
+            "NOT_STARTED",
+            f"deadline_too_long: limits.deadline_s {dl} + dispatch grace {DISPATCH_GRACE_S} + start margin "
+            f"{START_MARGIN_S} = {job_deadline}s is over the {MAX_DEADLINE_S:.0f}s owned-job limit; lower "
+            "limits.deadline_s",
+            call_id,
+        )
+    if all(pv):
+        try:
+            post_preflight(co, task_id=post["task"], sender=post["sender"], reply_to=post["reply_to"])
+        except StoreError as e:
+            return _start_refused(
+                "NOT_STARTED",
+                f"post_preflight: {e.code}: {e.message}",
+                call_id,
+                False if isinstance(e, ProtocolError) else None,
+            )
+    out_root = os.path.abspath(out_root or default_out_root())
+    try:
+        os.makedirs(out_root, mode=0o700, exist_ok=True)
+    except OSError as e:
+        return _start_refused("NOT_STARTED", f"cannot create out root {out_root}: {e}", call_id, _os_retryable(e))
+    job_id = CALL_JOB_PREFIX + call_id
+    if _call_dir_taken(jm, out_root, call_id):
+        raise ProtocolError(
+            "consult_call_id_conflict",
+            call_id,
+            f"{os.path.join(out_root, call_id)} already exists and no consult_start job {job_id!r} made it; "
+            "choose another call_id",
+        )
+    try:
+        packet_path = _stage_packet(out_root, call_id, blob)
+    except OSError as e:
+        return _start_refused("NOT_STARTED", f"cannot stage packet: {e}", call_id, _os_retryable(e))
+    argv = dispatch_argv(target, packet_path, out_root, call_id, jm.store.root, host_bin=host_bin)
+    launched = jm.run(job_id, argv, cwd=out_root, deadline_s=job_deadline, label="consult-start:" + target)
+    end = time.monotonic() + max(0.0, float(settle_s))
+    view = _call_view(jm, call_id)
+    while view["state"] == "running" and time.monotonic() < end:
+        time.sleep(0.1)
+        view = _call_view(jm, call_id)
+    state = "replayed" if launched.get("replayed") else ("started" if view["state"] == "running" else "ended")
+    return {"state": state, "call_id": call_id, "job_id": job_id, "call_dir": view["call_dir"],
+            "outcome": view["outcome"], "retryable": view["retryable"], "usable": view["usable"],
+            "reason": view["reason"], "job_deadline_s": job_deadline, "collect_with": "consult_result"}
+
+
+def _receipt_bound(rec: dict, packet_path: str, call_id: str) -> bool:
+    """A receipt is this job's only when its call id and the sha256 of the packet the dispatcher read equal this
+    job's call id and the sha256 of the packet staged for it."""
+    try:
+        want = sha256_file(packet_path)
+    except OSError:
+        return False
+    return rec.get("call_id") == call_id and rec.get("packet_sha256") == want
+
+
+def _stdout_summary(jm, job_id: str):
+    """The CLI's one JSON object from the job's stdout (bounded tail), or None."""
+    text = jm.output(job_id, stream="stdout", tail=True, limit=8192, budget=0).get("text") or ""
+    dec = json.JSONDecoder()
+    starts = [m.start() for m in re.finditer(r"(?m)^\{", text)]
+    for i in reversed(starts):
+        try:
+            obj, _end = dec.raw_decode(text, i)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
+
+
+def _call_view(jm, call_id: str) -> dict:
+    """Read-only state of one consult_start call: the job record (call dir taken from the job's immutable argv, never
+    recomputed from this process's TMPDIR) plus a receipt bound to this job. Only a bound ANSWERED receipt with a
+    verified answer is usable; everything else is CANNOT-EVALUATE."""
+    from .jobs import JobError
+
+    job_id = CALL_JOB_PREFIX + call_id
+    try:
+        st = jm.status(job_id, tail_bytes=0)
+    except JobError as e:
+        if e.code != "job_not_found":
+            raise
+        raise ProtocolError(
+            "consult_call_not_found",
+            call_id,
+            f"no consult_start job {job_id!r} in this coordination store (servers must share one store to collect "
+            "each other's calls)",
+        ) from None
+    d = parse_dispatch_argv((jm.read_request(job_id) or {}).get("argv"))
+    call_dir = os.path.join(d["out_root"], call_id) if d else None
+    if (d is None or d["call_id"] != call_id or os.path.islink(call_dir)
+            or os.path.dirname(os.path.realpath(call_dir)) != os.path.realpath(d["out_root"])):
+        raise ProtocolError("consult_job_not_a_call", job_id, "the job's argv is not the fixed consult_start template")
+    view = {"call_id": call_id, "job_id": job_id, "state": None, "job_status": st.get("effective_status"),
+            "state_version": st.get("state_version"), "outcome": None, "retryable": None, "usable": False,
+            "reason": None, "exit": None, "call_dir": call_dir, "receipt_path": None, "receipt_sha256": None,
+            "answer": None, "containment_breach": None, "coverage": None, "no_successful_read": None}
+    rp = os.path.join(call_dir, "receipt.json")
+    rec, error = None, None
+    if os.path.isfile(rp) and not os.path.islink(rp):
+        try:
+            with open(rp, "rb") as f:
+                blob = f.read()
+            rec = json.loads(blob.decode("utf-8"))
+        except (OSError, ValueError):
+            rec = None
+        if not (isinstance(rec, dict) and rec.get("schema") == RECEIPT_SCHEMA and rec.get("outcome") in OUTCOMES):
+            rec, error = None, "consult_receipt_invalid"
+        elif not _receipt_bound(rec, d["packet"], call_id):
+            rec, error = None, "consult_receipt_not_this_call"
+    if rec is not None:
+        view.update({
+            "state": "finished", "outcome": rec["outcome"], "retryable": rec.get("retryable"),
+            "reason": None if rec.get("reason") is None else str(rec.get("reason"))[:500], "exit": rec.get("exit"),
+            "receipt_path": rp, "receipt_sha256": hashlib.sha256(blob).hexdigest(),
+            "containment_breach": rec.get("containment_breach"), "coverage": rec.get("coverage"),
+            "no_successful_read": rec.get("no_successful_read"),
+        })
+        if rec["outcome"] == "ANSWERED":
+            try:
+                ap, sha = verified_answer(call_dir, rec)
+            except ProtocolError as e:
+                view["error"] = e.code
+            else:
+                view["answer"] = {"path": ap, "sha256": sha, "over_limit": (rec.get("answer") or {}).get("over_limit")}
+                view["usable"] = rec.get("usable") is True
+        return view
+    if error:
+        view["error"] = error
+    if not st.get("terminal"):
+        view["state"] = "running"
+        return view
+    view["state"] = "ended_without_receipt"
+    out = _stdout_summary(jm, job_id) or {}
+    if out.get("outcome") in OUTCOMES and out.get("outcome") != "ANSWERED":  # never a result without a receipt
+        view["outcome"], view["retryable"] = out["outcome"], out.get("retryable")
+        view["reason"] = str(out.get("reason"))[:500]
+    else:
+        view["reason"] = (
+            f"dispatcher ended without a receipt (job {st.get('effective_status')}, exit {st.get('exit_code')}, "
+            f"signal {st.get('signal')})" + (f": {out['error']}" if out.get("error") else "")
+        )[:500]
+    return view
+
+
+def call_result(
+    jm,
+    call_id: str,
+    *,
+    wait_s: float = 0,
+    after_version=None,
+    host_yield_s=None,
+    answer_offset: int = 0,
+    answer_limit: int = 0,
+) -> dict:
+    """MCP consult_result: the state of a consult_start call, optionally after ONE bounded in-tool join (MCP route:
+    at most host_yield_s - 5 s, 25 s by default). ANSWERED with a verified answer is the only usable result; an
+    answer page of at most RESULT_ANSWER_MAX bytes is inlined from ``answer_offset`` when ``answer_limit`` > 0, and
+    the whole response stays within RESULT_BUDGET_BYTES."""
+    if not isinstance(call_id, str) or not valid_id(call_id) or not valid_id(CALL_JOB_PREFIX + call_id):
+        raise ProtocolError("invalid_id", str(call_id), "call_id must be [A-Za-z0-9._:-]")
+    view = _call_view(jm, call_id)
+    wait_path = stop = None
+    if wait_s and float(wait_s) > 0 and view["state"] == "running":
+        j = jm.join(CALL_JOB_PREFIX + call_id, timeout_s=float(wait_s), after_version=after_version, tail_bytes=0,
+                    route="mcp", host_yield_s=host_yield_s)
+        wait_path, stop = j.get("wait_path"), j.get("stop_waiting")
+        view = _call_view(jm, call_id)
+    view["wait_path"], view["stop_waiting"] = wait_path, stop
+    ans = view.get("answer")
+    if ans:
+        limit = max(0, min(int(answer_limit or 0), RESULT_ANSWER_MAX))
+        ans["bytes_total"] = os.path.getsize(ans["path"])
+        if limit:
+            while True:
+                page = read_bounded(ans["path"], offset=max(0, int(answer_offset or 0)), limit=limit)
+                ans.update({k: page[k] for k in ("text", "offset", "next_offset", "truncated", "lossy")})
+                size = encoded_size(view)
+                if size <= RESULT_BUDGET_BYTES or limit <= 1:
+                    break
+                limit = min(limit - 1, int(limit * RESULT_BUDGET_BYTES / size * 0.9))
+    if encoded_size(view) > RESULT_BUDGET_BYTES:  # never expected: paths and reason are short; say so if it happens
+        view["coverage"] = "omitted: over the response budget"
+        view["over_budget"] = encoded_size(view) > RESULT_BUDGET_BYTES
+    return view

@@ -1641,7 +1641,7 @@ def test_cli_non_answered_exits_non_zero_and_prints_the_outcome(world):
     )
 
 
-# ------------------------------------------------------------------ MCP: consult_post only, never a launch tool
+# ------------------------------------------------------------------ MCP: consult_post (the launch route is consult_start, below)
 def test_mcp_consult_post_posts_one_report_and_refuses_tamper(world, monkeypatch):
     pytest.importorskip("fastmcp")
     from fastmcp import Client
@@ -1674,8 +1674,8 @@ def test_mcp_consult_post_posts_one_report_and_refuses_tamper(world, monkeypatch
 
     names, first, again = asyncio.run(go())
     assert {n for n in names if "consult" in n} == {
-        "consult_post"
-    }  # no MCP launch tool
+        "consult_post", "consult_start", "consult_result"
+    }  # one fixed-argv MCP launch route (consult_start) and its collector; no other
     assert not any(
         n in names for n in ("consult_call", "consult_run", "consult_launch")
     )
@@ -3043,3 +3043,470 @@ def test_rf26_max_answer_chars_is_advisory_over_limit_flag_and_full_answer(world
     assert Path(r["answer"]["path"]).read_text() == "claude answer"
     pkt["limits"]["max_answer_chars"] = 13
     assert receipt_of(call(world, "claude", pkt=pkt, call_id="c-fit"))["answer"]["over_limit"] is False
+
+
+# ------------------------------------------------------------------ MCP start/result (consult_start / consult_result)
+# The server launches the existing CLI as a detached owned job. In these tests THIS process is the server: HOME,
+# TMPDIR and MYCELIUM_COORD_DIR point into the world (the detached chain inherits them), and the fake Claude is THE
+# claude on the target's default PATH ($HOME/.local/bin), so the MCP route runs exactly as in production.
+import tempfile  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from mycelium_coord.views import encoded_size  # noqa: E402
+
+FAKE_CLAUDE_MCP = FAKE_CLAUDE.replace(
+    'if MODE == "hang": time.sleep(600)',
+    'if MODE == "hang": time.sleep(600)\nif MODE.startswith("sleep"): time.sleep(float(MODE[5:]))',
+).replace(
+    'else "claude answer", "permission_denials"',
+    'else ("\\u00e9\\n" * 10000 + "end" if MODE == "long" else "claude answer"), "permission_denials"',
+)
+START_KEYS = {"target", "packet", "call_id", "post_task", "post_reply_to", "sender"}
+RESULT_KEYS = {"call_id", "wait_s", "after_version", "host_yield_s", "answer_offset", "answer_limit"}
+NEVER_OVER_MCP = {"host_bin", "target_path", "out_root", "call_dir", "caller", "argv", "cwd", "env"}
+
+
+@pytest.fixture
+def mw(world, monkeypatch):
+    pytest.importorskip("fastmcp")
+    from mycelium_coord import mcp_server
+    from mycelium_coord.jobs import JobManager
+
+    home = world / "home"
+    bindir = home / ".local" / "bin"
+    bindir.mkdir(parents=True)
+    os.symlink(sys.executable, bindir / "python3")  # the adapters' python3 on the target's default PATH
+
+    def set_mode(mode):
+        _script(bindir / "claude", FAKE_CLAUDE_MCP, mode)
+
+    set_mode("normal")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("TMPDIR", str(world / "tmp"))
+    monkeypatch.setattr(tempfile, "tempdir", str(world / "tmp"))
+    monkeypatch.setenv("MYCELIUM_COORD_DIR", str(world / "store"))
+    for k in ("MYCELIUM_COORD_CAP_FILE", "MYCELIUM_JOB_ID"):
+        monkeypatch.delenv(k, raising=False)
+    jm = JobManager(CoordStore(str(world / "store")))
+    monkeypatch.setattr(mcp_server, "_jm", lambda: jm)
+    ns = SimpleNamespace(w=world, jm=jm, ms=mcp_server, set_mode=set_mode, out_root=consult.default_out_root())
+    yield ns
+    for d in sorted((world / "store" / "jobs").glob("*")):
+        try:
+            jm.cancel(d.name)
+        except Exception:  # noqa: BLE001 - cleanup only
+            pass
+    time.sleep(0.5)
+    for p in _pgrep(str(world)):
+        try:
+            os.kill(p, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def _tool(name, args):
+    from fastmcp import Client
+    from mycelium_coord import mcp_server
+
+    async def go():
+        async with Client(mcp_server.mcp) as c:
+            return (await c.call_tool(name, args)).data
+
+    return asyncio.run(go())
+
+
+def _tool_err(name, args) -> str:
+    with pytest.raises(Exception) as e:
+        _tool(name, args)
+    return str(e.value)
+
+
+def _start(mw, call_id, pkt=None, **kw):
+    return _tool("consult_start", {"target": "claude", "packet": pkt or make_packet(mw.w), "call_id": call_id, **kw})
+
+
+def _collect(call_id, rounds=4, **kw):
+    for _ in range(rounds):
+        r = _tool("consult_result", {"call_id": call_id, "wait_s": 25, **kw})
+        if r["state"] != "running":
+            return r
+    raise AssertionError(f"call {call_id} still running: {r}")
+
+
+def _jobs(w):
+    d = w / "store" / "jobs"
+    return sorted(p.name for p in d.glob("*")) if d.exists() else []
+
+
+def _staged(mw):
+    d = Path(mw.out_root) / consult.PACKET_STAGE_DIR
+    return sorted(os.listdir(d)) if d.exists() else []
+
+
+def _wait_started(w, n=300):
+    for _ in range(n):
+        if (w / "repo" / "env.dump.json").exists():
+            return
+        time.sleep(0.1)
+    raise AssertionError("fake host never started")
+
+
+def test_t1_start_and_result_schemas_take_only_validated_fields(mw):
+    from fastmcp import Client
+
+    async def go():
+        async with Client(mw.ms.mcp) as c:
+            return {t.name: t for t in await c.list_tools()}
+
+    tools = asyncio.run(go())
+    def schema(t):
+        return getattr(t, "input_schema", None) or t.inputSchema
+
+    def read_only(t):
+        ann = t.annotations
+        v = getattr(ann, "read_only_hint", None)
+        return ann.readOnlyHint if v is None else v
+
+    start = set(schema(tools["consult_start"])["properties"])
+    result = set(schema(tools["consult_result"])["properties"])
+    assert start == START_KEYS and result == RESULT_KEYS
+    assert not (start | result) & NEVER_OVER_MCP
+    assert schema(tools["consult_start"])["properties"]["target"]["enum"] == list(consult.TARGETS)
+    assert read_only(tools["consult_result"]) is True and read_only(tools["consult_start"]) is False
+
+
+def test_t2_start_launches_exactly_the_fixed_argv_and_answers(mw):
+    q = "; rm -rf ~ $(x) `y`"
+    r = _start(mw, "t2", make_packet(mw.w, question=q))
+    assert r["state"] in ("started", "ended") and r["job_id"] == "consult-t2"
+    assert r["call_dir"] == os.path.join(mw.out_root, "t2")
+    argv = mw.jm.read_request("consult-t2")["argv"]
+    want = consult.dispatch_argv(
+        "claude", os.path.join(mw.out_root, "packets", "t2.json"), mw.out_root, "t2", mw.jm.store.root
+    )
+    assert argv == want and len(argv) == 15
+    assert argv[0] == sys.executable and "-c" not in argv and not any(q in a or "rm -rf" in a for a in argv)
+    assert consult.parse_dispatch_argv(argv)["call_id"] == "t2"
+    res = _collect("t2")
+    assert res["state"] == "finished" and res["outcome"] == "ANSWERED" and res["usable"] is True
+    assert res["answer"]["sha256"] == consult.sha256_file(os.path.join(mw.out_root, "t2", "answer.md"))
+
+
+def test_t3a_mcp_recursion_refuses_before_any_store_is_built(mw, monkeypatch):
+    def boom():
+        raise AssertionError("a store was constructed under the recursion guard")
+
+    monkeypatch.setattr(mw.ms, "_jm", boom)
+    monkeypatch.setattr(mw.ms, "_co", boom)
+    monkeypatch.setenv(consult.RECURSION_ENV, "1")
+    r = _start(mw, "t3a")
+    assert r["outcome"] == "REFUSED" and r["reason"].startswith("recursion") and r["retryable"] is False
+    assert r["usable"] is False and r["job_id"] is None
+    assert _jobs(mw.w) == [] and _staged(mw) == []
+
+
+def test_t3b_core_recursion_guard_is_first(mw):
+    r = consult.start_call(mw.jm, None, target="claude", packet=make_packet(mw.w), call_id="t3b",
+                           env={consult.RECURSION_ENV: "1"}, out_root=mw.out_root)
+    assert r["outcome"] == "REFUSED" and r["reason"].startswith("recursion")
+    assert _jobs(mw.w) == [] and _staged(mw) == []
+
+
+def test_t4a_advisory_process_does_not_list_start_or_result(world):
+    pytest.importorskip("fastmcp")
+    code = (
+        "import asyncio, json\nfrom mycelium_coord import mcp_server as m\n"
+        "print(json.dumps(sorted(getattr(t, 'name', t) for t in asyncio.run(m.mcp.list_tools()))))\n"
+    )
+    env = {**os.environ, "PYTHONPATH": PKG_ROOT, "MYCELIUM_COORD_DIR": str(world / "s"), ADV: "1"}
+    out = json.loads(subprocess.run([sys.executable, "-c", code], env=env, text=True, capture_output=True,
+                                    timeout=120, check=True).stdout.strip().splitlines()[-1])
+    assert "consult_start" not in out and "consult_result" not in out and "coord_send" in out
+    env.pop(ADV)
+    out = json.loads(subprocess.run([sys.executable, "-c", code], env=env, text=True, capture_output=True,
+                                    timeout=120, check=True).stdout.strip().splitlines()[-1])
+    assert "consult_start" in out and "consult_result" in out  # paired control: listed when unrestricted
+
+
+def test_t4b_advisory_core_gate_refuses_before_anything_is_created(mw, monkeypatch):
+    monkeypatch.setenv(ADV, "1")
+    with pytest.raises(ProtocolError) as e:
+        consult.start_call(mw.jm, None, target="claude", packet=make_packet(mw.w), call_id="t4b",
+                           out_root=mw.out_root)
+    assert e.value.code == "advisory_process_refused" and e.value.path == "consult-start"
+    assert "advisory_process_refused" in _tool_err("consult_start", {"target": "claude", "packet": make_packet(mw.w),
+                                                                     "call_id": "t4b"})
+    assert _jobs(mw.w) == [] and _staged(mw) == []
+
+
+def test_t4c_the_fixed_argv_run_with_the_advisory_env_is_refused_by_the_cli(mw):
+    os.makedirs(os.path.join(mw.out_root, "packets"), mode=0o700)
+    pk = os.path.join(mw.out_root, "packets", "t4c.json")
+    Path(pk).write_text(json.dumps(make_packet(mw.w)))
+    argv = consult.dispatch_argv("claude", pk, mw.out_root, "t4c", mw.jm.store.root)
+    env = {**os.environ, "PYTHONPATH": PKG_ROOT}
+    r = subprocess.run(argv, env={**env, ADV: "1"}, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 3 and json.loads(r.stdout)["error"] == "advisory_process_refused"
+    assert not os.path.exists(os.path.join(mw.out_root, "t4c"))
+    r = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=120)  # paired control
+    assert r.returncode == 0 and json.loads(r.stdout)["outcome"] == "ANSWERED", r.stdout + r.stderr
+
+
+def _t5_cases(w):
+    unknown = make_packet(w)
+    unknown["extra"] = 1
+    ctrl = make_packet(w)
+    ctrl["files"][0]["why"] = "line\nbreak"
+    big = make_packet(w, decisions=["x" * 1000] * 70)
+    long_dl = make_packet(w)
+    long_dl["limits"]["deadline_s"] = 30000
+    return {"unknown_key": (unknown, "packet_invalid: unknown top-level keys"),
+            "control_char": (ctrl, "packet_invalid:"),
+            "over_64k": (big, "packet_invalid: "),
+            "deadline": (long_dl, "deadline_too_long:")}
+
+
+@pytest.mark.parametrize("case", ["unknown_key", "control_char", "over_64k", "deadline"])
+def test_t5_invalid_packet_or_deadline_is_not_started_and_creates_nothing(mw, case):
+    pkt, want = _t5_cases(mw.w)[case]
+    r = _start(mw, "t5", pkt)
+    assert r["outcome"] == "NOT_STARTED" and r["reason"].startswith(want), r["reason"]
+    if case == "over_64k":
+        assert "65536-byte limit" in r["reason"]
+    assert r["retryable"] is False and r["job_id"] is None and r["usable"] is False
+    assert _jobs(mw.w) == [] and _staged(mw) == []
+
+
+def test_t6_job_deadline_has_the_margin_and_a_call_near_its_deadline_answers(mw):
+    mw.set_mode("sleep4")
+    pkt = make_packet(mw.w)
+    pkt["limits"]["deadline_s"] = 5
+    r = _start(mw, "t6", pkt)
+    assert r["job_deadline_s"] == 5 + consult.DISPATCH_GRACE_S + consult.START_MARGIN_S == 95
+    assert mw.jm.read_request("consult-t6")["deadline_s"] == 95
+    res = _collect("t6")
+    assert res["outcome"] == "ANSWERED" and res["usable"] is True, res
+
+
+def test_t7_busy_lane_is_refused_retryable_and_controls_proceed(mw):
+    held = consult.CallLock(consult.default_lock_dir(), "uid%d" % os.getuid(), "claude", "other-call")
+    held.acquire()
+    try:
+        r = _start(mw, "t7a")
+        res = r if r["state"] == "ended" else _collect("t7a")
+        assert res["outcome"] == "REFUSED" and res["retryable"] is True and res["reason"].startswith("busy"), res
+        assert res["usable"] is False and not (mw.w / "repo" / "env.dump.json").exists()
+        # control: another target is a different lane and proceeds while claude is held
+        codex = fake_bin(mw.w, "codex", "normal")["CODEX_BIN"]
+        c = consult.start_call(mw.jm, None, target="codex", packet=make_packet(mw.w), call_id="t7b",
+                               out_root=mw.out_root, host_bin=codex)
+        assert c["job_id"] == "consult-t7b"
+        assert _collect("t7b")["outcome"] == "ANSWERED"
+    finally:
+        held.release()
+    # control: the same lane under a DEAD holder is recovered and the start proceeds
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()
+    Path(held.path).write_text(json.dumps({"holder": {"pid": p.pid, "start": "Mon Jan  1 00:00:00 2001",
+                                                      "node": platform.node()}, "call_id": "dead"}))
+    _start(mw, "t7c")
+    assert _collect("t7c")["outcome"] == "ANSWERED"
+
+
+def test_t8_same_call_id_replays_and_a_different_packet_conflicts(mw):
+    first = _start(mw, "t8")
+    assert first["state"] in ("started", "ended")
+    req = mw.jm.read_request("consult-t8")
+    again = _start(mw, "t8")
+    assert again["state"] == "replayed" and again["job_id"] == "consult-t8"
+    assert _jobs(mw.w) == ["consult-t8"] and mw.jm.read_request("consult-t8") == req  # one job, one launch
+    staged = Path(mw.out_root, "packets", "t8.json").read_bytes()
+    err = _tool_err("consult_start", {"target": "claude", "packet": make_packet(mw.w, question="other?"),
+                                      "call_id": "t8"})
+    assert "consult_call_id_conflict" in err
+    assert Path(mw.out_root, "packets", "t8.json").read_bytes() == staged and _jobs(mw.w) == ["consult-t8"]
+    assert _collect("t8")["outcome"] == "ANSWERED"
+
+
+def _cli_made_call_dir(mw, call_id):
+    """An ANSWERED call made by the CLI route with --call-id (a different packet), in the server's out root."""
+    rec = consult.run_call("claude", write_packet(mw.w, make_packet(mw.w, question="an older question?"), "old.json"),
+                           out_root=mw.out_root, call_id=call_id, env=caller_env(mw.w), path=os.environ["PATH"],
+                           extra_env=fake_bin(mw.w, "claude", "normal"))
+    assert rec["outcome"] == "ANSWERED"
+    return rec
+
+
+def test_t8b_an_existing_call_dir_not_made_by_this_store_is_refused_before_staging(mw):
+    _cli_made_call_dir(mw, "t8b")
+    assert "consult_call_id_conflict" in _tool_err("consult_start", {"target": "claude",
+                                                                     "packet": make_packet(mw.w), "call_id": "t8b"})
+    assert _jobs(mw.w) == [] and _staged(mw) == []
+
+
+def test_t8b_without_the_precheck_the_old_receipt_is_never_this_calls_result(mw, monkeypatch):
+    _cli_made_call_dir(mw, "t8c")
+    monkeypatch.setattr(consult, "_call_dir_taken", lambda *a: False)
+    _start(mw, "t8c")
+    r = _tool("consult_result", {"call_id": "t8c"})
+    assert r["usable"] is False and r["error"] == "consult_receipt_not_this_call" and r["outcome"] != "ANSWERED"
+    res = _collect("t8c")
+    assert res["state"] == "ended_without_receipt" and res["usable"] is False
+    assert res["error"] == "consult_receipt_not_this_call" and res["outcome"] == "REFUSED"
+    assert "call directory already exists" in res["reason"]
+
+
+def test_t9_a_call_survives_its_mcp_server_being_killed(mw):
+    mw.set_mode("sleep5")
+    code = (
+        "import asyncio, json, sys, time\nsys.path.insert(0, %r)\nfrom fastmcp import Client\n"
+        "from mycelium_coord import mcp_server as m\n"
+        "async def go():\n    async with Client(m.mcp) as c:\n"
+        "        return (await c.call_tool('consult_start', {'target': 'claude', 'packet': %r, 'call_id': 't9'})).data\n"
+        "print(json.dumps(asyncio.run(go())), flush=True)\ntime.sleep(120)\n"
+    ) % (PKG_ROOT, make_packet(mw.w))
+    server = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True,
+                              env={**os.environ, "PYTHONPATH": PKG_ROOT}, start_new_session=True)
+    try:
+        started = json.loads(server.stdout.readline())
+        assert started["state"] == "started", started
+    finally:
+        os.killpg(server.pid, signal.SIGKILL)  # the host app quits: its whole server process group dies
+        server.wait(timeout=30)
+    res = _collect("t9")  # a fresh server on the same store collects it
+    assert res["state"] == "finished" and res["outcome"] == "ANSWERED" and res["usable"] is True, res
+    assert res["answer"]["sha256"]
+
+
+@pytest.mark.parametrize("case", ["answered", "e429", "timeout", "missing_file", "repo_is_home"])
+def test_t10_outcomes_pass_through_from_the_receipt(mw, case):
+    pkt = make_packet(mw.w)
+    if case == "e429":
+        mw.set_mode("e429")
+    elif case == "timeout":
+        mw.set_mode("hang")
+        pkt["limits"]["deadline_s"] = 2
+    elif case == "missing_file":
+        pkt["files"] = [{"path": "gone.txt", "sha256": "0" * 64, "why": "w"}]
+    elif case == "repo_is_home":
+        pkt["files"] = []
+        pkt["scope"]["repo_realpath"] = str(mw.w / "home")
+    want = {"answered": ("ANSWERED", None), "e429": ("UNAVAILABLE", True), "timeout": ("TIMED_OUT", None),
+            "missing_file": ("NOT_STARTED", False), "repo_is_home": ("REFUSED", False)}[case]
+    _start(mw, "t10", pkt)
+    res = _collect("t10")
+    rec = json.loads(Path(res["receipt_path"]).read_text())
+    assert res["state"] == "finished" and res["outcome"] == rec["outcome"] == want[0], res
+    assert res["usable"] is (want[0] == "ANSWERED")
+    if want[1] is not None:
+        assert res["retryable"] is want[1]
+    assert (res["answer"] is not None) is (want[0] == "ANSWERED")
+
+
+def test_t11_a_killed_dispatcher_ends_without_receipt_never_running_forever(mw):
+    mw.set_mode("hang")
+    pkt = make_packet(mw.w)
+    pkt["limits"]["deadline_s"] = 60
+    _start(mw, "t11", pkt)
+    _wait_started(mw.w)
+    pgid = mw.jm.read_status("consult-t11")["pgid"]
+    os.killpg(pgid, signal.SIGKILL)
+    res = _collect("t11")
+    assert res["state"] == "ended_without_receipt" and res["usable"] is False and res["outcome"] is None, res
+    assert "without a receipt" in res["reason"] and "signal 9" in res["reason"]
+
+
+def test_t11_a_cli_recursion_refusal_ends_without_receipt_with_its_outcome(mw, monkeypatch):
+    monkeypatch.setenv(consult.RECURSION_ENV, "1")  # reaches only the job (the gate reads env={} below)
+    r = consult.start_call(mw.jm, None, target="claude", packet=make_packet(mw.w), call_id="t11b", env={},
+                           out_root=mw.out_root)
+    assert r["job_id"] == "consult-t11b"
+    res = r
+    for _ in range(4):
+        res = consult.call_result(mw.jm, "t11b", wait_s=25)
+        if res["state"] != "running":
+            break
+    assert res["state"] == "ended_without_receipt" and res["outcome"] == "REFUSED" and res["usable"] is False
+    assert res["reason"].startswith("recursion")
+
+
+def test_t12_a_tampered_answer_is_not_usable_and_no_text_is_returned(mw):
+    _start(mw, "t12")
+    assert _collect("t12")["usable"] is True
+    Path(mw.out_root, "t12", "answer.md").write_text("tampered")
+    r = _tool("consult_result", {"call_id": "t12", "answer_limit": 100})
+    assert r["usable"] is False and r["error"] == "consult_answer_sha_mismatch" and r["answer"] is None
+
+
+def test_t13_answer_pages_are_bounded_and_concatenate_losslessly(mw):
+    mw.set_mode("long")
+    _start(mw, "t13")
+    res = _collect("t13")
+    assert res["usable"] is True and res["answer"]["over_limit"] is True and "text" not in res["answer"]
+    full = Path(res["answer"]["path"]).read_bytes()
+    assert len(full) > 20000
+    r = _tool("consult_result", {"call_id": "t13", "answer_limit": 5000})  # clamped to 3000 bytes
+    assert len(r["answer"]["text"].encode()) <= consult.RESULT_ANSWER_MAX and r["answer"]["truncated"] is True
+    assert encoded_size(r) <= consult.RESULT_BUDGET_BYTES
+    parts, off = [], 0
+    for _ in range(200):
+        r = _tool("consult_result", {"call_id": "t13", "answer_offset": off, "answer_limit": 3000})
+        assert encoded_size(r) <= consult.RESULT_BUDGET_BYTES
+        parts.append(r["answer"]["text"])
+        off = r["answer"]["next_offset"]
+        if off is None:
+            break
+    assert "".join(parts).encode() == full
+
+
+def test_t14_call_dir_comes_from_the_job_record_not_this_processs_tmpdir(mw, monkeypatch):
+    _start(mw, "t14")
+    assert _collect("t14")["outcome"] == "ANSWERED"
+    other = mw.w / "tmp2"
+    other.mkdir()
+    monkeypatch.setenv("TMPDIR", str(other))
+    monkeypatch.setattr(tempfile, "tempdir", str(other))
+    r = _tool("consult_result", {"call_id": "t14"})
+    assert r["usable"] is True and r["call_dir"] == os.path.join(mw.out_root, "t14")
+    mw.jm.run("consult-t14x", ["/bin/echo", "hi"], cwd=str(mw.w))
+    assert "consult_job_not_a_call" in _tool_err("consult_result", {"call_id": "t14x"})
+    assert "consult_call_not_found" in _tool_err("consult_result", {"call_id": "nope"})
+
+
+def test_t15_result_wait_is_capped_at_the_mcp_in_tool_limit(mw):
+    mw.set_mode("hang")
+    pkt = make_packet(mw.w)
+    pkt["limits"]["deadline_s"] = 60
+    _start(mw, "t15", pkt)
+    r = _tool("consult_result", {"call_id": "t15", "wait_s": 50, "after_version": 0})
+    assert r["state"] == "running" and r["usable"] is False and r["outcome"] is None
+    assert r["wait_path"]["route"] == "mcp" and r["wait_path"]["applied_s"] == 25.0
+
+
+def test_t16_post_target_is_checked_before_launch_then_consult_post_posts_once(mw, monkeypatch):
+    co = _board(mw.w)
+    monkeypatch.setattr(mw.ms, "_co", lambda: co)
+    bad = _start(mw, "t16a", post_task="t", post_reply_to="nope", sender="ex")
+    assert bad["outcome"] == "NOT_STARTED" and bad["reason"].startswith("post_preflight: consult_reply_to_not_found")
+    assert _jobs(mw.w) == [] and _staged(mw) == []
+    part = _start(mw, "t16b", post_task="t", sender="ex")
+    assert part["outcome"] == "NOT_STARTED" and "go together" in part["reason"] and _jobs(mw.w) == []
+    ok = _start(mw, "t16c", post_task="t", post_reply_to="req1", sender="ex")
+    assert ok["job_id"] == "consult-t16c" and _reports(co) == []  # the start posts nothing
+    res = _collect("t16c")
+    assert res["outcome"] == "ANSWERED"
+    _tool("consult_post", {"task_id": "t", "sender": "ex", "reply_to": "req1", "call_dir": res["call_dir"]})
+    (rep,) = _reports(co)
+    assert rep["reply_to"] == "req1" and rep["artifact_ref"] == res["answer"]["path"]
+
+
+def test_t17_an_mcp_started_target_gets_only_the_allowlisted_environment(mw, monkeypatch):
+    monkeypatch.setenv("FOO_TOKEN", "do-not-pass")
+    _start(mw, "t17")
+    res = _collect("t17")
+    rec = json.loads(Path(res["receipt_path"]).read_text())
+    want = {"PATH", "HOME", consult.ADVISORY_ENV, consult.COORD_DIR_ENV, consult.RECURSION_ENV, "CLAUDE_BIN"}
+    want |= {k for k in consult.PASS_THROUGH_KEYS if os.environ.get(k)}
+    assert set(rec["env_keys_passed"]) == want and "FOO_TOKEN" not in rec["env_keys_passed"]
+    dumped = json.loads((mw.w / "repo" / "env.dump.json").read_text())
+    assert "FOO_TOKEN" not in dumped and dumped[consult.COORD_DIR_ENV] == os.path.join(res["call_dir"], "coord")

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 from functools import lru_cache
+from typing import Literal
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -21,7 +22,7 @@ from .coord import Coordinator
 from .execution import ExecutionManager
 from .jobs import DEFAULT_TAIL_BYTES, JOIN_MAX_S, JobManager
 from .waitpath import MCP_SAFE_WAIT_S, plan_wait, check_wait, preferred_pattern
-from .model import ProtocolError
+from .model import ProtocolError, require_authority
 from .store import CoordStore, StoreError
 
 _READ = ToolAnnotations(readOnlyHint=True)
@@ -1908,7 +1909,7 @@ async def sched_verify(
 @mcp.tool(title="Job Status", annotations=_READ)
 async def job_status(job_id: str, tail_bytes: int = 0) -> dict:
     """Compact status of one owned local job (started by the owned CLI `job-run`; there is no MCP
-    launch route). Field-selected, fits the 4 KB budget, references retained output by path;
+    launch route except consult_start's fixed consult job). Field-selected, fits the 4 KB budget, references retained output by path;
     a job whose supervisor vanished reads as effective_status=unknown without rewriting the record.
 
     Args:
@@ -2021,7 +2022,7 @@ async def consult_post(
     message_id: str | None = None,
 ) -> dict:
     """Post ONE `report` for a finished consult call (mode 1). Launches nothing: it reads receipt.json (and
-    answer.md when ANSWERED) from the call directory the `mycelium-coord consult call` CLI made, re-hashes the
+    answer.md when ANSWERED) from the call directory the `mycelium-coord consult call` CLI or consult_start made, re-hashes the
     answer against the receipt's recorded sha256 (a tampered answer is refused: consult_answer_sha_mismatch) and
     sends one report from this server process, which holds the sender's send capability. ANSWERED: the answer file
     is the artifact_ref and the receipt sha256 is the evidence. Any other outcome: a report stating the outcome
@@ -2031,7 +2032,8 @@ async def consult_post(
         task_id: Task id.
         sender: Attached participant id posting the report (this server process must hold its capability).
         reply_to: message_id of the review_request / consult_request being answered; the report goes to its sender.
-        call_dir: The finished call's directory (the `call_dir` printed by `consult call`).
+        call_dir: The finished call's directory (the `call_dir` printed by `consult call` or returned by
+            consult_start / consult_result).
         message_id: Optional idempotency key; default derived from the call id.
     """
     return await asyncio.to_thread(
@@ -2039,6 +2041,83 @@ async def consult_post(
             "consult_post",
             lambda: consult.post_report(
                 _co(), task_id=task_id, sender=sender, reply_to=reply_to, call_dir=call_dir, message_id=message_id
+            ),
+        )
+    )
+
+
+@mcp.tool(title="Consult Start", annotations=_WRITE_NI)
+async def consult_start(
+    target: Literal["codex", "claude", "antigravity"],
+    packet: dict,
+    call_id: str | None = None,
+    post_task: str | None = None,
+    post_reply_to: str | None = None,
+    sender: str | None = None,
+) -> dict:
+    """Start ONE call-mode consult (mode 1): a transient, headless, read-only session of the target host answers the
+    packet. The only MCP launch route: the server builds a fixed argv for the existing `mycelium-coord consult call`
+    and starts it as a detached owned job, so the call survives this server exiting and is bounded by the packet's
+    limits.deadline_s (there is no MCP cancel). Returns within a few seconds with state started / replayed / ended;
+    collect with consult_result(call_id). Refusals decided before anything is created come back as outcome
+    REFUSED (recursion: this process runs inside a called target) or NOT_STARTED (invalid packet, deadline too long,
+    post check failed); a busy (user, target) lane is REFUSED with retryable=true. Not available in restricted
+    (advisory) processes.
+
+    Args:
+        target: codex | claude | antigravity.
+        packet: A consult-packet/1 object (at most 64 KiB; refused, never trimmed).
+        call_id: Optional idempotency key ([A-Za-z0-9._:-], <= 112 chars). The same call_id with the same packet
+            replays; with a different packet it is refused (consult_call_id_conflict).
+        post_task: With post_reply_to and sender: checked BEFORE launch that a report could be posted later with
+            consult_post (posts nothing now).
+        post_reply_to: message_id of the review_request / consult_request the report will answer.
+        sender: Attached participant id that will post the report.
+    """
+
+    def go():
+        if os.environ.get(consult.RECURSION_ENV):
+            return consult.recursion_refusal()  # first: before any store is constructed
+        require_authority("consult-start")
+        co = _co() if (post_task or post_reply_to or sender) else None
+        return consult.start_call(
+            _jm(), co, target=target, packet=packet, call_id=call_id,
+            post={"task": post_task, "reply_to": post_reply_to, "sender": sender},
+        )
+
+    return await asyncio.to_thread(lambda: _wrap("consult_start", go))
+
+
+@mcp.tool(title="Consult Result", annotations=_READ)
+async def consult_result(
+    call_id: str,
+    wait_s: float = 0.0,
+    after_version: int | None = None,
+    host_yield_s: float | None = None,
+    answer_offset: int = 0,
+    answer_limit: int = 0,
+) -> dict:
+    """State of a call started with consult_start: running, finished (outcome from its receipt) or
+    ended_without_receipt (usable=false). Only outcome ANSWERED with usable=true is a result; every other outcome
+    (NOT_STARTED, REFUSED, UNAVAILABLE, TIMED_OUT) is CANNOT-EVALUATE, never "found nothing". A receipt is trusted only
+    when its call id and packet hash match this call's job; the answer is re-hashed against the receipt. With
+    wait_s > 0 it waits INSIDE the tool once for the job to end (applied = min(wait_s, host_yield_s - 5, 50), 25 s by
+    default; wait_path reports it); call again to keep waiting. Response <= 4 KB.
+
+    Args:
+        call_id: The call_id consult_start returned.
+        wait_s: Requested in-tool wait while the call runs (0 = read now).
+        after_version: Last seen state_version; a newer version returns at once.
+        host_yield_s: Your host's configured tool-call yield, only if you set one (default 30).
+        answer_offset: Byte offset of the answer page to inline (from the previous next_offset).
+        answer_limit: Bytes of answer text to inline (0 = path and sha256 only; at most 3000).
+    """
+    return await asyncio.to_thread(
+        lambda: _wrap(
+            "consult_result",
+            lambda: consult.call_result(
+                _jm(), call_id, wait_s=wait_s, after_version=after_version, host_yield_s=host_yield_s,
+                answer_offset=answer_offset, answer_limit=answer_limit,
             ),
         )
     )

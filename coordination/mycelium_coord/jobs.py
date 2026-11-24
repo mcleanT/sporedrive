@@ -1,8 +1,8 @@
 """Owned local jobs (efficiency v2, criterion 2): a small run/join path for work launched through
 the host-authorized shell.
 
-* ``run`` is CLI-only. The command is started by the owned CLI so its processes inherit the host
-  shell's permissions; nothing here exposes arbitrary command execution over MCP.
+* ``run`` is reached from the CLI and from exactly one fixed-argv MCP route (``consult_start``,
+  consult.start_call); no caller-chosen argv is ever exposed over MCP.
 * Every job has an immutable request record (identity, argv, cwd, deadline, stop policy, and the
   managed execution reservation it runs under) and a mutable status record. Output is retained
   complete on disk (``stdout.log`` / ``stderr.log`` / ``supervisor.log``) under the coordination
