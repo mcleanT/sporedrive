@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mode 2 "link" (docs/triangle/TWO-MODES-DESIGN.md sections 3-5): two named live sessions pinned to one task.
 In-process, one process holds every capability it attached; ``sendcap.forget()`` makes this process look like a
-second process that never attached. Nothing here launches a model CLI. Run on Betty only.
+second process that never attached. Nothing here launches a model CLI.
 """
 
 from __future__ import annotations
@@ -1066,7 +1066,7 @@ GOLDEN = Path(__file__).resolve().parent / "fixtures" / "legacy_golden_01d5b25.j
 
 
 def test_legacy_task_is_byte_identical_to_the_pre_change_golden(tmp_path, monkeypatch):
-    """The golden was produced by commit 01d5b25 (before the two-modes change) on Betty with a frozen clock
+    """The golden was produced by commit 01d5b25 (before the two-modes change) on the test cluster with a frozen clock
     (`git archive 01d5b25`, the same scenario as below, participant send capabilities stripped). The current
     code must reproduce every file of a legacy task (triangle-kinds + send-capability, no session-links)."""
     golden = json.loads(GOLDEN.read_text())

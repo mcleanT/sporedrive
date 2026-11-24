@@ -12,7 +12,7 @@ automatically (a retry is another billed model turn), so a stored accepted/uncer
 
 Routes: claude -> thin adapter over bridge_link.notify_via_bridge; codex -> ``codex exec resume``
 (opt-in per task, headless-owned threads only); antigravity and any unknown host -> not_supported
-(next-turn inbox only). See docs/triangle/M6_WAKE_DESIGN.md.
+(next-turn inbox only). See docs/triangle/FEATURES.md (Wake).
 """
 
 from __future__ import annotations

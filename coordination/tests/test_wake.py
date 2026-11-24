@@ -2,7 +2,7 @@
 """M6 wake: registry, gates, outcome vocabulary and the Codex exec-resume route.
 
 A FAKE codex executable stands in for the real one (no real codex, agy or claude runs, the real
-~/.codex queue DB is never read: every test points the queue at a fixture path). Run on Betty only.
+~/.codex queue DB is never read: every test points the queue at a fixture path).
 """
 
 from __future__ import annotations
@@ -562,8 +562,8 @@ def test_managed_paused_execution_refuses_before_run(tmp_path, monkeypatch):
 
 
 # ------------------------------------------------------------------ queue guard
-# The REAL Codex queue schema (codex 0.171.0, captured from a scratch copy of ~/.codex/queue_1.sqlite;
-# evidence/m6-queue-check/real-queue-schema.sql). Drained items are DELETED from queued_items, but the
+# The REAL Codex queue schema (codex 0.171.0, captured from a scratch copy of ~/.codex/queue_1.sqlite).
+# Drained items are DELETED from queued_items, but the
 # revision triggers leave a permanent queued_thread_revisions row per thread — which must NOT count.
 _REAL_QUEUE_SCHEMA = """
 CREATE TABLE queued_items (id TEXT PRIMARY KEY NOT NULL, thread_id TEXT NOT NULL, payload_json TEXT NOT NULL,

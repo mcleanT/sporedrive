@@ -45,7 +45,8 @@
   antigravity takes the MINIMUM of a caller-supplied host_yield_s and 25 s (a caller can only lower it) and returns
   ok=False with a `problem` for any inner wait above that; result carries host, shell_route and note.
 - Old-reader check: test_triangle_advisory.py::test_old_reader_reads_everything_a_new_server_writes runs the
-  base package (docs/triangle/evidence/base-91546b3, a `git archive` of 91546b3) against a store written by the new code.
+  base package (a `git archive` of commit 91546b3, passed in with `MYCELIUM_BASE_PKG`; the test skips without it) against a
+  store written by the new code.
 
 ## Limits of advisory containment (lead note, 2026-11-22)
 - MYCELIUM_COORD_ADVISORY is a property of the coord PROCESS: the MCP server or CLI started for that host. It is enforced only on that MCP or CLI surface.
@@ -63,7 +64,7 @@
   the caller's claim), or is an observer whose stored host+session equal the caller's (the same advisory identity
   re-attaching or moving to another task, which moves its selection).
   NON-advisory processes are unchanged: last attach wins the native-session selection.
-- Pending lead decision, after the Betty verify of round 2: per-conversation observer ids (`agy-<conv8>`), or allowing re-attach onto a DETACHED observer record of the same host.
+- Pending lead decision, after the round-2 verification: per-conversation observer ids (`agy-<conv8>`), or allowing re-attach onto a DETACHED observer record of the same host.
 - Non-advisory last-attach-wins (unchanged, round 3): outside an advisory process any attach with a host+session overwrites
   that native session's selection. Only advisory processes are protected against selection capture.
 
@@ -111,8 +112,8 @@
   (`clear` | `queued` | `unknown`). An absent DEFAULT DB (`~/.codex/queue_1.sqlite`) is `unknown` (refused `queue_unknown`) when
   another `~/.codex/queue_*.sqlite` exists (the `-shm`/`-wal` sidecars do not count); an absent env-override path stays
   `clear`.
-  Env overrides: `MYCELIUM_WAKE_CODEX_BIN`, `MYCELIUM_WAKE_CODEX_ARGS` (JSON list of extra args, e.g. the isolation
-  flags in evidence/m6-p3/run.sh; any bypass flag is refused). Fixed prompt: "New coordination message {mid} on task {tid}
+  Env overrides: `MYCELIUM_WAKE_CODEX_BIN`, `MYCELIUM_WAKE_CODEX_ARGS` (JSON list of extra args, e.g. Codex isolation
+  flags; any bypass flag is refused). Fixed prompt: "New coordination message {mid} on task {tid}
   for participant {pid}. Read it with coord_inbox (task {tid}, participant {pid}), acknowledge it with coord_ack (task {tid},
   participant {pid}, message {mid}), then act within your role." Outcome is read from the store after the run:
   acknowledged / completion_claimed / completed, or the cursor moved past the message -> `accepted`; otherwise (clean exit
@@ -151,7 +152,7 @@
   lock, so a takeover landing in the moment between that check and the keystroke is not excluded (the same window the
   execution pause gate has). The Codex route re-checks under the task lock held through launch.
 - Review: Codex scoped review (9 findings: 7 fixed, 1 accepted limit, 1 test gap fixed) and one targeted verification
-  (7 closed; the two items above documented). Evidence: evidence/sendcap-review/, live smoke evidence/sendcap-smoke/.
+  (7 closed; the two items above documented). A live smoke also passed; its records are kept privately.
 
 ## Call mode (mode 1, 2026-11-23; design TWO-MODES-DESIGN.md v1.5)
 A transient, headless, read-only call: a brand-new session of Codex, Claude Code or Antigravity gets one written packet

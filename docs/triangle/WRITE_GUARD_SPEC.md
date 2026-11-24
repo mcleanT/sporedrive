@@ -2,11 +2,9 @@
 
 **Owner request:** "prevent agents from 2 sessions from overwriting eachother".
 
-**Design:** refuse STALE whole-file overwrites (optimistic concurrency). This mirrors Claude Code's built-in rule. It is not file ownership. Decision record: Science/.living/decisions.md [2026-11-22].
+**Design:** refuse STALE whole-file overwrites (optimistic concurrency). This mirrors Claude Code's built-in rule. It is not file ownership.
 
-**Evidence:**
-- evidence/m2-probes.json: Claude 6 runs, Codex 6, agy 5.
-- Pre-checks: scratchpad/m2pre, 4 runs; summarised in BUILD.md.
+**Evidence:** probe runs before implementation (Claude 6, Codex 6, agy 5, plus 4 pre-checks). The raw records are kept privately.
 
 ## Verified host facts this spec relies on
 | Host | Whole-file overwrite tool | Native staleness check | Hook payload path | Read signal |
@@ -68,9 +66,7 @@ were not probed separately; treat them as blocking.
   - `python3 writeguard.py selftest` runs offline checks.
 
 ## Location
-`coordination/mycelium_coord/writeguard.py` must be runnable standalone. Tests go in `coordination/tests/test_writeguard.py`. Payload fixtures are taken from the real probe logs and sanitised:
-- scratchpad/m2/{claude,codex,antigravity}
-- scratchpad/m2pre/{agy,codex}
+`coordination/mycelium_coord/writeguard.py` must be runnable standalone. Tests go in `coordination/tests/test_writeguard.py`. Payload fixtures are taken from the real probe logs and sanitised (`coordination/tests/fixtures/writeguard/`).
 
 Registration templates are NOT installed:
 - `docs/triangle/proposed/writeguard-hooks/claude-settings-hooks.json`: PreToolUse matcher `Bash` (warn, and the Round 5 PRE snapshot); PostToolUse matcher `Bash|Read|Write|Edit|MultiEdit` (record).
@@ -79,7 +75,7 @@ Registration templates are NOT installed:
 - Every template registers a PRE hook for the host's shell tool (Claude `Bash`, Codex `Bash`, agy `run_command`). Since Round 5 this is load-bearing: the deny, `cat`, retry unlock only works because the PRE hook snapshots the file before the `cat` runs. A test (`test_templates_register_a_pre_hook_for_the_shell_tool`) reads the three templates and checks it.
 
 ## Acceptance (checked by file content)
-1. **Unit tests on Betty:**
+1. **Unit tests on the test cluster:**
    - path extraction per host from real fixtures (incl. relative paths, Move to, multi-file);
    - the signature rules (a)–(c) below;
    - deny formats;
@@ -92,32 +88,32 @@ Registration templates are NOT installed:
    - (b) agy write_file to a new file is allowed. Rewriting its own just-written file is allowed.
    - (c) Codex Add File over an existing, unread file is **denied** and the file is unchanged. After `cat` of the unchanged file, Add File is allowed.
    - (d) A Codex shell `printf > f` over a changed file is NOT denied, and a warning is logged. Report it as uncovered.
-3. Full suite on Betty: no new failures vs baseline.
+3. Full suite on the test cluster: no new failures vs baseline.
 
 ## Results
 Implemented 2026-11-22. Nothing was installed or registered globally. Hooks were registered per run or per workspace only.
 
-| Item | Result | Evidence |
-|---|---|---|
-| 1. Unit tests on Betty (venv-fastmcp) | PASS, 46 passed | evidence/betty/writeguard-unit.txt |
-| 2a. agy stale overwrite denied, re-read, both lines present | PASS | evidence/m2-smoke/{c.after_external.txt,c.txt,events.log,turn2.out} |
-| 2b. agy new file allowed, own rewrite allowed | PASS | evidence/m2-smoke/{new.txt (v2),turn1.out}; no deny logged for turn 1 |
-| 2c. Codex Add File over existing unread file denied and unchanged, then allowed after cat | PASS | evidence/m2-smoke/{run1.jsonl,last.txt,existing.before,existing.txt,events.log} |
-| 2d. Codex shell `>` over a changed file not denied, warning logged, reported as UNCOVERED | PASS (uncovered, by design) | evidence/m2-smoke/{g.txt,events.log} |
-| 3. Full suite on Betty | PASS, 303 passed, 2 skipped, 0 failed | evidence/betty/writeguard-full-suite.txt |
+| Item | Result |
+|---|---|
+| 1. Unit tests on the test cluster | PASS, 46 passed |
+| 2a. agy stale overwrite denied, re-read, both lines present | PASS |
+| 2b. agy new file allowed, own rewrite allowed | PASS (no deny logged for turn 1) |
+| 2c. Codex Add File over existing unread file denied and unchanged, then allowed after cat | PASS |
+| 2d. Codex shell `>` over a changed file not denied, warning logged, reported as UNCOVERED | PASS (uncovered, by design) |
+| 3. Full suite on the test cluster | PASS, 303 passed, 2 skipped, 0 failed |
 
 Notes:
-- 2a: agy conversation 6ed2602a-e644-421f-840c-c2acff61e5a0, turns 1 and 2 (resumed with --conversation). Between the turns EXTERNAL-LINE was appended outside agy. write_file was denied, the file kept EXTERNAL-LINE, and after a re-read the write landed with line-one, EXTERNAL-LINE and AGY-LINE. The deny is in events.log.
-- 2c: Codex session 01a20629-f2f4-7c41-9239-7ec8ba859098. `cat existing.txt` after the refusal printed `original-existing`, so the file was unchanged at denial time. The retry then wrote NEW-CONTENT.
+- 2a: one agy conversation, turns 1 and 2 (resumed with --conversation). Between the turns EXTERNAL-LINE was appended outside agy. write_file was denied, the file kept EXTERNAL-LINE, and after a re-read the write landed with line-one, EXTERNAL-LINE and AGY-LINE. The deny is in events.log.
+- 2c: one Codex session. `cat existing.txt` after the refusal printed `original-existing`, so the file was unchanged at denial time. The retry then wrote NEW-CONTENT.
 - 2d: the "external" change was simulated inside the same Codex session with a shell `>>` append, which the guard does not record as a read or write. It is not a second real session. The overwrite command was not blocked, and an `uncovered_shell_overwrite` line was logged.
 - Model runs used: 3 of 6 (agy 2, Codex 1).
 - Bug found by the unit tests and fixed: the patch parser returned the operation name "Add" instead of "Add File".
 - The full-suite count (303) cannot be reconciled with the 292 baseline, because the test files differ from the baseline run. The result is 0 failed.
-- Registration templates: docs/triangle/proposed/writeguard-hooks/. The agy template uses the verified top-level group shape with matcher `*`. The Codex and Claude matchers (`apply_patch|Bash`, `Bash|Read|Write|Edit|MultiEdit`) are standard regexes, not separately verified. The Codex smoke did use `apply_patch|Bash` with explicit `timeout=10`, and it fired.
+- Registration templates: docs/triangle/proposed/writeguard-hooks/. The agy template uses the verified top-level group shape; its matcher was narrowed from `*` to the guarded tools on 2026-11-24. The Codex and Claude matchers (`apply_patch|Bash`, `Bash|Read|Write|Edit|MultiEdit`) are standard regexes, not separately verified. The Codex smoke did use `apply_patch|Bash` with explicit `timeout=10`, and it fired.
 
 ## Round 2 fixes
 
-Status: implemented and tested. The Betty run of 2026-11-23 passed (see Round 3: 483 passed, and docs/triangle/evidence/betty/ for the later full suites). An earlier draft of this line said the tests had not run because Betty was unreachable; that no longer holds.
+Status: implemented and tested. The test-cluster run of 2026-11-23 passed (see Round 3: 483 passed).
 
 - W1 fail-open on unwritable store: before any deny (enforce or warn), `store_writable()` writes and removes a probe file in the session's record dir. On OSError the hook allows, logs to errors.log if possible, and for claude/codex adds additionalContext "write guard inactive: state dir not writable". `record()` never raises. Tests: `test_unwritable_store_regular_file_allows`, `test_unwritable_store_readonly_dir_allows` (skipped as root).
 - W2 shell parsing: `tokens()` is now a quote-aware tokenizer; unquoted newlines split commands like `;`; a quoted `>` (or any quoted operator word) is never an operator, so it neither flags an overwrite nor updates the last-writer ledger. `>>` is still never flagged. Tests: `test_shell_reads`, `test_shell_overwrites` additions, `test_quoted_gt_and_newline_do_not_record`.
@@ -132,7 +128,7 @@ Governing rule: WHEN UNSURE, RECORD NOTHING. A missed record only causes a later
 - The PostToolUse shell branch records reads and overwrite targets ONLY from `shell_effects`; if it returns None nothing is recorded. The pre-event warning (`shell_overwrites`) stays loose and never denies.
 - Counter-check: every real captured shell fixture (codex_*_bash_*, claude_*_bash*, agy_*run_command*) records exactly what it recorded before (test `test_real_shell_fixtures_record_exactly_what_they_did_before`); none contains a gated construct. Common Codex forms (`cat f`, `sed -n '1,200p' f`, `nl -ba f | sed -n '1,80p'`, `head -n 50 f && tail -n 5 g`, `cd sub && cat f`) still record.
 - Tests restated as safety properties (recording nothing is acceptable): subshell cd leak, untested clauses, heredoc body, glued operators.
-- Betty result (2026-11-23): targeted test_writeguard.py + test_triangle_advisory.py 181 passed (plus one test of mine that was wrong and removed); full suite `coordination/tests tests`: 483 passed, 3 skipped, 1 failed. The 1 failure is the known pre-existing flake `test_jobs.py::test_join_stops_on_paused_execution_and_on_stop_policy_is_honored`. Output: evidence/betty/round3-full-suite.txt.
+- Test-cluster result (2026-11-23): targeted test_writeguard.py + test_triangle_advisory.py 181 passed (plus one test of mine that was wrong and removed); full suite `coordination/tests tests`: 483 passed, 3 skipped, 1 failed. The 1 failure is the known pre-existing flake `test_jobs.py::test_join_stops_on_paused_execution_and_on_stop_policy_is_honored`.
 
 ## Round 4: trusted command shapes (2026-11-23)
 Four review rounds each found a new shell form that slipped past a DENYLIST of gated constructs. Round 4 replaces it with a POSITIVE definition: `shell_effects(cmd, cwd)` trusts a command only if it matches the grammar below in full; anything else records NOTHING. A missed record only causes a later "re-read first" deny (safe); a wrong record grants false freshness (the bug). No new denylist entries are the mechanism.
@@ -163,7 +159,7 @@ UNCOVERED (these record NOTHING now, by design; each only costs a later "re-read
 Accepted residual: a non-redirect creator (`cat m.txt; touch m.txt`) of a path read earlier in the same command records a read of a file the command itself created (the oracle alphabet cannot create files any other way). `CDPATH` set in the host environment could redirect `cd <dir>`; the oracle unsets it.
 
 ## Round 5: freshness only for content the session saw (review 2026-11-23, F1, F3)
-Why: in Rounds 1 to 4 a shell read was recorded at POST with the file's signature at that moment. `cat plan.md && make test` therefore credited every edit another session made while the test ran, and a later whole-file write silently dropped it. Two directions, both reproduced on Betty, both now closed:
+Why: in Rounds 1 to 4 a shell read was recorded at POST with the file's signature at that moment. `cat plan.md && make test` therefore credited every edit another session made while the test ran, and a later whole-file write silently dropped it. Two directions, both reproduced on the test cluster, both now closed:
 - **Read direction.** At PRE, for a shell tool (Codex `Bash`, Claude `Bash`, agy `run_command`), the hook computes `shell_effects` and snapshots the signature of each candidate read path (under `<dir>/pending/<host>/<session>/<key>.json`). At POST a shell read is recorded only if a snapshot exists for the call AND the file's signature is unchanged; what is recorded is the snapshot signature. No snapshot (no PRE hook ran, or the command was not parsable) records nothing. A later whole-file write is then denied, as for any unread file.
 - **Overwrite direction.** `echo x > f; make` credited an edit made during `make`. A shell overwrite is now recorded only when EVERY program in the command is in the known fast set (`FAST_PROGS`: the read commands `cat head tail sed nl wc less bat`, plus `echo printf true false :`). Anything else (make, pytest, sleep, ...) records no overwrite. The remaining window is hook latency for a command that is fast by construction.
 - **Native read tools** (agy `read_file`, Claude `Read`): the same PRE and POST equality applies when a PRE snapshot exists; without one the plain POST record is kept (Claude's matcher has no PRE hook for `Read`).
@@ -172,7 +168,7 @@ Why: in Rounds 1 to 4 a shell read was recorded at POST with the file's signatur
 - **F3 (Codex apply_patch).** The POST records only when `tool_response` is a string that starts with `Exit code: 0` and contains `Success` (as in the captured fixture). A failed patch, an empty or missing response, or any other shape records nothing.
 - **Hook host list.** `writeguard.HOSTS` stays a copy (the script is standalone); a test asserts it equals `model.HOST_KINDS` (F14).
 - **Oracle.** `test_writeguard_oracle.py` still drives `shell_effects` directly (`WG_ORACLE ...`; its coverage floor of 0.15 is unchanged). A new hook-level test drives the real hook: PRE, a real shell, POST (`WG_ORACLE_HOOK ...`). Session S1 is posted at once (control: reads must be credited), session S2 after every file was rewritten by "another session" (no read may be credited).
-- Betty results: see docs/triangle/evidence/betty/review-repair-full-suite.txt and BUILD.md.
+- Test-cluster results are kept with the private build record.
 
 ## Running alongside Mycelium (compat pass, 2026-11-24)
 Scope: every Mycelium function on Claude Code, Codex and Antigravity, checked against Mycelium main 0.9.7 and the
