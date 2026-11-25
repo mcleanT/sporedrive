@@ -2642,14 +2642,14 @@ def test_rf2_reader_after_cd_is_possible_but_an_absolute_operand_is_exact(tmp_pa
 def test_rf3_transient_prelaunch_oserrors_are_retryable(world, monkeypatch, site, eno, want):
     out_root = str(world / "out")
     if site == "out_root":
-        real = os.makedirs
+        real = os.mkdir  # make_dirs_private creates the out root with os.mkdir (0700, parents included)
 
         def mk(path, *a, **k):
             if str(path) == out_root:
                 raise OSError(eno, os.strerror(eno))
             return real(path, *a, **k)
 
-        monkeypatch.setattr(consult.os, "makedirs", mk)
+        monkeypatch.setattr(consult.os, "mkdir", mk)
     elif site == "call_dir":
         real = os.mkdir
 
