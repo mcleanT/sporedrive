@@ -3668,13 +3668,48 @@ def test_f2b_mcp_route_makes_an_owned_read_only_out_root_private_and_the_call_ru
     assert _mode(root) == 0o700 and _mode(root / consult.PACKET_STAGE_DIR) == 0o700
 
 
-def test_f2b_cli_route_makes_an_owned_read_only_out_root_private_and_the_call_runs(world, umask022):
-    out = world / "out"
+def test_f2b_cli_route_makes_the_default_out_root_private_and_the_call_runs(world, monkeypatch, umask022):
+    monkeypatch.setenv("TMPDIR", str(world / "tmp"))
+    monkeypatch.setattr(tempfile, "tempdir", str(world / "tmp"))
+    root = Path(consult.default_out_root())
+    root.mkdir(mode=0o700)
+    root.chmod(0o755)
+    rec = consult.run_call(
+        "claude",
+        write_packet(world, make_packet(world)),
+        out_root=None,
+        env=caller_env(world),
+        path=os.environ["PATH"],
+        extra_env=fake_bin(world, "claude", "normal"),
+    )
+    assert rec["outcome"] == "ANSWERED", rec
+    assert _mode(root) == 0o700
+
+
+@pytest.mark.parametrize("route", ["cli", "mcp"])
+def test_f2b_an_out_root_the_caller_chose_is_never_chmodded(world, monkeypatch, route, umask022):
+    # a chosen root may be a home folder or a directory others are meant to read: refuse it, never change it
+    out = world / "chosen"
     out.mkdir()
     out.chmod(0o755)
-    rec = call(world)
-    assert rec["outcome"] == "ANSWERED", rec
-    assert _mode(out) == 0o700
+    if route == "cli":
+        rec = consult.run_call(
+            "claude",
+            write_packet(world, make_packet(world)),
+            out_root=str(out),
+            env=caller_env(world),
+            path=os.environ["PATH"],
+            extra_env=fake_bin(world, "claude", "normal"),
+            lock_dir=str(world / "locks"),
+        )
+    else:
+        pytest.importorskip("fastmcp")
+        from mycelium_coord.jobs import JobManager
+
+        jm = JobManager(CoordStore(str(world / "store")))
+        rec = consult.start_call(jm, None, target="claude", packet=make_packet(world), call_id="f2c", out_root=str(out))
+    assert rec["outcome"] == "NOT_STARTED" and "private" in rec["reason"], rec
+    assert "chmod 700 it" in rec["reason"] and _mode(out) == 0o755
 
 
 @pytest.mark.parametrize("mode", [0o775, 0o757, 0o1777])
@@ -3684,7 +3719,7 @@ def test_f2b_an_out_root_others_could_write_is_still_refused_and_left_unchanged(
     root.chmod(mode)
     r = _start(mw, "f2w")
     assert r["outcome"] == "NOT_STARTED" and r["job_id"] is None and "private" in r["reason"], r
-    assert "remove it or use another out root" in r["reason"]
+    assert "use another out root" in r["reason"]
     assert _mode(root) == mode and _jobs(mw.w) == []
 
 

@@ -224,8 +224,8 @@ def private_dir_problem(path: str):
     if st.st_uid != os.getuid() or st.st_mode & 0o077:
         return (
             f"{path} is not private to this user (owner uid {st.st_uid}, mode {stat.S_IMODE(st.st_mode):o}); "
-            "remove it or use another out root (a directory this user owns that others can read but not write "
-            "is made private automatically)"
+            "chmod 700 it, remove it, or use another out root (only the default out root is made private "
+            "automatically, and only when others can read it but not write it)"
         )
     return None
 
@@ -248,6 +248,17 @@ def make_dirs_private(path: str) -> None:
             os.mkdir(d, 0o700)
         except FileExistsError:
             pass
+
+
+def tighten_default_out_root(out_root: str) -> None:
+    """Make the DEFAULT out root (and its packets/) private when an earlier build left it readable by others. Only
+    that root is touched: this code names it and nothing else lives there. A root the caller chose is never
+    changed (it may be a home folder or a directory others are meant to read); the gate refuses it instead."""
+    if os.path.abspath(out_root) != os.path.abspath(default_out_root()):
+        return
+    for d in (out_root, os.path.join(out_root, PACKET_STAGE_DIR)):
+        if os.path.lexists(d):
+            tighten_own_dir(d)
 
 
 def tighten_own_dir(path: str) -> None:
@@ -1498,7 +1509,7 @@ def _run_call(
         return finish(
             "NOT_STARTED", f"cannot create out root {out_root}: {e}", _os_retryable(e)
         )
-    tighten_own_dir(out_root)
+    tighten_default_out_root(out_root)
     why = private_dir_problem(out_root)
     if why:
         return finish("NOT_STARTED", f"out root not private: {why}", False)
@@ -2219,9 +2230,8 @@ def start_call(
         make_dirs_private(out_root)
     except OSError as e:
         return _start_refused("NOT_STARTED", f"cannot create out root {out_root}: {e}", call_id, _os_retryable(e))
+    tighten_default_out_root(out_root)
     for d in (out_root, os.path.join(out_root, PACKET_STAGE_DIR)):
-        if os.path.lexists(d):
-            tighten_own_dir(d)
         why = private_dir_problem(d) if os.path.lexists(d) else None
         if why:
             return _start_refused("NOT_STARTED", f"out root not private: {why}", call_id)
