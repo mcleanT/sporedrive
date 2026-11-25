@@ -55,7 +55,8 @@ def test_export_ships_the_call_mode_adapters_where_the_candidate_finds_them(tmp_
     # The first live MCP smoke of an exported build: every call ended adapter_missing, because the exporter shipped
     # coordination/ but not src/consult/, which consult.consult_dir() resolves from the exported package.
     stage, _ = ec._stage(SOURCE, tmp_path / "target", "test.adapters", None)
-    assert [n for n in ec.CONSULT_ADAPTERS if not (stage / "src" / "consult" / n).is_file()] == []
+    adapters = ("claude_ask.sh", "codex_call.sh", "agy_ask.py")
+    assert [n for n in adapters if not (stage / "src" / "consult" / n).is_file()] == []
     assert ec._validate_consult_adapters(stage) == []
     _, _, problems, _ = ec._cross_origin(stage, SOURCE, None)
     assert [p for p in problems if "src/consult" in p] == []
