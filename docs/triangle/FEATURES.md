@@ -181,7 +181,9 @@ over. Code: `coordination/mycelium_coord/consult.py`; hosts: `src/consult/{codex
   NOT_STARTED;
   packet over 64 KiB or invalid -> NOT_STARTED; `deadline_s` + 30 + 60 over the 6 h job limit -> NOT_STARTED
   `deadline_too_long`; optional post check (posts nothing) -> NOT_STARTED; an out root or `packets/` that is a symlink, not owned by this user
-  or open to group/other -> NOT_STARTED `out root not private`; an existing call directory this store's jobs did
+  or open to group/other -> NOT_STARTED `out root not private` (every directory a call creates is 0700; the default out
+  root, and only it, is made private first when others can read but not write it; a root the caller chose is never
+  changed); an existing call directory this store's jobs did
   not make -> `consult_call_id_conflict`. The same call_id with the same packet replays; a different packet is
   `consult_call_id_conflict`. `consult_start` returns within about 2 s (`started` / `replayed` / `ended`); a busy lane
   shows inline as REFUSED `busy`, retryable. `consult_result` waits inside the tool 25 s by default (host yield minus 5 s, at most 50 s),

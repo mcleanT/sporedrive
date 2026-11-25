@@ -244,10 +244,14 @@ def build_mcp_json() -> dict:
                 "command": "./coordination/bin/mycelium-coord-mcp",
                 "args": [],
                 "cwd": ".",
+                # The last two mark a called (restricted) session. They are unset in an ordinary session; when a
+                # called Codex session loads this plugin they reach the server, which then refuses consult_start.
                 "env_vars": [
                     "MYCELIUM_COORD_DIR",
                     "MYCELIUM_COORD_PYTHON",
                     "MYCELIUM_BRIDGE_PATH",
+                    "MYCELIUM_COORD_ADVISORY",
+                    "MYCELIUM_CONSULT_TARGET",
                 ],
             }
         }

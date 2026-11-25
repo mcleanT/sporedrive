@@ -222,8 +222,63 @@ def private_dir_problem(path: str):
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
         return f"{path} is not a real directory"
     if st.st_uid != os.getuid() or st.st_mode & 0o077:
-        return f"{path} is not private to this user (owner uid {st.st_uid}, mode {stat.S_IMODE(st.st_mode):o})"
+        return (
+            f"{path} is not private to this user (owner uid {st.st_uid}, mode {stat.S_IMODE(st.st_mode):o}); "
+            "chmod 700 it, remove it, or use another out root (only the default out root is made private "
+            "automatically, and only when others can read it but not write it)"
+        )
     return None
+
+
+def make_dirs_private(path: str) -> None:
+    """``os.makedirs`` except that every directory it creates, missing parents included, is 0700. ``os.makedirs``
+    applies the mode to the leaf only and creates parents with the umask default (0755, or 0775 under umask 002),
+    which the private-out-root gate then refuses: the lock directory of a call made without a store created the
+    default out root that way."""
+    missing = []
+    p = os.path.abspath(path)
+    while not os.path.lexists(p):
+        missing.append(p)
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    for d in reversed(missing):
+        try:
+            os.mkdir(d, 0o700)
+        except FileExistsError:
+            pass
+
+
+def tighten_default_out_root(out_root: str) -> None:
+    """Make the DEFAULT out root (and its packets/) private when an earlier build left it readable by others. Only
+    that root is touched: this code names it and nothing else lives there. A root the caller chose is never
+    changed (it may be a home folder or a directory others are meant to read); the gate refuses it instead."""
+    if os.path.abspath(out_root) != os.path.abspath(default_out_root()):
+        return
+    for d in (out_root, os.path.join(out_root, PACKET_STAGE_DIR)):
+        if os.path.lexists(d):
+            tighten_own_dir(d)
+
+
+def tighten_own_dir(path: str) -> None:
+    """Make private a directory this user owns that others can read or search but not write (an out root left at
+    0755 by an earlier build). Nothing else is touched, so ``private_dir_problem`` still refuses it: another
+    owner, a symlink, a non-directory, or a directory others could have written into (its contents cannot be
+    trusted). Works on a descriptor opened without following symlinks, so a swapped path is never changed."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW)
+    except OSError:
+        return
+    try:
+        st = os.fstat(fd)
+        mode = stat.S_IMODE(st.st_mode)
+        if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and mode & 0o077 and not mode & 0o022:
+            os.fchmod(fd, mode & 0o700)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def consult_dir() -> str:
@@ -683,7 +738,7 @@ class CallLock:
         """The recovery mutex: flock on ``<lock>.mutex``, a sidecar that is never deleted, so every contender locks
         the same inode. Held across read -> dead check -> unlink -> create, and by set_pgid and release, so no record
         is ever vacated or replaced under another contender's feet."""
-        os.makedirs(self.dir, mode=0o700, exist_ok=True)
+        make_dirs_private(self.dir)
         fd = os.open(self.path + ".mutex", os.O_CREAT | os.O_RDWR, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
@@ -1448,12 +1503,13 @@ def _run_call(
         return finish("NOT_STARTED", f"argument: invalid call_id {call_id!r}", False)
     out_root = os.path.abspath(out_root or default_out_root())
     try:
-        os.makedirs(out_root, mode=0o700, exist_ok=True)
+        make_dirs_private(out_root)
     except OSError as e:
         # no call directory exists yet, so there is no receipt; the retryable flag is still the errno's
         return finish(
             "NOT_STARTED", f"cannot create out root {out_root}: {e}", _os_retryable(e)
         )
+    tighten_default_out_root(out_root)
     why = private_dir_problem(out_root)
     if why:
         return finish("NOT_STARTED", f"out root not private: {why}", False)
@@ -2069,7 +2125,7 @@ def _stage_packet(out_root: str, call_id: str, blob: bytes) -> str:
     """Write the packet once (0600, O_EXCL) at <out_root>/packets/<call_id>.json. The same bytes again is a replay;
     different bytes is consult_call_id_conflict (a call id is never re-aimed)."""
     d = os.path.join(out_root, PACKET_STAGE_DIR)
-    os.makedirs(d, mode=0o700, exist_ok=True)
+    make_dirs_private(d)
     p = os.path.join(d, call_id + ".json")
     try:
         fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
@@ -2171,9 +2227,10 @@ def start_call(
             )
     out_root = os.path.abspath(out_root or default_out_root())
     try:
-        os.makedirs(out_root, mode=0o700, exist_ok=True)
+        make_dirs_private(out_root)
     except OSError as e:
         return _start_refused("NOT_STARTED", f"cannot create out root {out_root}: {e}", call_id, _os_retryable(e))
+    tighten_default_out_root(out_root)
     for d in (out_root, os.path.join(out_root, PACKET_STAGE_DIR)):
         why = private_dir_problem(d) if os.path.lexists(d) else None
         if why:
