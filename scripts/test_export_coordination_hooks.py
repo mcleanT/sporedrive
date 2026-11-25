@@ -38,3 +38,14 @@ def test_merge_registers_both_boundaries_idempotently():
 if __name__ == "__main__":
     test_merge_registers_both_boundaries_idempotently()
     print("ok")
+
+
+def test_codex_mcp_config_forwards_the_called_session_markers():
+    # Codex passes only listed variables to a plugin MCP server. A called Codex session that loaded the plugin
+    # would otherwise run an unrestricted server that could start calls of its own.
+    env_vars = ec.build_mcp_json()["mcpServers"]["mycelium-coord"]["env_vars"]
+    assert "MYCELIUM_COORD_ADVISORY" in env_vars and "MYCELIUM_CONSULT_TARGET" in env_vars
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "coordination"))
+    from mycelium_coord import consult
+
+    assert consult.ADVISORY_ENV in env_vars and consult.RECURSION_ENV in env_vars
