@@ -373,14 +373,7 @@ def _cross_origin(stage: Path, source: Path, overlay=None) -> tuple[dict, dict, 
         digest = _sha256(sp)
         if any(rel.startswith(pref) for pref in canon_prefixes):
             # map candidate coordination/bridge/skill file to its canonical origin
-            if rel.startswith("coordination/"):
-                origin = CANONICAL / rel[len("coordination/") :]
-            elif rel.startswith("bridge/"):
-                origin = CANONICAL_BRIDGE / rel[len("bridge/") :]
-            elif rel.startswith("src/consult/"):
-                origin = CANONICAL_CONSULT / rel[len("src/consult/") :]
-            else:  # skills/coordinate/SKILL.md <- canonical coordination/skill/SKILL.md
-                origin = CANONICAL / "skill" / rel[len("skills/coordinate/") :]
+            origin = _canonical_origin(rel)
             canonical[rel] = digest
             if not origin.is_file():
                 problems.append(
@@ -454,6 +447,18 @@ def _validate_bridge_import(stage: Path) -> list[str]:
     if r.returncode != 0 or "ok" not in r.stdout:
         return [f"bridge import failed: {r.stderr.strip()[:200]}"]
     return []
+
+
+def _canonical_origin(rel: str) -> Path:
+    """The repository file a shipped coordination, bridge, skill or call-mode adapter file must equal. The one map
+    for both staging validation and post-swap verification (they were two copies, and the second missed src/consult)."""
+    if rel.startswith("coordination/"):
+        return CANONICAL / rel[len("coordination/") :]
+    if rel.startswith("bridge/"):
+        return CANONICAL_BRIDGE / rel[len("bridge/") :]
+    if rel.startswith("src/consult/"):
+        return CANONICAL_CONSULT / rel[len("src/consult/") :]
+    return CANONICAL / "skill" / rel[len("skills/coordinate/") :]  # skills/coordinate/SKILL.md
 
 
 def _validate_consult_adapters(stage: Path) -> list[str]:
@@ -612,14 +617,10 @@ def verify(target: Path, source: Path, overlay=None) -> tuple[bool, list[str]]:
         if s_o.is_file() and meta.get("replaced_source_sha256") not in (None, _sha256(s_o)):
             problems.append(f"overlay replaced-source hash drifted (source changed since export): {rel}")
     for rel, digest in rec.get("coordination_from_canonical", {}).items():
-        if rel.startswith("coordination/"):
-            o = CANONICAL / rel[len("coordination/") :]
-        elif rel.startswith("bridge/"):
-            o = CANONICAL_BRIDGE / rel[len("bridge/") :]
-        else:
-            o = CANONICAL / "skill" / rel[len("skills/coordinate/") :]
+        o = _canonical_origin(rel)
         if not o.is_file() or _sha256(o) != digest:
             problems.append(f"coordination/bridge != canonical: {rel}")
+    problems += _validate_consult_adapters(target)
     problems += _validate_manifests(target)
     return (not problems), problems
 
