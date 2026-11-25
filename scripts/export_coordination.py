@@ -15,6 +15,7 @@ What the export does:
   * overlays the canonical `coordination/` subsystem and the canonical `bridge/` package (so
     `coord_notify_via_bridge` can import `cmux_bridge` from the installed candidate);
   * ships `skills/coordinate/SKILL.md`;
+  * ships the call-mode adapters `src/consult/` where the exported `consult.consult_dir()` finds them;
   * MERGES the coordination MCP into both plugin manifests (adding `mcpServers: ./.mcp.json` and a
     VALID distinct build version) and adds a conventional plugin-root `.mcp.json`;
   * MERGES a SessionStart coordination attach hook into the existing `hooks/hooks.json` (resolving
@@ -51,6 +52,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]  # codex-claude-workflow
 CANONICAL = REPO / "coordination"  # single canonical coordination source
 CANONICAL_BRIDGE = REPO / "bridge"  # single canonical bridge source
+# call-mode host adapters; consult.consult_dir() resolves <plugin>/src/consult from the exported coordination package
+CANONICAL_CONSULT = REPO / "src" / "consult"
+CONSULT_ADAPTERS = ("claude_ask.sh", "codex_call.sh", "agy_ask.py")
 # Version-controlled core-hook overlay (request-reduction v1): files here replace the same
 # relative path from the SOURCE working tree (never patched in place, never a cache edit) and are
 # verified against this repo, with the replaced source hash recorded for provenance.
@@ -361,7 +365,7 @@ def _cross_origin(stage: Path, source: Path, overlay=None) -> tuple[dict, dict, 
     problems = []
     retained, canonical, overlaid = {}, {}, {}
     overlay_rels = _overlay_files(overlay)
-    canon_prefixes = ("coordination/", "bridge/", "skills/coordinate/")
+    canon_prefixes = ("coordination/", "bridge/", "skills/coordinate/", "src/consult/")
     for rel in _rel_files(stage):
         if rel in _GENERATED:
             continue
@@ -373,6 +377,8 @@ def _cross_origin(stage: Path, source: Path, overlay=None) -> tuple[dict, dict, 
                 origin = CANONICAL / rel[len("coordination/") :]
             elif rel.startswith("bridge/"):
                 origin = CANONICAL_BRIDGE / rel[len("bridge/") :]
+            elif rel.startswith("src/consult/"):
+                origin = CANONICAL_CONSULT / rel[len("src/consult/") :]
             else:  # skills/coordinate/SKILL.md <- canonical coordination/skill/SKILL.md
                 origin = CANONICAL / "skill" / rel[len("skills/coordinate/") :]
             canonical[rel] = digest
@@ -450,6 +456,20 @@ def _validate_bridge_import(stage: Path) -> list[str]:
     return []
 
 
+def _validate_consult_adapters(stage: Path) -> list[str]:
+    """Prove the candidate's own coordination package finds every call-mode adapter: ask the staged
+    consult.consult_dir() (the path calls use), not a path this exporter assumes."""
+    code = (
+        "import os, sys; sys.path.insert(0, %r); from mycelium_coord import consult; "
+        "d = consult.consult_dir(); print('missing', [n for n in %r if not os.path.isfile(os.path.join(d, n))])"
+        % (str(stage / "coordination"), CONSULT_ADAPTERS)
+    )
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    if r.returncode != 0 or "missing []" not in r.stdout:
+        return [f"call-mode adapters not found by the candidate: {(r.stdout + r.stderr).strip()[:200]}"]
+    return []
+
+
 # ------------------------------------------------------------------ build + swap
 def _stage(source: Path, target: Path, build_id: str, overlay=None) -> tuple[Path, dict]:
     parent = target.parent
@@ -461,6 +481,7 @@ def _stage(source: Path, target: Path, build_id: str, overlay=None) -> tuple[Pat
         _copy_tree(Path(overlay), stage)  # 1b. version-controlled core-hook overlay (repo-owned)
     _copy_tree(CANONICAL, stage / "coordination")  # 2. coordination overlay
     _copy_tree(CANONICAL_BRIDGE, stage / "bridge")  # 3. bridge overlay (import path)
+    _copy_tree(CANONICAL_CONSULT, stage / "src" / "consult")  # 3b. call-mode adapters (consult_dir)
     (stage / "skills" / "coordinate").mkdir(parents=True, exist_ok=True)
     shutil.copy2(
         CANONICAL / "skill" / "SKILL.md", stage / "skills" / "coordinate" / "SKILL.md"
@@ -523,6 +544,7 @@ def export(
     retained, canonical, xo, overlaid = _cross_origin(stage, source, overlay)
     problems += xo
     problems += _validate_bridge_import(stage)
+    problems += _validate_consult_adapters(stage)
     if problems:
         if not keep_stage:
             shutil.rmtree(stage, ignore_errors=True)
